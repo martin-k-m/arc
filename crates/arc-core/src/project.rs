@@ -13,6 +13,43 @@ pub struct Config {
     pub inputs: InputsConfig,
     pub outputs: OutputsConfig,
     pub env: EnvConfig,
+    pub trace: TraceConfig,
+    /// Per-command scoping, written as repeated `[[command]]` tables.
+    #[serde(rename = "command")]
+    pub commands: Vec<CommandConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TraceConfig {
+    /// Observe executions to learn their dependencies. Costs one metadata walk
+    /// of the project per run; turn it off for very large trees where the walk
+    /// outweighs the command.
+    pub enabled: bool,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Narrows what a *particular* command depends on, when you know something Arc
+/// cannot observe.
+///
+/// Declared inputs are additive with `[inputs] include`, and are always
+/// fingerprinted even if an exclude pattern would have dropped them: an
+/// explicit include is a statement of fact, an exclude is only a hint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CommandConfig {
+    /// Glob matched against the full command line, e.g. `"cargo test*"`.
+    #[serde(rename = "match")]
+    pub match_: String,
+    pub inputs: Vec<String>,
+    pub exclude: Vec<String>,
+    pub outputs: Vec<String>,
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +157,38 @@ impl Project {
     pub fn max_size_bytes(&self) -> Result<u64> {
         parse_size(&self.config.cache.max_size)
     }
+
+    /// The configuration in force for one command line: the project defaults
+    /// plus every matching `[[command]]` block folded in.
+    ///
+    /// Folding is a union, never a replacement, so two overlapping blocks
+    /// cannot silently cancel each other's declarations.
+    pub fn config_for(&self, command_line: &str) -> Result<Config> {
+        let mut cfg = self.config.clone();
+        for c in &self.config.commands {
+            if !command_matches(&c.match_, command_line)? {
+                continue;
+            }
+            cfg.inputs.include.extend(c.inputs.iter().cloned());
+            cfg.inputs.exclude.extend(c.exclude.iter().cloned());
+            cfg.outputs.include.extend(c.outputs.iter().cloned());
+            cfg.env.include.extend(c.env.iter().cloned());
+        }
+        Ok(cfg)
+    }
+}
+
+/// A `[[command]] match` glob is matched against the whole command line.
+/// Separators are not special here — a command line is not a path.
+pub fn command_matches(pattern: &str, command_line: &str) -> Result<bool> {
+    if pattern.is_empty() {
+        return Ok(false);
+    }
+    let glob = globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+        .with_context(|| format!("invalid [[command]] match pattern: {pattern}"))?;
+    Ok(glob.compile_matcher().is_match(command_line))
 }
 
 fn load_config(path: &Path) -> Result<Config> {
@@ -179,6 +248,30 @@ mod tests {
         assert_eq!(parse_size("1.5MB").unwrap(), 1_572_864);
         assert_eq!(parse_size("512").unwrap(), 512);
         assert!(parse_size("big").is_err());
+    }
+
+    #[test]
+    fn per_command_scoping_folds_into_the_effective_config() {
+        let cfg: Config = toml::from_str(
+            "[[command]]\nmatch = \"cargo test*\"\ninputs = [\"src/**\"]\n\n[[command]]\nmatch = \"npm*\"\ninputs = [\"app/**\"]\n",
+        )
+        .unwrap();
+        let p = Project {
+            root: PathBuf::from("."),
+            config: cfg,
+            config_path: None,
+            git: false,
+        };
+        assert_eq!(
+            p.config_for("cargo test --all").unwrap().inputs.include,
+            vec!["src/**"]
+        );
+        assert!(p
+            .config_for("cargo build")
+            .unwrap()
+            .inputs
+            .include
+            .is_empty());
     }
 
     #[test]

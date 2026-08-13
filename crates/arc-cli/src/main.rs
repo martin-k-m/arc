@@ -41,12 +41,31 @@ enum Cmd {
         /// Also cache executions that exit non-zero
         #[arg(long)]
         cache_failures: bool,
+        /// Observe the execution and report what Arc learned about it
+        #[arg(long)]
+        trace: bool,
+        /// Show observed paths and processes individually, not just counts
+        #[arg(short, long)]
+        verbose: bool,
         /// Emit a machine-readable result on stderr
         #[arg(long)]
         json: bool,
         /// The command to run
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
+    },
+    /// Show the dependency graph Arc has learned
+    Graph {
+        /// Show every known path, not just a summary
+        #[arg(short, long)]
+        verbose: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which known executions the working tree's changes may affect
+    Affected {
+        #[arg(long)]
+        json: bool,
     },
     /// Show recent executions
     History {
@@ -149,6 +168,8 @@ fn real_main() -> Result<i32> {
             refresh,
             no_capture,
             cache_failures,
+            trace,
+            verbose,
             json,
             command,
         } => cmd_run(
@@ -160,10 +181,17 @@ fn real_main() -> Result<i32> {
                 refresh,
                 no_capture,
                 cache_failures,
+                trace,
             },
-            explain,
-            json,
+            Display {
+                explain,
+                trace,
+                verbose,
+                json,
+            },
         ),
+        Cmd::Graph { verbose, json } => cmd_graph(&home, &cwd, verbose, json).map(|_| 0),
+        Cmd::Affected { json } => cmd_affected(&home, &cwd, json).map(|_| 0),
         Cmd::History { limit, json } => cmd_history(&home, limit, json).map(|_| 0),
         Cmd::Inspect { id, json } => cmd_inspect(&home, &id, json).map(|_| 0),
         Cmd::Cache { command } => cmd_cache(&home, &cwd, command).map(|_| 0),
@@ -175,13 +203,21 @@ fn real_main() -> Result<i32> {
     }
 }
 
+/// How much of a run to show. Kept separate from `RunOptions` so presentation
+/// choices never leak into what the engine actually does.
+struct Display {
+    explain: bool,
+    trace: bool,
+    verbose: bool,
+    json: bool,
+}
+
 fn cmd_run(
     home: &Path,
     cwd: &Path,
     command: Vec<String>,
     opts: RunOptions,
-    explain: bool,
-    json: bool,
+    show: Display,
 ) -> Result<i32> {
     let (program, args) = command.split_first().expect("clap requires at least one");
     let project = Project::discover(cwd)?;
@@ -189,61 +225,11 @@ fn cmd_run(
     let report = engine::run(&project, cwd, program, args, &opts, home)?;
     let e = &report.explain;
 
-    if explain {
-        eprintln!("\n{} {}\n", ui::cyan(ui::MARK), ui::bold("arc explain"));
-        eprintln!("{}", ui::row("command", e.command.trim_end()));
-        eprintln!("{}", ui::row("directory", &e.cwd));
-        eprintln!(
-            "{}",
-            ui::row(
-                "inputs",
-                &format!(
-                    "{} {} {} {} {} {} reused",
-                    e.input_files,
-                    if e.input_files == 1 { "file" } else { "files" },
-                    ui::dim("·"),
-                    ui::duration(e.fingerprint_ms),
-                    ui::dim("·"),
-                    e.reused_fingerprints
-                )
-            )
-        );
-        eprintln!(
-            "{}",
-            ui::row("input digest", &ui::dim(&short(&e.input_digest)))
-        );
-        eprintln!(
-            "{}",
-            ui::row("environment", &ui::dim(&short(&e.env_digest)))
-        );
-        eprintln!(
-            "{}",
-            ui::row("toolchain", &ui::dim(&short(&e.toolchain_digest)))
-        );
-        eprintln!(
-            "{}",
-            ui::row("execution key", &ui::dim(&short(&e.execution_key)))
-        );
-        let result = if e.result == "cache hit" {
-            ui::green(&e.result)
-        } else {
-            ui::yellow(&e.result)
-        };
-        eprintln!("{}", ui::row("result", &result));
-        eprintln!("{}", ui::row("reason", &e.reason));
-        if !e.changed.is_empty() {
-            eprintln!("\n{}", ui::dim("  changed"));
-            for c in e.changed.iter().take(10) {
-                eprintln!("    {c}");
-            }
-            if e.changed.len() > 10 {
-                eprintln!(
-                    "{}",
-                    ui::dim(&format!("    and {} more", e.changed.len() - 10))
-                );
-            }
-        }
-        eprintln!();
+    if show.explain {
+        render_explain(&project, home, &report)?;
+    }
+    if show.trace {
+        render_trace(&report, show.verbose);
     }
 
     if report.record.cache_status == CacheStatus::Hit {
@@ -255,26 +241,28 @@ fn cmd_run(
         );
         if report.restored_files > 0 {
             detail.push_str(&format!(
-                " {} {} files ({})",
+                " {} {} ({})",
                 ui::dim("·"),
-                report.restored_files,
+                ui::plural(report.restored_files, "file", "files"),
                 ui::bytes(report.restored_bytes)
             ));
         }
         eprintln!(
             "\n{} {}  {}",
-            ui::cyan(ui::MARK),
+            ui::brand(ui::MARK),
             ui::badge("CACHE HIT"),
             ui::dim(&report.record.command_line())
         );
         eprintln!("  {detail}");
     }
 
-    if json {
+    if show.json {
         let r = &report.record;
         let out = serde_json::json!({
+            "schema": arc_core::SCHEMA_VERSION,
             "id": r.id,
             "key": r.key,
+            "family_key": r.family_key,
             "command": r.command_line(),
             "cache_status": r.cache_status.label(),
             "exit_code": r.exit_code,
@@ -282,12 +270,353 @@ fn cmd_run(
             "saved_ms": report.saved_ms,
             "restored_files": report.restored_files,
             "input_digest": r.input_digest,
-            "explain": report.explain,
+            "trace": r.trace,
+            "explain": e,
         });
         eprintln!("{}", serde_json::to_string(&out)?);
     }
 
     Ok(report.record.exit_code)
+}
+
+fn render_explain(project: &Project, home: &Path, report: &engine::RunReport) -> Result<()> {
+    let e = &report.explain;
+    eprint!("{}", ui::banner("EXPLAIN"));
+    eprintln!("{}", ui::row("command", e.command.trim_end()));
+    eprintln!("{}", ui::row("directory", &e.cwd));
+    eprintln!("{}", ui::row("family", &ui::dim(&short(&e.family_key))));
+    eprintln!(
+        "{}",
+        ui::row(
+            "inputs",
+            &format!(
+                "{} {} {} {} {} reused",
+                ui::plural(e.input_files, "file", "files"),
+                ui::dim("·"),
+                ui::duration(e.fingerprint_ms),
+                ui::dim("·"),
+                e.reused_fingerprints
+            )
+        )
+    );
+    eprintln!(
+        "{}",
+        ui::row(
+            "dependencies",
+            &format!(
+                "{} {} {}",
+                ui::completeness_color(&e.dependency_state),
+                ui::dim("·"),
+                if e.inputs_narrowed {
+                    "inputs narrowed"
+                } else {
+                    "whole project"
+                }
+            )
+        )
+    );
+    for (label, value) in [
+        ("input digest", &e.input_digest),
+        ("environment", &e.env_digest),
+        ("toolchain", &e.toolchain_digest),
+        ("execution key", &e.execution_key),
+    ] {
+        eprintln!("{}", ui::row(label, &ui::dim(&short(value))));
+    }
+    let result = if e.result == "cache hit" {
+        ui::green(&e.result)
+    } else {
+        ui::yellow(&e.result)
+    };
+    eprintln!("{}", ui::row("result", &result));
+    eprintln!("{}", ui::row("reason", &e.reason));
+
+    if !e.changed.is_empty() {
+        eprintln!("\n  {}", ui::dim("changed"));
+        for c in e.changed.iter().take(10) {
+            eprintln!("    {c}");
+        }
+        if e.changed.len() > 10 {
+            eprintln!(
+                "{}",
+                ui::dim(&format!("    and {} more", e.changed.len() - 10))
+            );
+        }
+    }
+
+    // Only worth computing when Arc can actually prove something irrelevant,
+    // and only because the user asked for an explanation.
+    if e.inputs_narrowed {
+        let ignored = engine::ignored_changes(project, home, &e.command, &e.family_key)?;
+        if !ignored.is_empty() {
+            eprintln!("\n  {}", ui::dim("outside this execution's inputs"));
+            for p in ignored.iter().take(10) {
+                eprintln!("    {p}");
+            }
+            if ignored.len() > 10 {
+                eprintln!(
+                    "{}",
+                    ui::dim(&format!("    and {} more", ignored.len() - 10))
+                );
+            }
+        }
+    }
+    eprintln!();
+    Ok(())
+}
+
+fn render_trace(report: &engine::RunReport, verbose: bool) {
+    let Some(obs) = &report.observations else {
+        eprint!("{}", ui::banner("TRACE"));
+        eprintln!("{}", ui::row("backend", &ui::dim("none")));
+        eprintln!(
+            "{}",
+            ui::row(
+                "status",
+                &ui::yellow("not observed (cache hit or tracing off)")
+            )
+        );
+        eprintln!();
+        return;
+    };
+    let deps = report.dependencies.as_ref();
+    let caps = arc_core::trace::platform_capabilities();
+
+    eprint!("{}", ui::banner("TRACE"));
+    eprintln!("{}", ui::row("command", &report.record.command_line()));
+    eprintln!(
+        "{}",
+        ui::row(
+            "backend",
+            &ui::accent(arc_core::trace::platform_backend_name())
+        )
+    );
+    eprintln!(
+        "{}",
+        ui::row(
+            "processes",
+            &ui::plural(obs.processes.len(), "observed", "observed")
+        )
+    );
+    eprintln!(
+        "{}",
+        ui::row(
+            "files written",
+            &ui::plural(obs.files.len(), "observed", "observed")
+        )
+    );
+    if let Some(d) = deps {
+        eprintln!(
+            "{}",
+            ui::row(
+                "executables",
+                &ui::plural(d.executables.len(), "known", "known")
+            )
+        );
+        eprintln!(
+            "{}",
+            ui::row(
+                "dependency model",
+                &ui::completeness_color(d.completeness.label())
+            )
+        );
+    }
+    // Never let a partial observation read as a full one.
+    if !caps.file_reads {
+        eprintln!(
+            "{}",
+            ui::row(
+                "not observed",
+                &ui::dim("file reads, directory reads, existence checks")
+            )
+        );
+    }
+    for note in &obs.notes {
+        eprintln!("{}", ui::row("note", &ui::yellow(note)));
+    }
+
+    if verbose {
+        if !obs.processes.is_empty() {
+            eprintln!("\n  {}", ui::dim("processes"));
+            for p in &obs.processes {
+                eprintln!(
+                    "    {:<8} {}",
+                    p.pid,
+                    p.image
+                        .as_deref()
+                        .unwrap_or("<exited before identification>")
+                );
+            }
+        }
+        if !obs.files.is_empty() {
+            eprintln!("\n  {}", ui::dim("files"));
+            for f in obs.files.iter().take(200) {
+                eprintln!(
+                    "    {:<8} {}",
+                    f.op.label(),
+                    f.rel.as_deref().unwrap_or(&f.path)
+                );
+            }
+            if obs.files.len() > 200 {
+                eprintln!(
+                    "{}",
+                    ui::dim(&format!("    and {} more", obs.files.len() - 200))
+                );
+            }
+        }
+    }
+    eprintln!(
+        "\n  {}",
+        ui::dim(&format!(
+            "{} total",
+            ui::duration(report.record.duration_ms)
+        ))
+    );
+    eprintln!();
+}
+
+fn cmd_graph(home: &Path, cwd: &Path, verbose: bool, json: bool) -> Result<()> {
+    let project = Project::discover(cwd)?;
+    let db = Db::open(home)?;
+    let graph = arc_core::graph::build(&project, &db)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&graph)?);
+        return Ok(());
+    }
+    if graph.nodes.is_empty() {
+        println!(
+            "{}",
+            ui::banner("DEPENDENCY GRAPH").trim_start_matches('\n')
+        );
+        println!("  No executions recorded for this project yet.\n");
+        println!("  Run:\n    arc run --trace <command>");
+        return Ok(());
+    }
+
+    print!("{}", ui::banner("DEPENDENCY GRAPH"));
+    println!("{}\n", ui::dim(&graph.project_root));
+    for node in &graph.nodes {
+        println!(
+            "{}  {}",
+            ui::bold(&node.command),
+            ui::dim(&format!(
+                "{} · {} · {}",
+                ui::plural(node.runs as usize, "run", "runs"),
+                node.backend,
+                node.completeness
+            ))
+        );
+        let mut lines: Vec<(String, String)> = Vec::new();
+        for g in &node.declared_inputs {
+            lines.push(("declared".into(), g.clone()));
+        }
+        let limit = if verbose { usize::MAX } else { 8 };
+        for p in node.inputs.iter().take(limit) {
+            lines.push(("input".into(), p.clone()));
+        }
+        for p in node.outputs.iter().take(limit) {
+            lines.push(("output".into(), p.clone()));
+        }
+        for p in node.executables.iter().take(limit) {
+            lines.push(("exec".into(), p.clone()));
+        }
+        if lines.is_empty() {
+            println!("{}{}\n", ui::branch(true), ui::dim("nothing observed yet"));
+            continue;
+        }
+        for (i, (kind, path)) in lines.iter().enumerate() {
+            println!(
+                "{}{} {}",
+                ui::branch(i + 1 == lines.len()),
+                ui::dim(&format!("{kind:<8}")),
+                path
+            );
+        }
+        if !node.inputs_narrowed {
+            println!(
+                "  {}",
+                ui::dim("inputs are not narrowed; this execution depends on the whole project")
+            );
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn cmd_affected(home: &Path, cwd: &Path, json: bool) -> Result<()> {
+    let project = Project::discover(cwd)?;
+    let db = Db::open(home)?;
+    let report = arc_core::affected::compute(&project, &db, cwd)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print!("{}", ui::banner("AFFECTED"));
+    if let Some(err) = &report.git_error {
+        println!(
+            "  {}\n",
+            ui::yellow(&format!("no change information: {err}"))
+        );
+        return Ok(());
+    }
+    if report.changes.is_empty() {
+        println!("  {}\n", ui::dim("working tree is clean"));
+        return Ok(());
+    }
+    if report.families.is_empty() {
+        println!(
+            "  {}\n\n  Run:\n    arc run --trace <command>",
+            ui::dim("No dependency information available for this project.")
+        );
+        return Ok(());
+    }
+
+    println!("  {}", ui::dim("changed"));
+    for c in report.changes.iter().take(20) {
+        println!("    {:<10} {}", ui::dim(c.kind.label()), c.path);
+    }
+    if report.changes.len() > 20 {
+        println!(
+            "{}",
+            ui::dim(&format!("    and {} more", report.changes.len() - 20))
+        );
+    }
+
+    use arc_core::affected::Verdict;
+    for (title, verdict, paint) in [
+        (
+            "affected executions",
+            Verdict::Affected,
+            ui::yellow as fn(&str) -> String,
+        ),
+        ("unaffected", Verdict::Unaffected, ui::green),
+        ("unknown (inputs not narrowed)", Verdict::Unknown, ui::dim),
+    ] {
+        let rows: Vec<_> = report.of(verdict).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        println!("\n  {}", ui::dim(title));
+        for f in rows {
+            println!("    {}", paint(&f.command));
+            if verdict == Verdict::Affected {
+                for m in f.matched.iter().take(3) {
+                    println!("      {}", ui::dim(m));
+                }
+            }
+        }
+    }
+    if report.of(Verdict::Unknown).next().is_some() {
+        println!(
+            "\n  {}",
+            ui::dim("Arc cannot rule these out: scope them with [[command]] inputs in arc.toml.")
+        );
+    }
+    println!();
+    Ok(())
 }
 
 fn cmd_history(home: &Path, limit: usize, json: bool) -> Result<()> {
@@ -305,8 +634,8 @@ fn cmd_history(home: &Path, limit: usize, json: bool) -> Result<()> {
     println!(
         "{}",
         ui::dim(&format!(
-            "{:<8} {:<34} {:>6} {:>6} {:>10}  {}",
-            "ID", "COMMAND", "EXIT", "CACHE", "DURATION", "WHEN"
+            "{:<8} {:<32} {:>6} {:>6} {:>7} {:>10}  {}",
+            "ID", "COMMAND", "EXIT", "CACHE", "INPUTS", "DURATION", "WHEN"
         ))
     );
     for r in rows {
@@ -315,16 +644,25 @@ fn cmd_history(home: &Path, limit: usize, json: bool) -> Result<()> {
         } else {
             ui::red(&format!("{:>6}", r.exit_code))
         };
+        // A traced run is marked so a reader can tell which executions
+        // contributed dependency knowledge.
+        let inputs = match r.input_file_count {
+            0 => ui::dim(&format!("{:>7}", "-")),
+            n if r.trace.is_some() => ui::brand(&format!("{n:>6}*")),
+            n => format!("{n:>7}"),
+        };
         println!(
-            "{} {:<34} {} {} {:>10}  {}",
+            "{} {:<32} {} {} {} {:>10}  {}",
             ui::bold(&format!("{:<8}", engine::short(&r.id))),
-            truncate(&r.command_line(), 34),
+            truncate(&r.command_line(), 32),
             exit,
             ui::status_color(r.cache_status.label()),
+            inputs,
             ui::duration(r.duration_ms),
             ui::dim(&ui::relative_time(r.started_at, now))
         );
     }
+    println!("{}", ui::dim("\n* execution was traced"));
     Ok(())
 }
 
@@ -378,6 +716,52 @@ fn cmd_inspect(home: &Path, id: &str, json: bool) -> Result<()> {
     if let Some(from) = &rec.replayed_from {
         ui::field("Replayed from", from);
     }
+    if !rec.family_key.is_empty() {
+        ui::field("Family", &rec.family_key);
+        let deps = Db::open(home)?.dependency_set(&rec.family_key)?;
+        if let Some(d) = &deps {
+            println!("{}", ui::dim("Dependencies"));
+            println!("{}", ui::row("model", d.completeness.label()));
+            println!("{}", ui::row("backend", &d.backend));
+            println!("{}", ui::row("observations", &d.observations.to_string()));
+            println!(
+                "{}",
+                ui::row("declared inputs", &d.declared_inputs.len().to_string())
+            );
+            println!(
+                "{}",
+                ui::row("observed inputs", &d.inputs.len().to_string())
+            );
+            println!(
+                "{}",
+                ui::row("observed outputs", &d.outputs.len().to_string())
+            );
+            println!(
+                "{}",
+                ui::row("executables", &d.executables.len().to_string())
+            );
+            println!(
+                "{}\n",
+                ui::row("inputs narrowed", &check(d.inputs_are_narrowed()))
+            );
+        }
+    }
+    if let Some(t) = &rec.trace {
+        println!("{}", ui::dim("Trace"));
+        println!("{}", ui::row("backend", &t.backend));
+        println!(
+            "{}",
+            ui::row(
+                "completeness",
+                &ui::completeness_color(t.completeness.label())
+            )
+        );
+        println!("{}", ui::row("processes", &t.processes.to_string()));
+        println!(
+            "{}\n",
+            ui::row("files observed", &t.files_observed.to_string())
+        );
+    }
     if !rec.outputs.is_empty() {
         println!("Outputs");
         for o in rec.outputs.iter().take(50) {
@@ -422,7 +806,7 @@ fn cmd_cache(home: &Path, cwd: &Path, command: CacheCmd) -> Result<()> {
                 );
                 return Ok(());
             }
-            ui::heading(&format!("{} arc cache", ui::cyan(ui::MARK)));
+            print!("{}", ui::banner("CACHE"));
             println!("{}", ui::row("entries", &s.cache_entries.to_string()));
             println!("{}", ui::row("executions", &s.executions.to_string()));
             println!("{}", ui::row("objects", &s.blobs.to_string()));
@@ -534,7 +918,7 @@ fn cmd_cache(home: &Path, cwd: &Path, command: CacheCmd) -> Result<()> {
 }
 
 fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
-    ui::heading(&format!("{} arc {}", ui::cyan(ui::MARK), arc_core::VERSION));
+    print!("{}", ui::banner(&format!("DOCTOR  {}", arc_core::VERSION)));
     println!(
         "{}",
         ui::row(
@@ -596,12 +980,47 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         )
     );
 
+    println!("\n{}\n", ui::bold("tracing"));
+    let caps = arc_core::trace::platform_capabilities();
+    println!(
+        "{}",
+        ui::row(
+            "backend",
+            &ui::accent(arc_core::trace::platform_backend_name())
+        )
+    );
+    for (label, ok) in caps.rows() {
+        println!("{}", ui::row(label, &supported(ok)));
+    }
+    println!(
+        "{}",
+        ui::row(
+            "completeness",
+            &ui::completeness_color(arc_core::dependency::Completeness::of(&caps, false).label())
+        )
+    );
+    println!(
+        "{}",
+        ui::row(
+            "input narrowing",
+            &ui::dim("configuration only (see arc.toml [[command]])")
+        )
+    );
+
     println!("\n{}\n", ui::bold("capabilities"));
     println!("{}", ui::row("command caching", &ui::green("supported")));
     println!("{}", ui::row("output capture", "declared globs only"));
+    println!("{}", ui::row("dependency graph", &ui::green("supported")));
     println!(
         "{}",
-        ui::row("filesystem tracing", &ui::dim("not implemented"))
+        ui::row(
+            "affected executions",
+            &if arc_core::git::available(cwd) {
+                ui::green("supported")
+            } else {
+                ui::yellow("needs git on PATH")
+            }
+        )
     );
     println!("{}", ui::row("remote cache", &ui::dim("not implemented")));
     Ok(())
@@ -654,5 +1073,15 @@ fn check(ok: bool) -> String {
         ui::green("yes")
     } else {
         ui::yellow("no")
+    }
+}
+
+/// Unsupported capabilities are dimmed, not red: they are honest gaps in what
+/// the platform allows, not failures of the installation.
+fn supported(ok: bool) -> String {
+    if ok {
+        ui::green("supported")
+    } else {
+        ui::dim("unsupported")
     }
 }

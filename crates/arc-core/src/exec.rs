@@ -23,7 +23,17 @@ pub struct Outcome {
 
 /// Run `program` with `args` in `cwd`. Output is streamed to this process's
 /// stdout/stderr as it arrives and, when `capture` is set, copied into memory.
-pub fn run(program: &Path, args: &[String], cwd: &Path, capture: bool) -> Result<Outcome> {
+///
+/// `on_spawn` is called with the child's pid as soon as it exists and before
+/// any of its output is read, which is the only moment a tracer can attach to
+/// the process tree.
+pub fn run(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    capture: bool,
+    on_spawn: &mut dyn FnMut(u32),
+) -> Result<Outcome> {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
     if capture {
@@ -33,6 +43,7 @@ pub fn run(program: &Path, args: &[String], cwd: &Path, capture: bool) -> Result
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Arc could not start `{}`.", program.display()))?;
+    on_spawn(child.id());
 
     let (stdout, stderr, truncated) = if capture {
         let out = child.stdout.take().expect("piped");

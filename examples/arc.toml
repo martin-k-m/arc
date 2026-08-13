@@ -8,6 +8,12 @@ max_size = "20GB"
 # about the environment than about the inputs.
 cache_failures = false
 
+[trace]
+# Observe executions to learn their dependencies. Costs one metadata walk of the
+# project per run. Turn it off for very large trees where the walk outweighs the
+# command; caching keeps working without it.
+enabled = true
+
 [inputs]
 # Empty means "the whole project, honouring .gitignore". Narrowing this is the
 # single biggest win for a large repository.
@@ -17,6 +23,7 @@ exclude = ["**/*.md"]
 [outputs]
 # Files Arc captures after a miss and restores on a hit. Leave empty to cache
 # only stdout, stderr and the exit code, which is what a test run needs.
+# `arc run --trace <command>` shows what a command actually writes.
 include = ["target/release/mytool"]
 
 [env]
@@ -24,3 +31,23 @@ include = ["target/release/mytool"]
 # never stored.
 include = ["MY_FEATURE_FLAG"]
 exclude = ["TERM"]
+
+# Per-command scoping. This is where input narrowing comes from: Arc cannot
+# observe file reads on any platform it currently supports, so telling it what a
+# command depends on is the one way to make unrelated edits stop invalidating it.
+#
+# `match` is a glob against the whole command line. Declarations from every
+# matching block are unioned with the settings above, so two blocks can never
+# silently cancel each other.
+[[command]]
+match = "cargo test*"
+inputs = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+
+[[command]]
+match = "cargo clippy*"
+inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
+
+[[command]]
+match = "npm*"
+inputs = ["app/**", "package.json", "package-lock.json"]
+env = ["NODE_ENV"]
