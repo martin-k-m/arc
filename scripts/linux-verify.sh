@@ -20,5 +20,7 @@ cargo test --workspace -- --test-threads=2 2>&1 |
 echo LINUX_TESTS_DONE
 cargo run --release -q -p arc-core --example ci_bench
 echo LINUX_BENCH_DONE
-bash scripts/ci-demo.sh 2>&1 | tail -80
+bash scripts/remote-exec-demo.sh 2>&1 | tail -70
 echo LINUX_DEMO_DONE
+bash scripts/exec-bench.sh 2>&1 | tail -50
+echo LINUX_EXEC_BENCH_DONE

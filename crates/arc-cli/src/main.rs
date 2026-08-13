@@ -49,6 +49,12 @@ enum Cmd {
         /// Ignore any configured remote cache
         #[arg(long)]
         no_remote: bool,
+        /// Run a cache miss on a remote worker, if one can run it
+        #[arg(long, conflicts_with = "no_remote_execution")]
+        remote_execution: bool,
+        /// Never send this command to a remote worker
+        #[arg(long)]
+        no_remote_execution: bool,
         /// Pin the tracing backend: auto, snapshot, or off
         #[arg(long, value_name = "NAME", default_value = "auto")]
         trace_backend: String,
@@ -253,6 +259,8 @@ fn real_main() -> Result<i32> {
             cache_failures,
             trace,
             no_remote,
+            remote_execution,
+            no_remote_execution,
             trace_backend,
             verbose,
             json,
@@ -268,6 +276,11 @@ fn real_main() -> Result<i32> {
                 cache_failures,
                 trace,
                 no_remote,
+                remote_execution: match (remote_execution, no_remote_execution) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
                 backend: arc_core::trace::Selection::parse(&trace_backend).with_context(|| {
                     format!("unknown --trace-backend `{trace_backend}`; use auto, snapshot or off")
                 })?,
@@ -345,6 +358,18 @@ struct SpinnerProgress {
 }
 
 impl engine::Progress for SpinnerProgress {
+    /// A worker's output goes to stderr as it arrives, so a long remote command
+    /// is not silent. The run's own stdout and stderr are still replayed
+    /// faithfully when it finishes.
+    fn log(&self, text: &str) {
+        if let Ok(mut s) = self.spinner.lock() {
+            s.stop();
+        }
+        eprint!("{text}");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+    }
+
     fn stage(&self, label: &str) {
         let Ok(mut s) = self.spinner.lock() else {
             return;
@@ -436,6 +461,33 @@ fn cmd_run(
         }
     }
 
+    if report.record.cache_status != CacheStatus::Hit {
+        if let Some(x) = report.remote_execution.as_ref().filter(|x| x.used) {
+            eprintln!();
+            eprintln!(
+                "{} {}  {}",
+                ui::brand(ui::MARK),
+                ui::badge("REMOTE EXEC"),
+                ui::dim(&report.record.command_line())
+            );
+            let t = x.timings.clone().unwrap_or_default();
+            eprintln!(
+                "  ran in {} {} queued {} {} {} in, {} out {} {}",
+                ui::duration(report.record.duration_ms),
+                ui::dim("·"),
+                ui::duration(x.queued_ms),
+                ui::dim("·"),
+                ui::bytes(t.input_bytes),
+                ui::bytes(t.output_bytes),
+                ui::dim("·"),
+                ui::dim(&x.endpoint)
+            );
+            if !x.published {
+                eprintln!("  {}", ui::dim("result not published to the shared cache"));
+            }
+        }
+    }
+
     // A remote problem is worth one line and no more: the command itself has
     // already been served correctly either way.
     if let Some(e) = report.remote.as_ref().and_then(|r| r.error.as_ref()) {
@@ -458,6 +510,15 @@ fn cmd_run(
                 } else {
                     "none"
                 },
+            },
+            "execution": {
+                "source": e.execution_source,
+                "reason": e.remote_execution,
+                "worker": report.remote_execution.as_ref().filter(|x| x.used).map(|x| x.endpoint.clone()),
+                "job": report.remote_execution.as_ref().and_then(|x| x.job_id.clone()),
+                "published": report.remote_execution.as_ref().map(|x| x.published).unwrap_or(false),
+                "queued_ms": report.remote_execution.as_ref().map(|x| x.queued_ms).unwrap_or(0),
+                "timings": report.remote_execution.as_ref().and_then(|x| x.timings.clone()),
             },
             "remote": report.remote.as_ref().map(|rr| serde_json::json!({
                 "endpoint": rr.endpoint,
@@ -532,6 +593,25 @@ fn render_explain(project: &Project, home: &Path, report: &engine::RunReport) ->
     };
     eprintln!("{}", ui::row("result", &result));
     eprintln!("{}", ui::row("reason", &e.reason));
+    if e.execution_source != "none" {
+        eprintln!(
+            "{}",
+            ui::row(
+                "executed",
+                &if e.execution_source == "remote" {
+                    ui::accent("remotely")
+                } else {
+                    "locally".to_string()
+                }
+            )
+        );
+    }
+    if !e.remote_execution.is_empty() && e.remote_execution != "not enabled" {
+        eprintln!(
+            "{}",
+            ui::row("remote execution", &ui::dim(&e.remote_execution))
+        );
+    }
 
     if !e.changed.is_empty() {
         eprintln!("\n  {}", ui::dim("changed"));
@@ -1862,6 +1942,75 @@ fn remote_for(cwd: &Path) -> Result<(arc_core::remote::RemoteConfig, Result<Remo
     Ok((cfg, opened))
 }
 
+fn executor_for(cwd: &Path) -> Result<Result<arc_core::remote::Executor, String>> {
+    let project = Project::discover(cwd)?;
+    Ok(arc_core::remote::Executor::open(&project.config.remote).map_err(|d| d.reason()))
+}
+
+/// Shared by `arc doctor` and `arc remote status`: what the worker says about
+/// itself, and whether this machine could use it.
+fn render_execution(cwd: &Path) {
+    match executor_for(cwd) {
+        Ok(Ok(x)) => {
+            println!("{}", ui::row("configured", &check(true)));
+            println!("{}", ui::row("endpoint", &ui::accent(x.endpoint())));
+            println!(
+                "{}",
+                ui::row(
+                    "auth",
+                    &if x.has_token() {
+                        ui::green("token configured")
+                    } else {
+                        ui::dim("none")
+                    }
+                )
+            );
+            match x.capabilities() {
+                Ok(c) => {
+                    println!("{}", ui::row("reachable", &check(true)));
+                    println!("{}", ui::row("worker", &arc_core::ci::sanitize(&c.worker)));
+                    println!("{}", ui::row("platform", &format!("{} / {}", c.os, c.arch)));
+                    let compatible =
+                        c.os == std::env::consts::OS && c.arch == std::env::consts::ARCH;
+                    println!(
+                        "{}",
+                        ui::row(
+                            "compatible",
+                            &if compatible {
+                                ui::green("yes")
+                            } else {
+                                ui::yellow("no — the worker is a different platform")
+                            }
+                        )
+                    );
+                    println!(
+                        "{}",
+                        ui::row(
+                            "capacity",
+                            &format!("{} jobs, {} queued", c.max_jobs, c.queued)
+                        )
+                    );
+                    println!("{}", ui::row("environment", &ui::dim(&c.environment_id)));
+                    // Stated plainly because it is a limitation, not a feature.
+                    println!("{}", ui::row("network", &ui::yellow(c.network.label())));
+                }
+                Err(e) => {
+                    println!("{}", ui::row("reachable", &ui::yellow(&format!("{e:#}"))));
+                    println!(
+                        "{}",
+                        ui::row("impact", &ui::dim("commands run locally instead"))
+                    );
+                }
+            }
+        }
+        Ok(Err(reason)) => {
+            println!("{}", ui::row("configured", &ui::dim(&reason)));
+            println!("{}", ui::row("execution", &ui::green("local only")));
+        }
+        Err(e) => println!("{}", ui::row("configured", &ui::red(&format!("{e:#}")))),
+    }
+}
+
 fn cmd_remote(cwd: &Path, command: RemoteCmd) -> Result<i32> {
     let (cfg, opened) = remote_for(cwd)?;
     match command {
@@ -1925,6 +2074,13 @@ fn cmd_remote(cwd: &Path, command: RemoteCmd) -> Result<i32> {
                     );
                 }
             }
+            println!(
+                "
+{}
+",
+                ui::bold("execution")
+            );
+            render_execution(cwd);
             println!();
             Ok(0)
         }
@@ -2092,6 +2248,14 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         Err(e) => println!("{}", ui::row("configured", &ui::red(&format!("{e:#}")))),
     }
 
+    println!(
+        "
+{}
+",
+        ui::bold("remote execution")
+    );
+    render_execution(cwd);
+
     println!("\n{}\n", ui::bold("continuous integration"));
     {
         use arc_core::ci::context::{CiContext, Environment};
@@ -2211,10 +2375,7 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
             }
         )
     );
-    println!(
-        "{}",
-        ui::row("remote execution", &ui::dim("not implemented"))
-    );
+    println!("{}", ui::row("remote execution", &ui::green("supported")));
     Ok(())
 }
 

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/arc-core", "crates/arc-cli", "crates/arc-cache"]
+members = ["crates/arc-core", "crates/arc-cli", "crates/arc-cache", "crates/arc-worker"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
