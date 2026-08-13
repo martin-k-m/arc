@@ -8,6 +8,7 @@ use arc_core::project::Project;
 use arc_core::record::CacheStatus;
 use arc_core::store::Store;
 use clap::{Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Parser)]
@@ -57,16 +58,37 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Show the dependency graph Arc has learned
+    /// Show the task graph Arc has learned
     Graph {
-        /// Show every known path, not just a summary
+        /// Show only this task and everything connected to it
+        #[arg(long, value_name = "NAME")]
+        task: Option<String>,
+        /// Show only tasks the working tree's changes reach
+        #[arg(long)]
+        affected: bool,
+        /// Also list each task's outputs and declared inputs
         #[arg(short, long)]
         verbose: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Show which known executions the working tree's changes may affect
+    /// Show which tasks the working tree's changes reach, and optionally run them
     Affected {
+        /// Execute the affected tasks, in dependency order
+        #[arg(long)]
+        run: bool,
+        /// With --run, print the plan instead of executing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Tasks to run at once (default: available parallelism, capped at 16)
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Stop starting new tasks after the first failure
+        #[arg(long)]
+        fail_fast: bool,
+        /// Show why each task is in its bucket
+        #[arg(long)]
+        explain: bool,
         #[arg(long)]
         json: bool,
     },
@@ -197,8 +219,20 @@ fn real_main() -> Result<i32> {
                 json,
             },
         ),
-        Cmd::Graph { verbose, json } => cmd_graph(&home, &cwd, verbose, json).map(|_| 0),
-        Cmd::Affected { json } => cmd_affected(&home, &cwd, json).map(|_| 0),
+        Cmd::Graph {
+            task,
+            affected,
+            verbose,
+            json,
+        } => cmd_graph(&home, &cwd, task, affected, verbose, json).map(|_| 0),
+        Cmd::Affected {
+            run,
+            dry_run,
+            jobs,
+            fail_fast,
+            explain,
+            json,
+        } => cmd_affected(&home, &cwd, run, dry_run, jobs, fail_fast, explain, json),
         Cmd::History { limit, json } => cmd_history(&home, limit, json).map(|_| 0),
         Cmd::Inspect { id, json } => cmd_inspect(&home, &id, json).map(|_| 0),
         Cmd::Cache { command } => cmd_cache(&home, &cwd, command).map(|_| 0),
@@ -517,158 +551,492 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
     eprintln!();
 }
 
-fn cmd_graph(home: &Path, cwd: &Path, verbose: bool, json: bool) -> Result<()> {
+fn cmd_graph(
+    home: &Path,
+    cwd: &Path,
+    task: Option<String>,
+    affected_only: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
     let project = Project::discover(cwd)?;
     let db = Db::open(home)?;
     let graph = arc_core::graph::build(&project, &db)?;
 
+    let keep: Option<BTreeSet<String>> = match (&task, affected_only) {
+        (Some(needle), _) => {
+            let matches = graph.find(needle);
+            if matches.is_empty() {
+                anyhow::bail!("no task matches `{needle}`. Try `arc graph` to list them.");
+            }
+            let mut keep: BTreeSet<String> = BTreeSet::new();
+            for m in matches {
+                keep.insert(m.family_key.clone());
+                keep.extend(reachable(&graph, &m.family_key, true));
+                keep.extend(reachable(&graph, &m.family_key, false));
+            }
+            Some(keep)
+        }
+        (None, true) => {
+            let report = arc_core::affected::compute(&project, &db, cwd)?;
+            Some(
+                report
+                    .selected()
+                    .iter()
+                    .map(|t| t.family_key.clone())
+                    .collect(),
+            )
+        }
+        (None, false) => None,
+    };
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&graph)?);
-        return Ok(());
-    }
-    if graph.nodes.is_empty() {
         println!(
             "{}",
-            ui::banner("DEPENDENCY GRAPH").trim_start_matches('\n')
+            serde_json::to_string_pretty(&filter_graph(&graph, keep.as_ref()))?
         );
-        println!("  No executions recorded for this project yet.\n");
-        println!("  Run:\n    arc run --trace <command>");
         return Ok(());
     }
 
-    print!("{}", ui::banner("DEPENDENCY GRAPH"));
-    println!(
-        "{}
-",
-        ui::dim(&graph.project_root)
-    );
-    for node in &graph.nodes {
+    if graph.nodes.is_empty() {
+        print!("{}", ui::banner("TASK GRAPH"));
         println!(
-            "{}  {}",
-            ui::bold(&node.command),
-            ui::dim(&format!(
-                "{} · {} · {}",
-                ui::plural(node.runs as usize, "run", "runs"),
-                node.backend,
-                node.completeness
-            ))
+            "  {}\n",
+            ui::dim("No executions recorded for this project yet.")
         );
-        // Grouped rather than flattened: "which directory does this depend on"
-        // and "which file" are different questions, and a single list of a few
-        // hundred paths answers neither.
-        let limit = if verbose { usize::MAX } else { 8 };
-        let groups: [(&str, &Vec<String>); 6] = [
-            ("Declared", &node.declared_inputs),
-            ("Inputs", &node.inputs),
-            ("Directories", &node.directories),
-            ("Existence checks", &node.existence),
-            ("Executables", &node.executables),
-            ("Outputs", &node.outputs),
-        ];
-        let mut printed = false;
-        for (title, items) in groups {
-            if items.is_empty() {
-                continue;
-            }
-            printed = true;
-            println!("  {}", ui::dim(title));
-            for (i, p) in items.iter().take(limit).enumerate() {
-                let last = i + 1 == items.len().min(limit);
-                // An existence dependency reads very differently depending on
-                // which way it currently points, so say which.
-                let suffix = if title == "Existence checks" {
-                    ui::dim(if std::path::Path::new(p).exists() {
-                        " (present)"
-                    } else {
-                        " (absent)"
-                    })
-                } else {
-                    String::new()
-                };
-                println!("  {}{p}{suffix}", ui::branch(last));
-            }
-            if items.len() > limit {
-                println!(
-                    "    {}",
-                    ui::dim(&format!("and {} more", items.len() - limit))
-                );
-            }
-        }
-        if !printed {
-            println!("  {}", ui::dim("nothing observed yet"));
-        }
-        if !node.inputs_narrowed {
+        println!("  Run:\n    arc run <command>");
+        return Ok(());
+    }
+
+    print!("{}", ui::banner("TASK GRAPH"));
+    println!("{}\n", ui::dim(&graph.project_root));
+
+    let shown: Vec<&arc_core::graph::TaskNode> = graph
+        .nodes
+        .iter()
+        .filter(|n| keep.as_ref().map_or(true, |k| k.contains(&n.family_key)))
+        .collect();
+    let visible: BTreeSet<&str> = shown.iter().map(|n| n.family_key.as_str()).collect();
+
+    let mut printed: BTreeSet<&str> = BTreeSet::new();
+    for node in shown.iter().filter(|n| {
+        graph
+            .incoming(&n.family_key)
+            .all(|e| !visible.contains(e.from.as_str()))
+    }) {
+        print_subtree(
+            &graph,
+            node,
+            &visible,
+            &mut printed,
+            "",
+            true,
+            true,
+            verbose,
+        );
+    }
+    // Anything reachable only through a cycle has no root to hang from.
+    let orphans: Vec<&arc_core::graph::TaskNode> = shown
+        .iter()
+        .copied()
+        .filter(|n| !printed.contains(n.family_key.as_str()))
+        .collect();
+    for node in orphans {
+        print_subtree(
+            &graph,
+            node,
+            &visible,
+            &mut printed,
+            "",
+            true,
+            true,
+            verbose,
+        );
+    }
+
+    println!();
+    let complete = graph
+        .nodes
+        .iter()
+        .filter(|n| n.completeness == arc_core::dependency::Completeness::Complete)
+        .count();
+    println!(
+        "  {}",
+        ui::dim(&format!(
+            "{} · {} · {} complete · {} partial",
+            ui::plural(graph.nodes.len(), "task", "tasks"),
+            ui::plural(graph.edges.len(), "edge", "edges"),
+            complete,
+            graph.nodes.len() - complete
+        ))
+    );
+    if !graph.ambiguities.is_empty() {
+        println!("\n  {}", ui::yellow("ambiguous producers"));
+        for a in graph.ambiguities.iter().take(10) {
             println!(
-                "  {}",
-                ui::dim("inputs are not narrowed; this execution depends on the whole project")
+                "    {} {}",
+                a.path,
+                ui::dim(&format!("({} producers)", a.producers.len()))
             );
         }
-        println!();
     }
+    if !graph.cycles.is_empty() {
+        println!("\n  {}", ui::yellow("cycles"));
+        for c in &graph.cycles {
+            let names: Vec<String> = c
+                .members
+                .iter()
+                .filter_map(|m| graph.node(m).map(|n| n.label.clone()))
+                .collect();
+            println!("    {}", names.join(" <-> "));
+        }
+    }
+    for u in &graph.unresolved {
+        println!(
+            "\n  {}",
+            ui::yellow(&format!(
+                "{}: `after` names unknown task `{}`",
+                u.task, u.after
+            ))
+        );
+    }
+    println!();
     Ok(())
 }
 
-fn cmd_affected(home: &Path, cwd: &Path, json: bool) -> Result<()> {
+fn reachable(graph: &arc_core::graph::TaskGraph, from: &str, downstream: bool) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut queue = vec![from.to_string()];
+    while let Some(key) = queue.pop() {
+        let next: Vec<String> = if downstream {
+            graph.outgoing(&key).map(|e| e.to.clone()).collect()
+        } else {
+            graph.incoming(&key).map(|e| e.from.clone()).collect()
+        };
+        for n in next {
+            if seen.insert(n.clone()) {
+                queue.push(n);
+            }
+        }
+    }
+    seen
+}
+
+fn filter_graph(
+    graph: &arc_core::graph::TaskGraph,
+    keep: Option<&BTreeSet<String>>,
+) -> arc_core::graph::TaskGraph {
+    let Some(keep) = keep else {
+        return graph.clone();
+    };
+    let mut g = graph.clone();
+    g.nodes.retain(|n| keep.contains(&n.family_key));
+    g.edges
+        .retain(|e| keep.contains(&e.from) && keep.contains(&e.to));
+    g
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_subtree<'a>(
+    graph: &'a arc_core::graph::TaskGraph,
+    node: &'a arc_core::graph::TaskNode,
+    visible: &BTreeSet<&str>,
+    printed: &mut BTreeSet<&'a str>,
+    prefix: &str,
+    root: bool,
+    last: bool,
+    verbose: bool,
+) {
+    let repeat = !printed.insert(node.family_key.as_str());
+    let connector = if root {
+        String::new()
+    } else {
+        ui::branch(last)
+    };
+    let mut tags: Vec<String> = Vec::new();
+    if node.completeness != arc_core::dependency::Completeness::Complete {
+        tags.push(ui::yellow(node.completeness.label()));
+    }
+    if graph.cycle_of(&node.family_key).is_some() {
+        tags.push(ui::yellow("cycle"));
+    }
+    if repeat {
+        tags.push(ui::dim("(shown above)"));
+    }
+    let suffix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", tags.join(" "))
+    };
+    println!("{prefix}{connector}{}{suffix}", ui::bold(&node.label));
+
+    let detail_prefix = if root {
+        "  ".to_string()
+    } else if last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}{}   ", ui::dim("│"))
+    };
+    if verbose {
+        for p in node.produces.iter().take(8) {
+            println!("{detail_prefix}{} {p}", ui::dim("produces"));
+        }
+        for p in node.declared_inputs.iter().take(8) {
+            println!("{detail_prefix}{} {p}", ui::dim("declared"));
+        }
+    }
+    if repeat {
+        return;
+    }
+
+    let mut children: Vec<&arc_core::graph::TaskNode> = graph
+        .outgoing(&node.family_key)
+        .filter(|e| visible.contains(e.to.as_str()))
+        .filter_map(|e| graph.node(&e.to))
+        .collect();
+    children.sort_by(|a, b| a.label.cmp(&b.label));
+    children.dedup_by(|a, b| a.family_key == b.family_key);
+
+    let child_prefix = if root { String::new() } else { detail_prefix };
+    for (i, c) in children.iter().enumerate() {
+        print_subtree(
+            graph,
+            c,
+            visible,
+            printed,
+            &child_prefix,
+            false,
+            i + 1 == children.len(),
+            verbose,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_affected(
+    home: &Path,
+    cwd: &Path,
+    run: bool,
+    dry_run: bool,
+    jobs: Option<usize>,
+    fail_fast: bool,
+    explain: bool,
+    json: bool,
+) -> Result<i32> {
     let project = Project::discover(cwd)?;
     let db = Db::open(home)?;
     let report = arc_core::affected::compute(&project, &db, cwd)?;
+    let graph = arc_core::graph::build(&project, &db)?;
+    let plan = arc_core::plan::build(&graph, &report);
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+    if !run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            render_affected(&report, &graph, explain);
+        }
+        return Ok(0);
     }
 
+    if dry_run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            render_plan(&plan);
+        }
+        return Ok(0);
+    }
+
+    if plan.is_empty() {
+        if json {
+            // A caller asking for `--run --json` wants a run summary, whether or
+            // not anything needed running.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&arc_core::plan::RunSummary::default())?
+            );
+        } else {
+            print!("{}", ui::banner("NOTHING TO DO"));
+            println!(
+                "  {}\n",
+                ui::dim("no known task is affected by these changes")
+            );
+        }
+        return Ok(0);
+    }
+
+    let opts = arc_core::plan::SchedulerOptions {
+        jobs: jobs.unwrap_or_else(arc_core::plan::default_jobs),
+        fail_fast,
+        ..Default::default()
+    };
+    db.release();
+    if !json {
+        print!("{}", ui::banner("RUNNING"));
+        println!(
+            "  {}\n",
+            ui::dim(&format!(
+                "{} of {} tasks · {} at a time",
+                plan.tasks.len(),
+                plan.total_known_tasks,
+                opts.jobs
+            ))
+        );
+    }
+    let observer = TaskObserver { json };
+    let summary = arc_core::plan::execute(&plan, &project.root, home, &opts, &observer)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        render_summary(&summary);
+    }
+    Ok(summary.exit_code())
+}
+
+struct TaskObserver {
+    json: bool,
+}
+
+impl arc_core::plan::Observer for TaskObserver {
+    fn finished(&self, r: &arc_core::plan::TaskResult) {
+        if self.json {
+            return;
+        }
+        use arc_core::plan::TaskOutcome;
+        let (mark, style): (&str, fn(&str) -> String) = match r.outcome {
+            TaskOutcome::Hit => ("HIT", ui::green),
+            TaskOutcome::Ran => ("RAN", ui::brand),
+            TaskOutcome::Failed => ("FAIL", ui::red),
+            TaskOutcome::Blocked => ("BLOCKED", ui::yellow),
+            TaskOutcome::Cancelled => ("SKIPPED", ui::dim),
+        };
+        eprintln!(
+            "  {:>8} {:<40} {}",
+            style(mark),
+            truncate(&r.label, 40),
+            ui::dim(&ui::duration(r.duration_ms))
+        );
+        let body = format!("{}{}", r.stdout, r.stderr);
+        if !body.trim().is_empty() {
+            for line in body.lines() {
+                eprintln!("    {} {line}", ui::dim("|"));
+            }
+        }
+        if let Some(cause) = &r.blocked_by {
+            eprintln!(
+                "    {} prerequisite {} did not succeed",
+                ui::dim("|"),
+                ui::dim(&short(cause))
+            );
+        }
+    }
+}
+
+fn render_summary(s: &arc_core::plan::RunSummary) {
+    type Part = (usize, &'static str, fn(&str) -> String);
+    let parts: [Part; 4] = [
+        (s.ran, "ran", ui::brand),
+        (s.hits, "cached", ui::green),
+        (s.failed, "failed", ui::red),
+        (s.blocked, "blocked", ui::yellow),
+    ];
+    let body: Vec<String> = parts
+        .iter()
+        .filter(|(n, _, _)| *n > 0)
+        .map(|(n, label, style)| style(&format!("{n} {label}")))
+        .collect();
+    eprintln!(
+        "\n{} {}  {}",
+        ui::brand(ui::MARK),
+        ui::bold(&body.join(" · ")),
+        ui::dim(&ui::duration(s.duration_ms))
+    );
+}
+
+fn render_plan(plan: &arc_core::plan::ExecutionPlan) {
+    print!("{}", ui::banner("EXECUTION PLAN"));
+    if plan.is_empty() {
+        println!("  {}\n", ui::dim("nothing to run"));
+        return;
+    }
+    for (i, wave) in plan.waves.iter().enumerate() {
+        let together = if wave.len() > 1 {
+            ui::dim("  (concurrent)")
+        } else {
+            String::new()
+        };
+        println!("  {}{together}", ui::dim(&format!("step {}", i + 1)));
+        for label in wave {
+            println!("    {}", ui::bold(label));
+        }
+    }
+    println!(
+        "\n  {}\n",
+        ui::dim(&format!(
+            "{} of {} tasks would run; {} skipped",
+            plan.tasks.len(),
+            plan.total_known_tasks,
+            plan.skipped
+        ))
+    );
+}
+
+fn render_affected(
+    report: &arc_core::affected::Report,
+    graph: &arc_core::graph::TaskGraph,
+    explain: bool,
+) {
+    use arc_core::affected::Verdict;
     print!("{}", ui::banner("AFFECTED"));
     if let Some(err) = &report.git_error {
         println!(
             "  {}\n",
             ui::yellow(&format!("no change information: {err}"))
         );
-        return Ok(());
+        return;
     }
-    if report.changes.is_empty() {
-        println!("  {}\n", ui::dim("working tree is clean"));
-        return Ok(());
-    }
-    if report.families.is_empty() {
+    if report.tasks.is_empty() {
         println!(
-            "  {}\n\n  Run:\n    arc run --trace <command>",
-            ui::dim("No dependency information available for this project.")
+            "  {}\n\n  Run:\n    arc run <command>",
+            ui::dim("No tasks recorded for this project.")
         );
-        return Ok(());
+        return;
     }
 
     println!("  {}", ui::dim("changed"));
-    for c in report.changes.iter().take(20) {
+    if report.changes.is_empty() {
+        println!("    {}", ui::dim("working tree is clean"));
+    }
+    for c in report.changes.iter().take(15) {
         println!("    {:<10} {}", ui::dim(c.kind.label()), c.path);
     }
-    if report.changes.len() > 20 {
+    if report.changes.len() > 15 {
         println!(
-            "{}",
-            ui::dim(&format!("    and {} more", report.changes.len() - 20))
+            "    {}",
+            ui::dim(&format!("and {} more", report.changes.len() - 15))
         );
     }
 
-    use arc_core::affected::Verdict;
     for (title, verdict, paint) in [
         (
-            "affected executions",
+            "affected",
             Verdict::Affected,
             ui::yellow as fn(&str) -> String,
         ),
+        ("unknown", Verdict::Unknown, ui::dim),
         ("unaffected", Verdict::Unaffected, ui::green),
-        ("unknown (inputs not narrowed)", Verdict::Unknown, ui::dim),
     ] {
         let rows: Vec<_> = report.of(verdict).collect();
         if rows.is_empty() {
             continue;
         }
         println!("\n  {}", ui::dim(title));
-        for f in rows {
-            println!("    {}", paint(&f.command));
-            if verdict == Verdict::Affected {
-                for m in f.matched.iter().take(3) {
-                    println!("      {}", ui::dim(m));
+        for t in rows {
+            println!("    {}", paint(&t.label));
+            if explain {
+                for line in explain_cause(report, graph, t, 0).iter().take(6) {
+                    println!("{line}");
                 }
             }
         }
@@ -676,11 +1044,55 @@ fn cmd_affected(home: &Path, cwd: &Path, json: bool) -> Result<()> {
     if report.of(Verdict::Unknown).next().is_some() {
         println!(
             "\n  {}",
-            ui::dim("Arc cannot rule these out: scope them with [[command]] inputs in arc.toml.")
+            ui::dim("Arc cannot rule these out, so they run. `arc graph -v` shows why.")
         );
     }
     println!();
-    Ok(())
+}
+
+fn explain_cause(
+    report: &arc_core::affected::Report,
+    graph: &arc_core::graph::TaskGraph,
+    task: &arc_core::affected::TaskVerdict,
+    depth: usize,
+) -> Vec<String> {
+    use arc_core::affected::Cause;
+    let pad = "      ".to_string() + &"  ".repeat(depth);
+    let label_of = |k: &str| {
+        graph
+            .node(k)
+            .map(|n| n.label.clone())
+            .unwrap_or_else(|| short(k))
+    };
+    let mut out = Vec::new();
+    for cause in task.causes.iter().take(2) {
+        match cause {
+            Cause::Changed { path } => out.push(format!(
+                "{pad}{}",
+                ui::dim(&format!("because {path} changed"))
+            )),
+            Cause::Upstream { task: up, via, .. } => {
+                out.push(format!(
+                    "{pad}{}",
+                    ui::dim(&format!("because {} is affected, via {via}", label_of(up)))
+                ));
+                if depth < 3 {
+                    if let Some(upstream) = report.task(up) {
+                        out.extend(explain_cause(report, graph, upstream, depth + 1));
+                    }
+                }
+            }
+            Cause::UpstreamUnknown { task: up } => out.push(format!(
+                "{pad}{}",
+                ui::dim(&format!("because {} is unknown", label_of(up)))
+            )),
+            Cause::NotProvable { reason } => {
+                out.push(format!("{pad}{}", ui::dim(&format!("because {reason}"))))
+            }
+            Cause::Cycle => out.push(format!("{pad}{}", ui::dim("part of a dependency cycle"))),
+        }
+    }
+    out
 }
 
 fn cmd_history(home: &Path, limit: usize, json: bool) -> Result<()> {
@@ -782,7 +1194,50 @@ fn cmd_inspect(home: &Path, id: &str, json: bool) -> Result<()> {
     }
     if !rec.family_key.is_empty() {
         ui::field("Family", &rec.family_key);
-        let deps = Db::open(home)?.dependency_set(&rec.family_key)?;
+        if let Ok(project) = Project::discover(Path::new(&rec.project_root)) {
+            if let Ok(graph) = arc_core::graph::build(&project, &db) {
+                if let Some(node) = graph.node(&rec.family_key) {
+                    println!("{}", ui::dim("Task"));
+                    println!("{}", ui::row("label", &node.label));
+                    println!("{}", ui::row("produces", &node.produces.len().to_string()));
+                    let up = graph.upstream_of(&rec.family_key);
+                    let down = graph.downstream_of(&rec.family_key);
+                    println!(
+                        "{}",
+                        ui::row(
+                            "upstream",
+                            &if up.is_empty() {
+                                ui::dim("none")
+                            } else {
+                                up.iter()
+                                    .map(|n| n.label.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        )
+                    );
+                    println!(
+                        "{}",
+                        ui::row(
+                            "downstream",
+                            &if down.is_empty() {
+                                ui::dim("none")
+                            } else {
+                                down.iter()
+                                    .map(|n| n.label.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        )
+                    );
+                    if graph.cycle_of(&rec.family_key).is_some() {
+                        println!("{}", ui::row("cycle", &ui::yellow("yes")));
+                    }
+                    println!();
+                }
+            }
+        }
+        let deps = db.dependency_set(&rec.family_key)?;
         if let Some(d) = &deps {
             println!("{}", ui::dim("Dependencies"));
             println!("{}", ui::row("model", d.completeness.label()));
@@ -1079,6 +1534,37 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         )
     );
 
+    println!("\n{}\n", ui::bold("task graph"));
+    match Db::open(home).and_then(|db| arc_core::graph::build(&project, &db)) {
+        Ok(g) => {
+            use arc_core::dependency::Completeness;
+            let complete = g
+                .nodes
+                .iter()
+                .filter(|n| n.completeness == Completeness::Complete)
+                .count();
+            println!("{}", ui::row("tasks", &g.nodes.len().to_string()));
+            println!("{}", ui::row("edges", &g.edges.len().to_string()));
+            println!("{}", ui::row("complete", &complete.to_string()));
+            println!(
+                "{}",
+                ui::row("partial", &(g.nodes.len() - complete).to_string())
+            );
+            println!(
+                "{}",
+                ui::row("ambiguous outputs", &count_style(g.ambiguities.len()))
+            );
+            println!("{}", ui::row("cycles", &count_style(g.cycles.len())));
+            if !g.unresolved.is_empty() {
+                println!(
+                    "{}",
+                    ui::row("unresolved `after`", &count_style(g.unresolved.len()))
+                );
+            }
+        }
+        Err(e) => println!("{}", ui::row("task graph", &ui::red(&format!("{e:#}")))),
+    }
+
     println!("\n{}\n", ui::bold("capabilities"));
     println!("{}", ui::row("command caching", &ui::green("supported")));
     println!("{}", ui::row("output capture", "declared globs only"));
@@ -1093,6 +1579,10 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
                 ui::yellow("needs git on PATH")
             }
         )
+    );
+    println!(
+        "{}",
+        ui::row("selective execution", &ui::green("supported"))
     );
     println!("{}", ui::row("remote cache", &ui::dim("not implemented")));
     Ok(())
@@ -1126,6 +1616,16 @@ fn cmd_clean(home: &Path, all: bool) -> Result<()> {
         home.display()
     );
     Ok(())
+}
+
+/// Zero is the healthy answer for ambiguities and cycles, so it should not draw
+/// the eye the way a non-zero count should.
+fn count_style(n: usize) -> String {
+    if n == 0 {
+        ui::green("0")
+    } else {
+        ui::yellow(&n.to_string())
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

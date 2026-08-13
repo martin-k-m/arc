@@ -46,6 +46,12 @@ pub struct CommandConfig {
     /// Glob matched against the full command line, e.g. `"cargo test*"`.
     #[serde(rename = "match")]
     pub match_: String,
+    /// Human-readable task name, used by `arc graph`, `arc affected` and by
+    /// `after`. Never part of execution identity.
+    pub name: Option<String>,
+    /// Task names this command must follow, for dependencies no filesystem
+    /// observation can reveal.
+    pub after: Vec<String>,
     pub inputs: Vec<String>,
     pub exclude: Vec<String>,
     pub outputs: Vec<String>,
@@ -164,8 +170,14 @@ impl Project {
     /// Folding is a union, never a replacement, so two overlapping blocks
     /// cannot silently cancel each other's declarations.
     pub fn config_for(&self, command_line: &str) -> Result<Config> {
-        let mut cfg = self.config.clone();
-        for c in &self.config.commands {
+        self.config.resolve(command_line)
+    }
+}
+
+impl Config {
+    fn resolve(&self, command_line: &str) -> Result<Config> {
+        let mut cfg = self.clone();
+        for c in &self.commands {
             if !command_matches(&c.match_, command_line)? {
                 continue;
             }
@@ -175,6 +187,14 @@ impl Project {
             cfg.env.include.extend(c.env.iter().cloned());
         }
         Ok(cfg)
+    }
+
+    /// Every `[[command]]` block whose glob matches, in declaration order.
+    pub fn commands_matching(&self, command_line: &str) -> Vec<&CommandConfig> {
+        self.commands
+            .iter()
+            .filter(|c| command_matches(&c.match_, command_line).unwrap_or(false))
+            .collect()
     }
 }
 

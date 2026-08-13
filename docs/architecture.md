@@ -58,6 +58,40 @@ consumer without a rewrite.
      store.put_* + db.put_execution
 ```
 
+## The task graph
+
+```text
+Execution family
+      |
+      +-- consumes (files, directories, existence)
+      +-- produces (temporally classified outputs)
+                |
+                v
+        graph::assemble          producer index, keyed by PathKey
+                |
+                v
+          TaskGraph              nodes + derived edges + cycles + ambiguities
+                |
+        +-------+--------+
+        v                v
+ affected::analyse    arc graph
+        |
+        v
+   plan::build                   topological, deterministic, cycle-condensed
+        |
+        v
+   plan::execute                 bounded parallelism, per-task buffering
+        |
+        v
+      arc run                    one child per task, ordinary cache semantics
+```
+
+One durable row per task, in `task_graph`; edges are derived on every load and
+never stored, so rewriting a row cannot leave a stale edge. `plan::execute`
+spawns `arc run` per task rather than calling the engine in-process: the engine
+takes an exclusive lock on the metadata database, and cross-process locking was
+already proven safe by the concurrency tests.
+
 ## Module boundaries
 
 | Module | Owns |
@@ -69,7 +103,9 @@ consumer without a rewrite.
 | `scan` | Project-wide input discovery and content hashing |
 | `trace` | Observation backends behind one capability-declaring interface |
 | `dependency` | `DependencySet`, temporal classification, `can_narrow`, narrowed fingerprinting |
-| `graph` / `affected` | Read-only projections over families and dependency sets |
+| `graph` | `TaskNode`, edge derivation, cycles, ambiguity, topological order |
+| `affected` | Direct and transitive propagation with provenance; pure, reusable |
+| `plan` | `ExecutionPlan` and the bounded-parallel scheduler |
 | `git` | Optional, isolated; nothing in the run pipeline depends on it |
 | `store` | Content-addressed blobs |
 | `db` | redb metadata, schema versioning, indexes |
@@ -105,8 +141,8 @@ digests over different ground, which is why `SCHEMA_VERSION` went to 3: a v2
 entry for the same command in the same project is not comparable.
 
 `SCHEMA_VERSION`, `FAMILY_KEY_VERSION`, `DEPENDENCY_SCHEMA_VERSION`,
-`TRACE_SCHEMA_VERSION`, `TRACE_SEMANTICS_VERSION` and `DB_SCHEMA_VERSION` are
-separate on purpose: each can be bumped without invalidating more than it has to.
+`TRACE_SCHEMA_VERSION`, `TRACE_SEMANTICS_VERSION`, `GRAPH_SCHEMA_VERSION` and
+`DB_SCHEMA_VERSION` are separate on purpose: each can be bumped without invalidating more than it has to.
 `TRACE_SEMANTICS_VERSION` is the subtle one — it exists because the *rules* a
 backend applies can change while the stored shape stays identical, and a set
 called "complete" under the old rules must not be reused under the new ones.
@@ -124,13 +160,15 @@ Content-addressed blobs in `$ARC_HOME/store/blobs/<2>/<62>`, metadata in
 | `fingerprints` | project id | packed size/mtime/digest blob |
 | `execution_families` | family key | `ExecutionFamily` |
 | `dependency_sets` | family key | `DependencySet` |
-| `dependency_edges` | `{project}\0{rel}\0{family}` | `""` |
+| `task_graph` | `{project}\0{family}` | `TaskNode` |
 | `counters` / `meta` | name | value |
 
-`dependency_edges` is ordered by key, so "which families depend on this file?"
-is a contiguous range scan scoped to one project rather than a full table scan.
-Only families whose inputs are actually narrowed get rows, which bounds the
-index at the size of the dependency set rather than the size of the repository.
+`task_graph` is ordered by key, so loading one project's graph is a contiguous
+range scan and never touches another project's rows. Each row is compact —
+labels, structured command, produced and consumed paths — rather than a copy of
+the dependency set, so a ten-thousand-task graph loads without deserialising ten
+thousand full dependency sets. It is written in the same transaction as the
+dependency set it derives from.
 
 Raw syscall streams are never persisted. A dependency set holds normalised paths
 and counts; `ExecutionRecord.trace` holds a summary and the downgrade reasons as

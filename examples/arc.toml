@@ -50,11 +50,16 @@ exclude = ["TERM"]
 # `match` is a glob against the whole command line. Declarations from every
 # matching block are unioned with the settings above, so two blocks can never
 # silently cancel each other.
+# `name` is optional and never part of execution identity. It only gives the
+# task a readable label in `arc graph` and `arc affected`, and a handle for
+# `after`.
 [[command]]
+name = "test-core"
 match = "cargo test*"
 inputs = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
 
 [[command]]
+name = "lint"
 match = "cargo clippy*"
 inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
 
@@ -62,3 +67,13 @@ inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
 match = "npm*"
 inputs = ["app/**", "package.json", "package-lock.json"]
 env = ["NODE_ENV"]
+
+# Arc infers task edges from what one command writes and another reads, so most
+# ordering needs no configuration. `after` is for the dependencies no filesystem
+# observation can reveal — a deploy that must follow a smoke test, say. Naming a
+# task that does not exist is reported by `arc graph` and `arc doctor` rather
+# than silently ignored.
+[[command]]
+name = "package"
+match = "*make package*"
+after = ["test-core"]

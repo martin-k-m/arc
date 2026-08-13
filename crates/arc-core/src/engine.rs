@@ -147,6 +147,7 @@ struct Inputs {
 struct Plan {
     cfg: Config,
     classifier: Classifier,
+    family: family::ExecutionFamily,
     family_key: String,
     resolved: PathBuf,
     rel_cwd: String,
@@ -596,22 +597,23 @@ fn plan(
     let cfg = project.config_for(&command_line)?;
     let resolved = key::find_program_or_explain(program, cwd)?;
     let rel_cwd = key::rel_cwd(&project.root, cwd);
-    let project_id = crate::hash::hash_bytes(project.root.to_string_lossy().as_bytes()).hex();
+    let project_id = crate::project_id(&project.root);
     let family_key = family::family_key(program, args, &rel_cwd, &cfg).hex();
     let classifier = Classifier::new(&project.root, arc_home);
 
     let caps = trace::platform_capabilities();
     let now = scan::now_millis();
-    db.touch_family(&family::ExecutionFamily {
+    let family = family::ExecutionFamily {
         key: family_key.clone(),
         program: program.to_string(),
         args: args.to_vec(),
-        project_root: project.root.to_string_lossy().to_string(),
+        project_root: crate::paths::display_form(&project.root),
         rel_cwd: rel_cwd.clone(),
         first_seen: now,
         last_seen: now,
         runs: 1,
-    })?;
+    };
+    db.touch_family(&family)?;
     // Knowledge that fails validation is discarded rather than repaired: a
     // dependency set Arc cannot vouch for is worth exactly as much as none.
     let (deps, dep_state) = match db.dependency_set(&family_key)? {
@@ -634,6 +636,7 @@ fn plan(
     Ok(Plan {
         cfg,
         classifier,
+        family,
         family_key,
         resolved,
         rel_cwd,
@@ -655,17 +658,8 @@ fn learn(db: &Db, plan: &Plan, fresh: DependencySet, now: i64) -> Result<Depende
         m
     };
     merged.declared_inputs = plan.cfg.inputs.include.clone();
-
-    // Only a family whose inputs are actually narrowed earns index rows.
-    // Indexing a whole project would make `arc affected` answer "everything",
-    // at the cost of a row per file per family.
-    let indexed: Vec<String> = if merged.inputs_are_narrowed() {
-        merged.inputs.clone()
-    } else {
-        Vec::new()
-    };
-    db.put_dependency_set(&plan.project_id, &merged, &indexed)?;
-
+    let node = crate::graph::TaskNode::from_family(&plan.family, &merged, &plan.cfg);
+    db.put_dependency_set(&plan.project_id, &merged, &node)?;
     Ok(merged)
 }
 

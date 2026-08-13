@@ -16,6 +16,7 @@ pub mod key;
 pub mod maintenance;
 pub mod outputs;
 pub mod paths;
+pub mod plan;
 pub mod project;
 pub mod record;
 pub mod scan;
@@ -23,6 +24,12 @@ pub mod store;
 pub mod trace;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Stable identity of a project within the database, so two checkouts of the
+/// same repository at different paths never share a task graph.
+pub fn project_id(root: &std::path::Path) -> String {
+    hash::hash_bytes(paths::display_form(root).as_bytes()).hex()
+}
 
 /// Bumped whenever anything that feeds an execution key changes meaning. Old
 /// entries then simply stop matching instead of being misinterpreted.
