@@ -63,6 +63,10 @@ fn scoping_digest(cfg: &Config) -> Digest {
     h.field((cfg.commands.len() as u64).to_le_bytes());
     for c in &cfg.commands {
         h.field(&c.match_);
+        // A block's declared command decides which command lines it scopes, so
+        // it belongs here for the same reason `match` does.
+        h.field(c.command.as_deref().unwrap_or(""));
+        list(&mut h, &c.args);
         list(&mut h, &c.inputs);
         list(&mut h, &c.exclude);
         list(&mut h, &c.outputs);

@@ -379,6 +379,7 @@ pub fn run(
 
     // ---- learn -------------------------------------------------------------
     progress.stage("learning dependencies");
+    let mut learned_node = None;
     let (trace_summary, learned) = match &observations {
         Some((caps, name, obs)) => {
             let fresh = DependencySet::from_observations(
@@ -389,7 +390,8 @@ pub fn run(
                 &project.root,
                 now,
             );
-            let merged = learn(&db, &plan, fresh, now)?;
+            let (merged, node) = learn(&db, &plan, fresh, now)?;
+            learned_node = Some(node);
             (
                 Some(TraceSummary {
                     backend: name.to_string(),
@@ -499,15 +501,23 @@ pub fn run(
         original_duration_ms: outcome.duration_ms,
     });
     db.put_execution(&record, entry.as_ref())?;
+    db.record_duration(&plan.family_key, outcome.duration_ms)?;
 
     // The command has already succeeded. Publishing is best-effort from here:
     // a remote that rejects, times out or is simply absent changes nothing
     // about the result the user just got.
-    if store_cacheable {
-        if let Some(r) = remote.as_ref().filter(|r| r.write) {
-            progress.stage("publishing to remote cache");
+    if let Some(r) = remote.as_ref().filter(|r| r.write) {
+        progress.stage("publishing to remote cache");
+        if store_cacheable {
             if let Err(e) = publish(r, &store, &record, &exec_key.hex()) {
                 remote_error = Some(e.to_string());
+            }
+        }
+        // Dependency knowledge is published even when the result is not
+        // cacheable: knowing what a failing test reads is still worth sharing.
+        if let Some(node) = &learned_node {
+            if let Err(e) = r.publish_task(&remote::task_from_node(node)) {
+                remote_error.get_or_insert(e.to_string());
             }
         }
     }
@@ -838,7 +848,12 @@ fn plan(
 }
 
 /// Fold a fresh observation into stored knowledge and reindex the family.
-fn learn(db: &Db, plan: &Plan, fresh: DependencySet, now: i64) -> Result<DependencySet> {
+fn learn(
+    db: &Db,
+    plan: &Plan,
+    fresh: DependencySet,
+    now: i64,
+) -> Result<(DependencySet, crate::graph::TaskNode)> {
     let mut merged = if plan.dep_state == Completeness::Invalid || plan.deps.observations == 0 {
         fresh
     } else {
@@ -849,7 +864,7 @@ fn learn(db: &Db, plan: &Plan, fresh: DependencySet, now: i64) -> Result<Depende
     merged.declared_inputs = plan.cfg.inputs.include.clone();
     let node = crate::graph::TaskNode::from_family(&plan.family, &merged, &plan.cfg);
     db.put_dependency_set(&plan.project_id, &merged, &node)?;
-    Ok(merged)
+    Ok((merged, node))
 }
 
 /// Run without touching cache state, but still record what happened.

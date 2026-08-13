@@ -140,6 +140,123 @@ pub fn touched_paths(changes: &[Change]) -> Vec<String> {
     v
 }
 
+/// Resolve a revision expression to a commit id. The expression is passed as a
+/// single argument to `git rev-parse`, never through a shell, so a branch name
+/// containing metacharacters is data rather than syntax.
+pub fn resolve(cwd: &Path, rev: &str) -> std::result::Result<String, Unavailable> {
+    if rev.trim().is_empty() {
+        return Err(Unavailable::Failed("empty revision".into()));
+    }
+    let spec = format!("{rev}^{{commit}}");
+    Ok(git(cwd, &["rev-parse", "--verify", "--quiet", &spec])?
+        .trim()
+        .to_string())
+}
+
+/// Whether a commit is present in this checkout. A shallow clone answers `false`
+/// for anything outside its truncated history, which is exactly the case CI must
+/// notice rather than treat as "nothing changed".
+pub fn has_commit(cwd: &Path, rev: &str) -> bool {
+    resolve(cwd, rev).is_ok_and(|s| !s.is_empty())
+}
+
+pub fn is_shallow(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "--is-shallow-repository"])
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// Fetch history from a remote. Only ever called when the user asked for it:
+/// Arc does not mutate a repository as a side effect of analysing it.
+pub fn fetch(cwd: &Path, remote: &str, refspec: &str, depth: Option<u32>) -> Result<()> {
+    let deepen;
+    let mut args = vec!["fetch", "--no-tags", "--quiet", remote, refspec];
+    if let Some(d) = depth {
+        deepen = format!("--deepen={d}");
+        args.insert(1, &deepen);
+    }
+    git(cwd, &args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Changes between two commits, from `--name-status -z`: machine-readable,
+/// NUL-delimited, rename and copy detection on.
+pub fn changed_between(
+    cwd: &Path,
+    base: &str,
+    head: &str,
+) -> std::result::Result<Vec<Change>, Unavailable> {
+    let range = format!("{base}..{head}");
+    let raw = git(
+        cwd,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "-C",
+            "--no-renames-empty",
+            &range,
+        ],
+    )
+    // `--no-renames-empty` is not universal; retry without it rather than
+    // reporting no changes because of a Git version difference.
+    .or_else(|_| git(cwd, &["diff", "--name-status", "-z", "-M", "-C", &range]))?;
+    Ok(parse_name_status(&raw))
+}
+
+/// Changes between a commit and the working tree, including untracked files.
+/// This is what a developer running `arc ci --base origin/main` locally means.
+pub fn changed_since(cwd: &Path, base: &str) -> std::result::Result<Vec<Change>, Unavailable> {
+    let raw = git(cwd, &["diff", "--name-status", "-z", "-M", "-C", base])?;
+    let mut out = parse_name_status(&raw);
+    out.extend(changes(cwd)?);
+    out.sort_by(|a, b| (&a.path, a.kind.label()).cmp(&(&b.path, b.kind.label())));
+    out.dedup_by(|a, b| a.path == b.path && a.kind == b.kind && a.from == b.from);
+    Ok(out)
+}
+
+/// `X\0path\0` records, with `R100\0old\0new\0` and `C100\0src\0dst\0` for
+/// renames and copies. The status letter is followed by a similarity score, so
+/// only its first byte is significant.
+fn parse_name_status(raw: &str) -> Vec<Change> {
+    let mut out = Vec::new();
+    let mut fields = raw.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let Some(code) = status.as_bytes().first().copied() else {
+            continue;
+        };
+        match code {
+            b'R' | b'C' => {
+                let (Some(from), Some(to)) = (fields.next(), fields.next()) else {
+                    break;
+                };
+                out.push(Change {
+                    path: to.to_string(),
+                    kind: ChangeKind::Renamed,
+                    from: Some(from.to_string()),
+                });
+            }
+            _ => {
+                let Some(path) = fields.next() else { break };
+                let kind = match code {
+                    b'A' => ChangeKind::Added,
+                    b'D' => ChangeKind::Deleted,
+                    // T (type change, including a gitlink becoming a file) and
+                    // U (unmerged) both mean the path is not what it was.
+                    _ => ChangeKind::Modified,
+                };
+                out.push(Change {
+                    path: path.to_string(),
+                    kind,
+                    from: None,
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn repo_root(cwd: &Path) -> Result<Option<std::path::PathBuf>> {
     Ok(match git(cwd, &["rev-parse", "--show-toplevel"]) {
         Ok(s) => Some(std::path::PathBuf::from(crate::paths::display_form(
@@ -172,5 +289,38 @@ mod tests {
     fn paths_with_spaces_survive_nul_delimited_parsing() {
         let c = parse_status(" M my docs/a b.md\0");
         assert_eq!(c[0].path, "my docs/a b.md");
+    }
+
+    #[test]
+    fn name_status_parses_every_change_kind_including_renames() {
+        let raw = "M\0src/a.rs\0A\0src/b.rs\0D\0docs/old.md\0R100\0old.rs\0new.rs\0T\0link\0";
+        let c = parse_name_status(raw);
+        assert_eq!(c.len(), 5);
+        assert_eq!(
+            (c[0].kind, c[0].path.as_str()),
+            (ChangeKind::Modified, "src/a.rs")
+        );
+        assert_eq!(c[1].kind, ChangeKind::Added);
+        assert_eq!(c[2].kind, ChangeKind::Deleted);
+        assert_eq!(c[3].kind, ChangeKind::Renamed);
+        assert_eq!(c[3].path, "new.rs");
+        assert_eq!(c[3].from.as_deref(), Some("old.rs"));
+        assert_eq!(c[4].kind, ChangeKind::Modified);
+        assert!(touched_paths(&c).contains(&"old.rs".to_string()));
+    }
+
+    #[test]
+    fn a_truncated_name_status_stream_does_not_panic() {
+        for cut in 0..24 {
+            let raw = "R100\0old.rs\0new.rs\0M\0a.rs\0";
+            parse_name_status(&raw[..cut.min(raw.len())]);
+        }
+    }
+
+    #[test]
+    fn name_status_handles_newlines_and_tabs_in_paths() {
+        let c = parse_name_status("M\0weird\tname\nwith/newline.rs\0");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].path, "weird\tname\nwith/newline.rs");
     }
 }

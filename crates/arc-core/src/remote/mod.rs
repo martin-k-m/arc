@@ -290,6 +290,54 @@ impl Remote {
         Ok(Some(rec))
     }
 
+    /// Dependency knowledge for families this machine already intends to run.
+    ///
+    /// One request per batch rather than one per task: a CI job asks about every
+    /// canonical task at once, and the answer is only worth having if getting it
+    /// is cheaper than the work it avoids.
+    pub fn lookup_tasks(&self, families: &[String]) -> Result<Vec<protocol::RemoteTask>> {
+        let mut out = Vec::new();
+        for chunk in families.chunks(protocol::MAX_BATCH_TASKS) {
+            let url = self.url("tasks/lookup");
+            let bytes = serde_json::to_vec(&protocol::TaskLookupRequest {
+                families: chunk.to_vec(),
+            })?;
+            let start = Instant::now();
+            let resp = match self.send(|| {
+                self.auth(self.agent.post(&url))
+                    .set("Content-Type", "application/json")
+                    .send_bytes(&bytes)
+            }) {
+                Ok(r) => r,
+                // A server that does not serve task knowledge is a server Arc
+                // works without: the tasks stay unknown and therefore run.
+                Err(e) if is_not_found(&e) => return Ok(out),
+                Err(e) => return Err(e),
+            };
+            let body: protocol::TaskLookupResponse = read_json(resp, protocol::MAX_METADATA_BYTES)?;
+            self.counters
+                .lookup_ms
+                .fetch_add(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            for t in body.tasks {
+                if t.validate(None).is_ok() && t.compatible_with_host().is_ok() {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn publish_task(&self, task: &protocol::RemoteTask) -> Result<()> {
+        task.validate(None).map_err(|e| anyhow!(e))?;
+        let url = self.url(&format!("tasks/{}", task.family_key));
+        self.send(|| {
+            self.auth(self.agent.put(&url))
+                .set("Content-Type", "application/json")
+                .send_bytes(&task.canonical())
+        })?;
+        Ok(())
+    }
+
     pub fn missing(&self, digests: &[String]) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for chunk in digests.chunks(protocol::MAX_BATCH_DIGESTS) {
@@ -675,6 +723,45 @@ pub fn from_record(rec: &ExecutionRecord) -> RemoteExecution {
         stdout: rec.stdout.as_ref().map(wire),
         stderr: rec.stderr.as_ref().map(wire),
         arc_version: rec.arc_version.clone(),
+    }
+}
+
+/// Publishable form of a learned task row.
+pub fn task_from_node(node: &crate::graph::TaskNode) -> protocol::RemoteTask {
+    use crate::graph::Consumes;
+    protocol::RemoteTask {
+        protocol: protocol::PROTOCOL_VERSION,
+        graph_semantics: crate::graph::GRAPH_SCHEMA_VERSION,
+        dependency_semantics: crate::dependency::DEPENDENCY_SCHEMA_VERSION,
+        trace_semantics: crate::trace::TRACE_SEMANTICS_VERSION,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        family_key: node.family_key.clone(),
+        program: node.program.clone(),
+        args: node.args.clone(),
+        rel_cwd: node.rel_cwd.clone(),
+        completeness: node.completeness.label().to_string(),
+        inputs_narrowed: node.inputs_narrowed,
+        produces: node
+            .produces
+            .iter()
+            .map(|p| WirePath::from_rel(p))
+            .collect(),
+        consumes: node
+            .consumes
+            .iter()
+            .map(|c| protocol::WireConsumed {
+                path: WirePath::from_rel(&c.path),
+                kind: match c.kind {
+                    Consumes::File => protocol::WireConsumes::File,
+                    Consumes::Directory => protocol::WireConsumes::Directory,
+                    Consumes::Existence => protocol::WireConsumes::Existence,
+                },
+            })
+            .collect(),
+        declared_inputs: node.declared_inputs.clone(),
+        observations: node.observations,
+        arc_version: crate::VERSION.to_string(),
     }
 }
 

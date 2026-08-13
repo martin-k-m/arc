@@ -97,6 +97,34 @@ Republishing a byte-identical record returns `200`. This makes concurrent
 publication of the same result safe and makes contradictory results impossible
 to introduce silently.
 
+### `GET /v1/{ns}/tasks/{family_key}`
+
+Returns one task record, or `404`.
+
+### `PUT /v1/{ns}/tasks/{family_key}`
+
+Publishes dependency knowledge for a family. `400` if the record fails
+validation or its `family_key` does not equal `{family_key}`.
+
+Unlike an execution record, a task record is an observation rather than a claim
+of exclusivity, so a later publisher with at least as many observations replaces
+an earlier one and neither is a conflict. Nothing downstream trusts it without
+re-deriving the family key locally.
+
+### `POST /v1/{ns}/tasks/lookup`
+
+```json
+{ "families": ["<64 hex>", ...] }
+```
+
+Returns `{"tasks": [...]}`, omitting families the server does not have. One
+round trip per batch: a CI job asks about every task it intends to run at once,
+and the answer is only worth having if obtaining it costs less than the work it
+avoids.
+
+A server that does not implement task knowledge answers `404`, which clients
+treat as "no knowledge": the tasks stay unknown and therefore run.
+
 ## The execution record
 
 ```json
@@ -168,6 +196,8 @@ Partial restoration is never correct.
 | Metadata payload | 16 MiB |
 | Output entries per record | 250,000 |
 | Digests per `objects/missing` | 4,096 |
+| Families per `tasks/lookup` | 512 |
+| Paths per task record | 100,000 |
 | Object size | 16 GiB |
 | Namespace length | 128 |
 | Path length | 4,096 |
@@ -177,6 +207,43 @@ Partial restoration is never correct.
 Failures carry `{"error": "..."}`. Clients retry `5xx` and transport faults a
 small bounded number of times with exponential backoff; `401`, `403`, `404`,
 `409` and malformed responses are never retried.
+
+## The task record
+
+```json
+{
+  "protocol": 1,
+  "graph_semantics": 1,
+  "dependency_semantics": 2,
+  "trace_semantics": 1,
+  "os": "linux",
+  "arch": "x86_64",
+  "family_key": "<64 hex>",
+  "program": "cargo",
+  "args": ["test", "-p", "arc-core"],
+  "rel_cwd": "",
+  "completeness": "complete",
+  "inputs_narrowed": true,
+  "produces": [{ "enc": "utf8", "v": "generated/client.ts" }],
+  "consumes": [{ "path": { "enc": "utf8", "v": "src/lib.rs" }, "kind": "file" }],
+  "declared_inputs": ["src/**"],
+  "observations": 7,
+  "arc_version": "0.6.0"
+}
+```
+
+`program`, `args` and `rel_cwd` are present so a recipient can confirm the
+record describes the task it already intends to run. **A recipient never learns
+a command from here.** It derives the family key from its own checked-out
+configuration, requires the record to carry that exact key, and requires the
+command fields to match its local declaration byte for byte. Any mismatch, any
+semantics difference, any unreadable path, and the record is discarded and the
+task is treated as unknown.
+
+Consequence, and the property this design exists to guarantee: a hostile server
+can cause a client to do **more** work than necessary. It cannot cause a client
+to run different work, and it cannot cause a client to skip work. Task knowledge
+informs selection only — it never narrows a cache key.
 
 ## What the protocol does not do
 

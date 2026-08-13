@@ -256,6 +256,47 @@ fn route(state: &State, method: &Method, url: &str, mut req: Request) -> Result<
                 Err(e) => fail_ok(req, 400, &e.to_string()),
             }
         }
+        (Method::Post, ["tasks", "lookup"]) => {
+            let body: protocol::TaskLookupRequest =
+                match read_json(&mut req, protocol::MAX_METADATA_BYTES) {
+                    Ok(b) => b,
+                    Err(e) => return fail_ok(req, 400, &e.to_string()),
+                };
+            if body.families.len() > protocol::MAX_BATCH_TASKS {
+                return fail_ok(req, 413, "too many families in one batch");
+            }
+            let tasks = body
+                .families
+                .iter()
+                .filter(|f| protocol::valid_digest(f))
+                .filter_map(|f| state.storage.get_task(ns, f))
+                .collect();
+            json(req, 200, &protocol::TaskLookupResponse { tasks })
+        }
+        (Method::Get, ["tasks", family]) => {
+            if !protocol::valid_digest(family) {
+                return fail_ok(req, 400, "malformed family key");
+            }
+            match state.storage.get_task(ns, family) {
+                Some(t) => json(req, 200, &t),
+                None => fail_ok(req, 404, "no such task"),
+            }
+        }
+        (Method::Put, ["tasks", family]) => {
+            if !protocol::valid_digest(family) {
+                return fail_ok(req, 400, "malformed family key");
+            }
+            let task: protocol::RemoteTask = match read_json(&mut req, protocol::MAX_METADATA_BYTES)
+            {
+                Ok(t) => t,
+                Err(e) => return fail_ok(req, 400, &e.to_string()),
+            };
+            if let Err(e) = task.validate(Some(family)) {
+                return fail_ok(req, 400, &e);
+            }
+            state.storage.put_task(ns, family, &task)?;
+            Ok(req.respond(Response::empty(201))?)
+        }
         (Method::Get, ["executions", key]) => {
             if !protocol::valid_digest(key) {
                 return fail_ok(req, 400, "malformed execution key");

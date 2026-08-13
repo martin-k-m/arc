@@ -53,15 +53,22 @@ exclude = ["TERM"]
 # `name` is optional and never part of execution identity. It only gives the
 # task a readable label in `arc graph` and `arc affected`, and a handle for
 # `after`.
+# A block with both `name` and `command` is *runnable*: `arc ci` can execute it.
+# `match` is then unnecessary — the block scopes exactly the command line it
+# declares — but you may still add one to scope a wider family of invocations.
 [[command]]
 name = "test-core"
-match = "cargo test*"
+command = "cargo"
+args = ["test", "--workspace"]
 inputs = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+tags = ["test"]
 
 [[command]]
 name = "lint"
-match = "cargo clippy*"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets"]
 inputs = ["src/**", "Cargo.toml", "Cargo.lock"]
+tags = ["fast"]
 
 [[command]]
 match = "npm*"
@@ -92,3 +99,20 @@ token_env = "ARC_CACHE_TOKEN"
 # An untrusted CI job (a fork's pull request) should read but not write.
 read = true
 write = true
+
+[ci]
+# What `arc ci` runs. Every entry must name a runnable [[command]] above;
+# naming one that does not exist is an error rather than a silent skip. Omit
+# `tasks` entirely and every runnable command is used.
+tasks = ["test-core", "lint"]
+
+# When Arc may publish to the remote cache from CI.
+#
+#   "trusted"  only from events Arc can positively identify as trusted.
+#              A fork pull request is not one, and neither is
+#              pull_request_target. This is the default.
+#   "always"   publish regardless. Only for a cache no untrusted code can reach.
+#   "never"    never publish from CI; read only.
+#
+# Whatever this says, never pass a cache-write token to a fork's pull request.
+remote_write = "trusted"

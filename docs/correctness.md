@@ -687,3 +687,122 @@ are never written to the database, the object store, execution records, history,
 JSON output, logs, or error messages, and redirects are not followed so a
 credential cannot be forwarded to another host. `arc doctor` and `arc remote
 status` report that a token is configured, never what it is.
+
+## CI
+
+`arc ci` is orchestration. It selects work and reports on it; it does not weaken
+anything above. Cache keys, completeness, narrowing and unknown-propagation
+behave in CI exactly as they behave on a laptop.
+
+### Comparison correctness
+
+The affected analysis is only as good as the diff it is given, so resolving
+base and head is where CI can go wrong quietly.
+
+* A pull request compares its head against its **base**, taken from the event
+  payload. It is not the checked-out commit against its parent: a workflow that
+  checks out GitHub's synthetic merge commit would then be comparing the merge
+  against one of its parents, which answers a different question.
+* A merge group uses the merge queue's own base and head, not a pull request's.
+* A push uses the event's `before`, falling back to `HEAD~1` only when that
+  commit is actually present. The all-zero sha — GitHub's way of saying "there
+  was no previous commit" — is not a revision.
+* `--base`/`--head` override everything, so a CI decision can be reproduced
+  locally exactly.
+
+Comparisons are one of two kinds, never a blend: a commit range, or a commit
+against the working tree. `--base` alone means the working tree, including
+untracked files, which is what a developer reproducing CI wants. In CI the head
+always comes from the provider.
+
+Revisions are resolved through `git rev-parse --verify`, as arguments, never
+through a shell. A branch name is untrusted input.
+
+### No diff means no proof
+
+Every path that cannot establish a complete diff ends in the same place: the
+comparison is unknown, every declared task is raised to `Unknown`, and
+everything runs.
+
+* the base commit is absent from a shallow clone
+* the event carries no base at all (`workflow_dispatch`)
+* the event payload is missing, truncated, malformed, or has the wrong types
+* `git diff` itself fails
+* the provider names a head this checkout does not contain
+
+Verdicts are only ever raised this way, never lowered — a task the graph already
+proved affected stays affected. The reason is reported rather than swallowed.
+
+### Canonical task selection
+
+CI considers only tasks the repository declares. A command Arc happens to have
+learned about, but which `arc.toml` does not name, is never executed by
+`arc ci` even when a change reaches it. A declared task Arc knows nothing about
+is `Unknown`, therefore selected, therefore executed and learned from.
+
+### Trust and remote writes
+
+Trust is a policy input, not a security boundary, and Arc treats it as such: it
+decides only whether to *publish*, never whether to believe. A fork pull request
+is untrusted. `pull_request_target` is never trusted, because Arc cannot see
+which tree the workflow checked out. Anything Arc cannot classify is not
+trusted. The policy is enforced on the children too — `arc ci` passes a
+read-only remote down to every task it schedules, so a task cannot publish
+merely because a trusted workflow started it.
+
+### CI environment variables
+
+CI injects variables that identify a *run* rather than describe the work:
+`GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_JOB`, `GITHUB_STEP_SUMMARY` and
+others. If Arc hashed the whole environment, every CI run would miss.
+
+It does not, and never has: the environment digest covers an allowlist —
+`DEFAULT_ENV` plus `[env] include` — so a variable participates in a key only
+because someone named it. Nothing needed excluding, and nothing is excluded,
+which matters because the alternative (dropping everything matching `GITHUB_*`)
+would silently erase a real dependency for any project that legitimately reads
+one. A project that *does* include a volatile variable is warned by `arc ci` and
+`arc doctor`, and its choice is still honoured.
+
+### Shared task knowledge
+
+A fresh CI runner has no local graph. Arc publishes each learned task's
+dependency knowledge to the remote cache and fetches it for the tasks the
+checked-out `arc.toml` declares, so a new machine can prove work unaffected
+without having run it once.
+
+This metadata is optimisation data and never authority:
+
+* The family key is derived **locally**, from the checked-out configuration. A
+  record that does not carry that exact key is discarded.
+* `program`, `args` and `rel_cwd` must match the local declaration byte for
+  byte. They are compared, never adopted — the command Arc runs always comes
+  from the repository.
+* Graph, dependency and trace semantics versions must all match this Arc, and
+  the record must have been observed on the same OS and architecture.
+* Every path in the record goes through the same validation as any other wire
+  path: no traversal, no absolute paths, no drive-qualified paths.
+* Knowledge that is partial, unparseable, or written in a completeness word this
+  Arc does not recognise leaves the task `Unknown`.
+
+A compromised cache server can therefore make Arc run **more** work than
+necessary. It cannot make Arc run different work, and it cannot make Arc skip
+work. Remote knowledge is used for *selection* only; it never narrows a cache
+key, so it cannot cause a false hit either.
+
+### Estimated work avoided
+
+The figure comes from the median of each task's recent recorded durations,
+bounded to a fixed window per family. Only real executions are recorded — a
+replay measures restoration, not work. A task with no history contributes
+nothing and is reported as unmeasured, so a first run cannot claim a saving it
+has no evidence for.
+
+### Provider-supplied text
+
+Repository names, branch names and file paths on a fork pull request are written
+by whoever opened it. Nothing from a provider reaches a terminal, a Markdown
+summary or a workflow command without being stripped of control characters and
+escaped for its destination. Workflow-command values additionally encode `%`,
+carriage return and newline, so no provider-controlled string can begin a
+`::error::`. Identity remains bytes; only presentation is sanitised.

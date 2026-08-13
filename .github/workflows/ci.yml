@@ -29,6 +29,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release
       - run: cargo run --release -q -p arc-core --example graph_bench
+      - run: cargo run --release -q -p arc-core --example ci_bench
 
   # The Linux tracer is the one component whose behaviour depends on the
   # sandbox it runs in, so it is exercised both ways: under a container's

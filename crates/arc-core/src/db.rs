@@ -32,12 +32,48 @@ const DEPENDENCIES: TableDefinition<&str, &str> = TableDefinition::new("dependen
 /// range scan per project. Edges are derived from these rows in memory and never
 /// stored, which makes a stale edge structurally impossible.
 const GRAPH: TableDefinition<&str, &str> = TableDefinition::new("task_graph");
+/// family key -> `TaskTiming`. How long this kind of work actually takes, so a
+/// CI summary can say what was avoided instead of guessing.
+const TIMINGS: TableDefinition<&str, &str> = TableDefinition::new("task_timings");
 /// Metadata schema marker. A database written by an incompatible version is
 /// rebuilt rather than reinterpreted.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
 /// Bumped when table layouts change incompatibly.
-pub const DB_SCHEMA_VERSION: &str = "4";
+pub const DB_SCHEMA_VERSION: &str = "5";
+
+/// Recent execution durations for one family, bounded so history cannot grow
+/// without limit. The median of the retained window is robust against the one
+/// cold run that took thirty times as long as the rest.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskTiming {
+    pub runs: u64,
+    pub last_ms: u64,
+    #[serde(default)]
+    pub recent: Vec<u64>,
+}
+
+/// How many durations are kept per family.
+pub const TIMING_WINDOW: usize = 16;
+
+impl TaskTiming {
+    pub fn median_ms(&self) -> Option<u64> {
+        if self.recent.is_empty() {
+            return None;
+        }
+        let mut v = self.recent.clone();
+        v.sort_unstable();
+        Some(v[v.len() / 2])
+    }
+
+    fn record(&mut self, ms: u64) {
+        self.runs = self.runs.saturating_add(1);
+        self.last_ms = ms;
+        self.recent.push(ms);
+        let overflow = self.recent.len().saturating_sub(TIMING_WINDOW);
+        self.recent.drain(..overflow);
+    }
+}
 
 pub const COUNTER_HITS: &str = "hits";
 pub const COUNTER_MISSES: &str = "misses";
@@ -83,6 +119,7 @@ impl Db {
             txn.open_table(FAMILIES)?;
             txn.open_table(DEPENDENCIES)?;
             txn.open_table(GRAPH)?;
+            txn.open_table(TIMINGS)?;
             txn.open_table(META)?.insert("schema", DB_SCHEMA_VERSION)?;
             Ok(())
         })?;
@@ -431,6 +468,38 @@ impl Db {
         })
     }
 
+    /// Fold one real execution's duration into a family's rolling window.
+    /// Replays are not recorded: a hit measures restoration, not work.
+    pub fn record_duration(&self, family_key: &str, ms: u64) -> Result<()> {
+        if family_key.is_empty() {
+            return Ok(());
+        }
+        self.write(|txn| {
+            let mut t = txn.open_table(TIMINGS)?;
+            let mut timing: TaskTiming = t
+                .get(family_key)?
+                .and_then(|v| serde_json::from_str(v.value()).ok())
+                .unwrap_or_default();
+            timing.record(ms);
+            t.insert(family_key, serde_json::to_string(&timing)?.as_str())?;
+            Ok(())
+        })
+    }
+
+    pub fn timings(&self) -> Result<std::collections::HashMap<String, TaskTiming>> {
+        self.read(|txn| {
+            let t = txn.open_table(TIMINGS)?;
+            let mut out = std::collections::HashMap::new();
+            for row in t.iter()? {
+                let (k, v) = row?;
+                if let Ok(timing) = serde_json::from_str(v.value()) {
+                    out.insert(k.value().to_string(), timing);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn clear_all(&self) -> Result<()> {
         self.release();
         std::fs::remove_file(&self.path).ok();
@@ -495,6 +564,36 @@ mod tests {
         m.insert("src/a.rs".into(), (12, 34, hash_bytes(b"a")));
         m.insert("b.rs".into(), (0, -1, hash_bytes(b"b")));
         assert_eq!(decode_fingerprints(&encode_fingerprints(&m)), m);
+    }
+
+    #[test]
+    fn timing_history_is_bounded_and_robust_to_one_slow_run() {
+        let mut t = TaskTiming::default();
+        assert_eq!(t.median_ms(), None, "no history is not zero");
+        for ms in [100, 110, 90, 100_000] {
+            t.record(ms);
+        }
+        assert_eq!(
+            t.median_ms(),
+            Some(110),
+            "one cold run does not set the estimate"
+        );
+        for i in 0..1000 {
+            t.record(i);
+        }
+        assert_eq!(t.recent.len(), TIMING_WINDOW);
+        assert_eq!(t.runs, 1004);
+        assert_eq!(t.last_ms, 999);
+    }
+
+    #[test]
+    fn a_timing_window_of_extreme_values_neither_overflows_nor_goes_negative() {
+        let mut t = TaskTiming::default();
+        for _ in 0..100 {
+            t.record(u64::MAX);
+        }
+        assert_eq!(t.median_ms(), Some(u64::MAX));
+        assert_eq!(t.runs, 100);
     }
 
     #[test]

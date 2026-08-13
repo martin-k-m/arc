@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use arc_core::hash::Hasher;
-use arc_core::remote::protocol::{self, RemoteExecution};
+use arc_core::remote::protocol::{self, RemoteExecution, RemoteTask};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ impl Storage {
     pub fn open(root: &Path) -> Result<Storage> {
         fs::create_dir_all(root.join("objects")).context("creating object store")?;
         fs::create_dir_all(root.join("executions")).context("creating record store")?;
+        fs::create_dir_all(root.join("tasks")).context("creating task store")?;
         fs::create_dir_all(root.join("tmp")).context("creating tmp")?;
         Ok(Storage {
             root: root.to_path_buf(),
@@ -63,6 +64,41 @@ impl Storage {
             .join("executions")
             .join(ns)
             .join(format!("{key}.json"))
+    }
+
+    fn task_path(&self, ns: &str, family: &str) -> PathBuf {
+        self.root
+            .join("tasks")
+            .join(ns)
+            .join(format!("{family}.json"))
+    }
+
+    pub fn get_task(&self, ns: &str, family: &str) -> Option<RemoteTask> {
+        serde_json::from_slice(&fs::read(self.task_path(ns, family)).ok()?).ok()
+    }
+
+    /// Task knowledge is an observation, not a claim of exclusivity: a later
+    /// publisher with at least as many observations replaces an earlier one,
+    /// and neither is a conflict. Nothing downstream trusts it without
+    /// re-deriving the family key locally.
+    pub fn put_task(&self, ns: &str, family: &str, task: &RemoteTask) -> Result<()> {
+        if let Some(prev) = self.get_task(ns, family) {
+            if prev.observations > task.observations {
+                return Ok(());
+            }
+        }
+        let dest = self.task_path(ns, family);
+        fs::create_dir_all(dest.parent().unwrap())?;
+        let tmp = self.tmp();
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&task.canonical())?;
+            f.sync_all()?;
+        }
+        if fs::rename(&tmp, &dest).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(())
     }
 
     pub fn has_object(&self, digest: &str) -> bool {
@@ -158,7 +194,8 @@ impl Storage {
         }
     }
 
-    pub fn stats(&self) -> Result<(usize, u64, usize)> {
+    /// `(objects, bytes, executions, tasks)`.
+    pub fn stats(&self) -> Result<(usize, u64, usize, usize)> {
         let mut objects = 0;
         let mut bytes = 0;
         for shard in fs::read_dir(self.root.join("objects"))? {
@@ -172,14 +209,22 @@ impl Storage {
                 bytes += f.metadata()?.len();
             }
         }
-        let mut records = 0;
-        for ns in fs::read_dir(self.root.join("executions"))? {
-            let ns = ns?;
-            if ns.file_type()?.is_dir() {
-                records += fs::read_dir(ns.path())?.count();
+        let count = |dir: PathBuf| -> Result<usize> {
+            let mut n = 0;
+            for ns in fs::read_dir(dir)? {
+                let ns = ns?;
+                if ns.file_type()?.is_dir() {
+                    n += fs::read_dir(ns.path())?.count();
+                }
             }
-        }
-        Ok((objects, bytes, records))
+            Ok(n)
+        };
+        Ok((
+            objects,
+            bytes,
+            count(self.root.join("executions"))?,
+            count(self.root.join("tasks"))?,
+        ))
     }
 }
 

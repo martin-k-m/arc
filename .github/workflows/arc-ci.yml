@@ -1,0 +1,49 @@
+# Arc running Arc's own declared CI tasks.
+#
+# Also the worked example referenced by docs/ci.md. Two things in it are load
+# bearing:
+#
+#   * `fetch-depth: 0` — Arc compares two commits. Without history it cannot
+#     compute a diff, and falls back to running every declared task.
+#   * the token expression — a fork's pull request must never receive a
+#     cache-write credential. Arc refuses to publish from an untrusted event
+#     anyway, but the safe pattern is not to hand over the secret at all.
+name: arc-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  arc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Arc has no published binaries yet, so this repository builds the tool it
+      # is about to use. A project consuming Arc would install it instead.
+      - name: build arc
+        run: cargo build --release -p arc-cli
+
+      - name: report context
+        run: ./target/release/arc doctor
+
+      - name: plan
+        run: ./target/release/arc ci --dry-run --explain
+
+      - name: run
+        run: ./target/release/arc ci -j 4
+        env:
+          # No ARC_CACHE_TOKEN is configured for this repository yet. When one
+          # is, this is the shape: empty on a fork, the secret otherwise.
+          ARC_CACHE_TOKEN: ${{ github.event.pull_request.head.repo.fork && '' || secrets.ARC_CACHE_TOKEN }}

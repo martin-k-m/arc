@@ -224,8 +224,12 @@ fn direct(
         let key = PathKey::from_display(&c.path);
         let hit = match c.kind {
             // Anything appearing, changing or vanishing inside an enumerated
-            // directory changes its entry set.
-            graph::Consumes::Directory => changed_keys.iter().any(|k| under(k, &key)),
+            // directory changes its entry set. The directory's own path counts
+            // too: Git reports a submodule pointer move as a change to the
+            // gitlink itself, and the contents behind it are not the same.
+            graph::Consumes::Directory => {
+                changed_keys.contains(&key) || changed_keys.iter().any(|k| under(k, &key))
+            }
             _ => changed_keys.contains(&key),
         };
         if hit {
@@ -412,6 +416,17 @@ mod tests {
             test.causes.first(),
             Some(Cause::Upstream { via, .. }) if via == "gen/x"
         ));
+    }
+
+    #[test]
+    fn a_moved_submodule_pointer_affects_a_task_that_enumerates_it() {
+        let mut consumer = node("build", &[], &[], true);
+        consumer.consumes = vec![Consumed {
+            path: "vendor/lib".into(),
+            kind: Consumes::Directory,
+        }];
+        let v = verdicts(vec![consumer], &["vendor/lib"]);
+        assert_eq!(v["build"], Verdict::Affected);
     }
 
     #[test]

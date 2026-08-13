@@ -1,0 +1,37 @@
+# Arc's own configuration, and a worked example of a repository that uses
+# `arc ci`.
+
+[outputs]
+include = ["target/release/arc", "target/release/arc.exe", "target/release/arc-cache"]
+
+[[command]]
+name = "test"
+command = "cargo"
+args = ["test", "--workspace"]
+inputs = ["crates/**", "Cargo.toml", "Cargo.lock"]
+tags = ["slow"]
+
+[[command]]
+name = "lint"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+inputs = ["crates/**", "Cargo.toml", "Cargo.lock"]
+tags = ["fast"]
+
+[[command]]
+name = "fmt"
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+inputs = ["crates/**"]
+tags = ["fast"]
+
+[[command]]
+name = "build"
+command = "cargo"
+args = ["build", "--release"]
+inputs = ["crates/**", "Cargo.toml", "Cargo.lock"]
+tags = ["slow"]
+
+[ci]
+tasks = ["fmt", "lint", "test", "build"]
+remote_write = "trusted"
