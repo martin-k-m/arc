@@ -22,10 +22,18 @@ pub struct Node {
     pub completeness: String,
     pub inputs_narrowed: bool,
     pub declared_inputs: Vec<String>,
+    /// Project-relative files, then anything outside the project, so a reader
+    /// sees their own source before a list of system libraries.
     pub inputs: Vec<String>,
+    pub directories: Vec<String>,
+    /// Paths whose presence or absence the execution depends on, without
+    /// depending on their contents.
+    pub existence: Vec<String>,
     pub outputs: Vec<String>,
     pub executables: Vec<String>,
     pub observations: u64,
+    /// Everything preventing this family's model from being complete.
+    pub downgrades: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,9 +74,22 @@ fn node(family: &ExecutionFamily, deps: Option<&DependencySet>) -> Node {
         completeness: d.completeness.label().to_string(),
         inputs_narrowed: d.inputs_are_narrowed(),
         declared_inputs: d.declared_inputs.clone(),
-        inputs: d.inputs.clone(),
+        inputs: d
+            .inputs
+            .iter()
+            .cloned()
+            .chain(d.external.iter().map(|e| e.path.clone()))
+            .collect(),
+        directories: d
+            .directories
+            .iter()
+            .cloned()
+            .chain(d.external_directories.iter().cloned())
+            .collect(),
+        existence: d.existence.clone(),
         outputs: d.outputs.clone(),
         executables: d.executables.iter().map(|e| e.path.clone()).collect(),
         observations: d.observations,
+        downgrades: d.downgrades.iter().map(|x| x.describe()).collect(),
     }
 }

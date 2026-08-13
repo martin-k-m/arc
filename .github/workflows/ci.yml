@@ -28,3 +28,25 @@ jobs:
       - run: git config --global user.name ci
       - run: cargo test --workspace
       - run: cargo build --release
+
+  # The Linux tracer is the one component whose behaviour depends on the
+  # sandbox it runs in, so it is exercised both ways: under a container's
+  # default seccomp profile, and with ptrace explicitly forbidden. The second
+  # must fall back cleanly rather than fail.
+  tracing-sandboxes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: report capabilities
+        run: ./target/release/arc doctor
+      - name: default sandbox
+        run: cargo test --workspace --test linux_trace
+      - name: ptrace forbidden
+        run: |
+          docker run --rm \
+            --security-opt seccomp=<(echo '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["ptrace"],"action":"SCMP_ACT_ERRNO"}]}') \
+            -v "$PWD:/w" -w /w ubuntu:24.04 \
+            sh -c './target/release/arc doctor | grep -A2 "backend" && ./target/release/arc run sh -c "echo fallback works"'

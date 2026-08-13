@@ -1,7 +1,13 @@
-//! End-to-end tests for v0.2 dependency intelligence.
+//! End-to-end tests for dependency intelligence, against the real binary.
 //!
-//! These lean on the failure direction that matters: every case that Arc cannot
+//! These lean on the failure direction that matters: every case Arc cannot
 //! prove must end in an execution, never in a hit.
+//!
+//! Two worlds are exercised deliberately. Where a backend observes everything,
+//! Arc narrows automatically and a change it did not depend on is a *hit* —
+//! that is the whole point of the milestone. Where it does not, the project-wide
+//! scan applies and any change is a miss. Tests that care about the difference
+//! ask [`narrows`] rather than assuming a platform.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -114,6 +120,22 @@ fn git_available() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }
 
+/// Whether this platform's tracer can observe every dependency class, and so
+/// whether Arc will narrow the input set without being told to.
+///
+/// Read from the binary's own diagnostics rather than from `cfg!`, so the tests
+/// track what Arc actually reports — including a Linux container where ptrace is
+/// refused and the answer is "no" despite the platform.
+fn narrows() -> bool {
+    let out = Command::new(ARC)
+        .arg("doctor")
+        .output()
+        .expect("arc doctor");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.contains("automatic narrowing") && l.contains("supported"))
+}
+
 // ---------------------------------------------------------------- family ----
 
 #[test]
@@ -217,27 +239,78 @@ fn a_new_file_appearing_inside_the_scope_forces_a_miss() {
 }
 
 #[test]
-fn an_unscoped_command_is_invalidated_by_any_project_change() {
+fn without_narrowing_any_project_change_invalidates() {
+    // Pinned to the conservative backend so this holds on every platform: with
+    // no proof of what the command reads, Arc has no grounds to call any change
+    // irrelevant.
     let sb = Sandbox::new();
-    sb.run(&[]);
+    sb.run(&["--trace-backend", "snapshot"]);
+    sb.run(&["--trace-backend", "snapshot"]);
     sb.write("docs/design.md", "changed");
     assert!(
-        !stderr(&sb.run(&[])).contains("CACHE HIT"),
-        "without narrowing, Arc has no grounds to call a change irrelevant"
+        !stderr(&sb.run(&["--trace-backend", "snapshot"])).contains("CACHE HIT"),
+        "without narrowing, every change must be treated as relevant"
     );
+}
+
+#[test]
+fn a_complete_trace_makes_an_unrelated_change_irrelevant() {
+    if !narrows() {
+        return;
+    }
+    // No arc.toml, no scoping: the knowledge comes entirely from observing the
+    // execution. This is the milestone in one assertion.
+    let sb = Sandbox::new();
+    sb.run(&[]);
+    sb.run(&[]);
+    sb.write("docs/design.md", "rewritten");
+    let log = stderr(&sb.run(&[]));
+    assert!(log.contains("CACHE HIT"), "{log}");
 }
 
 // ---------------------------------------------------------------- trace ----
 
 #[test]
-fn tracing_reports_only_what_the_backend_can_actually_see() {
+fn tracing_never_claims_more_than_the_backend_can_see() {
     let sb = Sandbox::new();
     let log = stderr(&sb.run(&["--trace"]));
     assert!(log.contains("TRACE"), "{log}");
-    // The headline claim must never be "complete" while reads are unobservable.
-    assert!(log.contains("partial"), "{log}");
-    assert!(log.contains("not observed"), "{log}");
-    assert!(!log.contains("dependency model   complete"), "{log}");
+    let headline = log
+        .lines()
+        .find(|l| l.contains("TRACE "))
+        .unwrap_or_default();
+    if narrows() {
+        assert!(headline.contains("TRACE COMPLETE"), "{log}");
+    } else {
+        // The headline claim must never be "complete" while reads are
+        // unobservable, whatever else the report goes on to say.
+        assert!(headline.contains("TRACE PARTIAL"), "{log}");
+        assert!(
+            model_line(&log).contains("partial"),
+            "the model must be reported as partial: {log}"
+        );
+    }
+}
+
+/// The `dependency model` row of a trace report.
+fn model_line(log: &str) -> String {
+    log.lines()
+        .find(|l| l.contains("dependency model"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn pinning_the_conservative_backend_is_honoured_and_never_narrows() {
+    let sb = Sandbox::new();
+    let log = stderr(&sb.run(&["--trace", "--trace-backend", "snapshot"]));
+    assert!(log.contains("TRACE PARTIAL"), "{log}");
+    assert!(model_line(&log).contains("partial"), "{log}");
+    assert!(
+        log.contains("next run narrows")
+            && !stderr(&sb.run(&["--trace-backend", "snapshot"])).is_empty(),
+        "{log}"
+    );
 }
 
 #[test]
@@ -257,7 +330,10 @@ fn observed_writes_are_recorded_as_outputs_not_inputs() {
         "the write should be learned as an output: {node}"
     );
     let inputs: Vec<String> = serde_json::from_value(node["inputs"].clone()).unwrap();
-    assert!(inputs.is_empty(), "no backend here can observe reads");
+    assert!(
+        !inputs.iter().any(|i| i.contains("generated.txt")),
+        "a file this execution created is not an input to it: {node}"
+    );
 }
 
 #[test]
@@ -520,15 +596,30 @@ fn affected_reports_missing_git_instead_of_an_empty_change_list() {
 // ----------------------------------------------------------------- graph ----
 
 #[test]
-fn graph_json_is_stable_and_marks_unnarrowed_families() {
+fn graph_json_is_stable_and_reports_narrowing_honestly() {
     let sb = Sandbox::new();
     sb.run(&[]);
     let graph = json(&sb.arc(&["graph", "--json"]));
     assert!(graph["schema"].is_number());
     let node = &graph["nodes"][0];
-    assert_eq!(node["inputs_narrowed"], false);
     assert!(node["command"].as_str().unwrap().contains("echo"));
     assert!(node["completeness"].is_string());
+    // The flag must agree with what the platform can actually observe: claiming
+    // narrowed inputs Arc did not earn is exactly the lie this guards against.
+    assert_eq!(
+        node["inputs_narrowed"].as_bool().unwrap(),
+        narrows(),
+        "{node}"
+    );
+    for field in [
+        "inputs",
+        "directories",
+        "existence",
+        "outputs",
+        "executables",
+    ] {
+        assert!(node[field].is_array(), "missing {field}: {node}");
+    }
 }
 
 #[test]

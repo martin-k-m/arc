@@ -44,6 +44,9 @@ enum Cmd {
         /// Observe the execution and report what Arc learned about it
         #[arg(long)]
         trace: bool,
+        /// Pin the tracing backend: auto, snapshot, or off
+        #[arg(long, value_name = "NAME", default_value = "auto")]
+        trace_backend: String,
         /// Show observed paths and processes individually, not just counts
         #[arg(short, long)]
         verbose: bool,
@@ -169,6 +172,7 @@ fn real_main() -> Result<i32> {
             no_capture,
             cache_failures,
             trace,
+            trace_backend,
             verbose,
             json,
             command,
@@ -182,6 +186,9 @@ fn real_main() -> Result<i32> {
                 no_capture,
                 cache_failures,
                 trace,
+                backend: arc_core::trace::Selection::parse(&trace_backend).with_context(|| {
+                    format!("unknown --trace-backend `{trace_backend}`; use auto, snapshot or off")
+                })?,
             },
             Display {
                 explain,
@@ -200,6 +207,25 @@ fn real_main() -> Result<i32> {
             ConfigCmd::Show => cmd_config_show(&cwd).map(|_| 0),
         },
         Cmd::Clean { all } => cmd_clean(&home, all).map(|_| 0),
+    }
+}
+
+/// Drives the spinner from the engine's stage reports. Once the command itself
+/// starts, the spinner stops for good: the child owns the terminal from there.
+struct SpinnerProgress {
+    spinner: std::sync::Mutex<ui::Spinner>,
+}
+
+impl engine::Progress for SpinnerProgress {
+    fn stage(&self, label: &str) {
+        let Ok(mut s) = self.spinner.lock() else {
+            return;
+        };
+        if label == "executing" {
+            s.stop();
+        } else {
+            s.set(label);
+        }
     }
 }
 
@@ -222,7 +248,14 @@ fn cmd_run(
     let (program, args) = command.split_first().expect("clap requires at least one");
     let project = Project::discover(cwd)?;
 
-    let report = engine::run(&project, cwd, program, args, &opts, home)?;
+    // The spinner erases itself the moment the child is about to run, so its
+    // output and Arc's never share a line.
+    let progress = SpinnerProgress {
+        spinner: std::sync::Mutex::new(ui::Spinner::start("starting")),
+    };
+    let report = engine::run(&project, cwd, program, args, &opts, home, &progress);
+    drop(progress);
+    let report = report?;
     let e = &report.explain;
 
     if show.explain {
@@ -247,8 +280,10 @@ fn cmd_run(
                 ui::bytes(report.restored_bytes)
             ));
         }
+        eprintln!();
+        ui::flourish();
         eprintln!(
-            "\n{} {}  {}",
+            "{} {}  {}",
             ui::brand(ui::MARK),
             ui::badge("CACHE HIT"),
             ui::dim(&report.record.command_line())
@@ -308,9 +343,9 @@ fn render_explain(project: &Project, home: &Path, report: &engine::RunReport) ->
                 ui::completeness_color(&e.dependency_state),
                 ui::dim("·"),
                 if e.inputs_narrowed {
-                    "inputs narrowed"
+                    ui::green("inputs narrowed")
                 } else {
-                    "whole project"
+                    ui::dim(&e.narrow_reason)
                 }
             )
         )
@@ -373,16 +408,24 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
             "{}",
             ui::row(
                 "status",
-                &ui::yellow("not observed (cache hit or tracing off)")
+                &ui::yellow("not observed (cache hit, or tracing off)")
             )
         );
         eprintln!();
         return;
     };
     let deps = report.dependencies.as_ref();
-    let caps = arc_core::trace::platform_capabilities();
+    let complete =
+        deps.is_some_and(|d| d.completeness == arc_core::dependency::Completeness::Complete);
 
-    eprint!("{}", ui::banner("TRACE"));
+    eprint!(
+        "{}",
+        ui::banner(if complete {
+            "TRACE COMPLETE"
+        } else {
+            "TRACE PARTIAL"
+        })
+    );
     eprintln!("{}", ui::row("command", &report.record.command_line()));
     eprintln!(
         "{}",
@@ -391,28 +434,21 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
             &ui::accent(arc_core::trace::platform_backend_name())
         )
     );
-    eprintln!(
-        "{}",
-        ui::row(
-            "processes",
-            &ui::plural(obs.processes.len(), "observed", "observed")
-        )
-    );
-    eprintln!(
-        "{}",
-        ui::row(
-            "files written",
-            &ui::plural(obs.files.len(), "observed", "observed")
-        )
-    );
+    eprintln!("{}", ui::row("processes", &obs.processes.len().to_string()));
+    eprintln!("{}", ui::row("events", &obs.files.len().to_string()));
     if let Some(d) = deps {
-        eprintln!(
-            "{}",
-            ui::row(
-                "executables",
-                &ui::plural(d.executables.len(), "known", "known")
-            )
-        );
+        for (label, n) in [
+            ("files read", d.inputs.len() + d.external.len()),
+            (
+                "directories",
+                d.directories.len() + d.external_directories.len(),
+            ),
+            ("existence checks", d.existence.len()),
+            ("executables", d.executables.len()),
+            ("outputs", d.outputs.len()),
+        ] {
+            eprintln!("{}", ui::row(label, &n.to_string()));
+        }
         eprintln!(
             "{}",
             ui::row(
@@ -420,19 +456,24 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
                 &ui::completeness_color(d.completeness.label())
             )
         );
-    }
-    // Never let a partial observation read as a full one.
-    if !caps.file_reads {
+        // A partial model must never read as a complete one, so every reason it
+        // fell short is printed rather than summarised away.
+        for reason in &d.downgrades {
+            eprintln!(
+                "{}",
+                ui::row("not complete", &ui::yellow(&reason.describe()))
+            );
+        }
         eprintln!(
             "{}",
             ui::row(
-                "not observed",
-                &ui::dim("file reads, directory reads, existence checks")
+                "next run narrows",
+                &check(report.explain.inputs_narrowed || complete)
             )
         );
     }
     for note in &obs.notes {
-        eprintln!("{}", ui::row("note", &ui::yellow(note)));
+        eprintln!("{}", ui::row("note", &ui::dim(note)));
     }
 
     if verbose {
@@ -449,24 +490,25 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
             }
         }
         if !obs.files.is_empty() {
-            eprintln!("\n  {}", ui::dim("files"));
-            for f in obs.files.iter().take(200) {
+            eprintln!("\n  {}", ui::dim("observations, in order"));
+            for f in obs.files.iter().take(300) {
                 eprintln!(
                     "    {:<8} {}",
                     f.op.label(),
                     f.rel.as_deref().unwrap_or(&f.path)
                 );
             }
-            if obs.files.len() > 200 {
+            if obs.files.len() > 300 {
                 eprintln!(
                     "{}",
-                    ui::dim(&format!("    and {} more", obs.files.len() - 200))
+                    ui::dim(&format!("    and {} more", obs.files.len() - 300))
                 );
             }
         }
     }
     eprintln!(
-        "\n  {}",
+        "
+  {}",
         ui::dim(&format!(
             "{} total",
             ui::duration(report.record.duration_ms)
@@ -495,7 +537,11 @@ fn cmd_graph(home: &Path, cwd: &Path, verbose: bool, json: bool) -> Result<()> {
     }
 
     print!("{}", ui::banner("DEPENDENCY GRAPH"));
-    println!("{}\n", ui::dim(&graph.project_root));
+    println!(
+        "{}
+",
+        ui::dim(&graph.project_root)
+    );
     for node in &graph.nodes {
         println!(
             "{}  {}",
@@ -507,31 +553,49 @@ fn cmd_graph(home: &Path, cwd: &Path, verbose: bool, json: bool) -> Result<()> {
                 node.completeness
             ))
         );
-        let mut lines: Vec<(String, String)> = Vec::new();
-        for g in &node.declared_inputs {
-            lines.push(("declared".into(), g.clone()));
-        }
+        // Grouped rather than flattened: "which directory does this depend on"
+        // and "which file" are different questions, and a single list of a few
+        // hundred paths answers neither.
         let limit = if verbose { usize::MAX } else { 8 };
-        for p in node.inputs.iter().take(limit) {
-            lines.push(("input".into(), p.clone()));
+        let groups: [(&str, &Vec<String>); 6] = [
+            ("Declared", &node.declared_inputs),
+            ("Inputs", &node.inputs),
+            ("Directories", &node.directories),
+            ("Existence checks", &node.existence),
+            ("Executables", &node.executables),
+            ("Outputs", &node.outputs),
+        ];
+        let mut printed = false;
+        for (title, items) in groups {
+            if items.is_empty() {
+                continue;
+            }
+            printed = true;
+            println!("  {}", ui::dim(title));
+            for (i, p) in items.iter().take(limit).enumerate() {
+                let last = i + 1 == items.len().min(limit);
+                // An existence dependency reads very differently depending on
+                // which way it currently points, so say which.
+                let suffix = if title == "Existence checks" {
+                    ui::dim(if std::path::Path::new(p).exists() {
+                        " (present)"
+                    } else {
+                        " (absent)"
+                    })
+                } else {
+                    String::new()
+                };
+                println!("  {}{p}{suffix}", ui::branch(last));
+            }
+            if items.len() > limit {
+                println!(
+                    "    {}",
+                    ui::dim(&format!("and {} more", items.len() - limit))
+                );
+            }
         }
-        for p in node.outputs.iter().take(limit) {
-            lines.push(("output".into(), p.clone()));
-        }
-        for p in node.executables.iter().take(limit) {
-            lines.push(("exec".into(), p.clone()));
-        }
-        if lines.is_empty() {
-            println!("{}{}\n", ui::branch(true), ui::dim("nothing observed yet"));
-            continue;
-        }
-        for (i, (kind, path)) in lines.iter().enumerate() {
-            println!(
-                "{}{} {}",
-                ui::branch(i + 1 == lines.len()),
-                ui::dim(&format!("{kind:<8}")),
-                path
-            );
+        if !printed {
+            println!("  {}", ui::dim("nothing observed yet"));
         }
         if !node.inputs_narrowed {
             println!(
@@ -821,7 +885,8 @@ fn cmd_cache(home: &Path, cwd: &Path, command: CacheCmd) -> Result<()> {
             );
             let hit_rate = match s.hit_rate() {
                 Some(r) => format!(
-                    "{} {}",
+                    "{} {} {}",
+                    ui::meter(r / 100.0, 12),
                     ui::green(&format!("{r:.1}%")),
                     ui::dim(&format!("({} hits, {} misses)", s.hits, s.misses))
                 ),
@@ -981,29 +1046,36 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
     );
 
     println!("\n{}\n", ui::bold("tracing"));
-    let caps = arc_core::trace::platform_capabilities();
-    println!(
-        "{}",
-        ui::row(
-            "backend",
-            &ui::accent(arc_core::trace::platform_backend_name())
-        )
-    );
+    let probe = arc_core::trace::probe();
+    println!("{}", ui::row("backend", &ui::accent(probe.name)));
+    println!("{}", ui::row("available", &check(probe.available)));
+    if let Some(reason) = &probe.reason {
+        // Naming the actual obstacle is the difference between a message a user
+        // can act on and one they can only shrug at.
+        println!("{}", ui::row("reason", &ui::yellow(reason)));
+        println!("{}", ui::row("fallback", &ui::dim(probe.fallback)));
+    }
+    let caps = probe.capabilities;
     for (label, ok) in caps.rows() {
         println!("{}", ui::row(label, &supported(ok)));
     }
+    let narrows = caps.observes_everything();
     println!(
         "{}",
         ui::row(
-            "completeness",
-            &ui::completeness_color(arc_core::dependency::Completeness::of(&caps, false).label())
+            "best completeness",
+            &ui::completeness_color(if narrows { "complete" } else { "partial" })
         )
     );
     println!(
         "{}",
         ui::row(
-            "input narrowing",
-            &ui::dim("configuration only (see arc.toml [[command]])")
+            "automatic narrowing",
+            &if narrows {
+                ui::green("supported")
+            } else {
+                ui::dim("configuration only (arc.toml [[command]])")
+            }
         )
     );
 

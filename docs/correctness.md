@@ -7,9 +7,9 @@ favour of executing.
 ## Invariants
 
 **I1 — Reuse requires equivalence.** Two executions share a result only when the
-command, arguments, relative working directory, family identity, project input
-digest, environment digest, toolchain digest, learned-dependency digest,
-declared output globs, platform, and Arc schema version are all identical.
+command, arguments, relative working directory, family identity, input digest,
+environment digest, toolchain digest, learned-dependency digest, declared output
+globs, platform, and Arc schema version are all identical.
 `crates/arc-core/src/key.rs`.
 
 **I2 — Objects are atomic.** A blob only appears at its content-addressed path
@@ -30,17 +30,24 @@ the cache entry and runs the command. `try_replay` in
 **I5 — Secrets are not persisted.** Environment values are only ever stored as
 hashes. Names matching known credential markers are additionally redacted from
 all output. Dependency sets and trace records hold paths and counts, never
-environment values. `crates/arc-core/src/key.rs`.
+environment values, and a syscall tracer cannot see environment access at all
+because it happens in memory. `crates/arc-core/src/key.rs`.
 
 **I6 — Metadata optimisations never affect correctness.** The size/mtime
 fingerprint cache is an optimisation only: a stale or missing entry costs a
 re-hash. Files modified within 2 s are always re-hashed, since a write inside the
 filesystem's timestamp granularity could otherwise be invisible.
 
-**I7 — Learned knowledge may add to a key, never subtract from it.** Observed
-dependencies can only make the execution key cover *more*. Narrowing the input
-set requires `Completeness::Complete`, which no backend shipping today reports.
-`crates/arc-core/src/dependency.rs`.
+**I7 — Learned knowledge may add to a key freely, and narrow it only under
+proof.** Observed dependencies always make the execution key cover *more*.
+Replacing the project-wide input set with a learned one requires passing
+[`can_narrow`](#the-narrowing-gate), which is the single place in Arc that
+decision is made. `crates/arc-core/src/dependency.rs`.
+
+**I8 — A tracer failure is never a command failure.** If tracing cannot start,
+breaks mid-run, or is refused by the environment, the command still runs and its
+exit status is still Arc's exit status. What is lost is the observation, and a
+run Arc could not fully observe never narrows.
 
 ## Dependency learning
 
@@ -52,87 +59,252 @@ contents so that Arc can still find what it learned after a file changes. It is
 never used to authorise a hit — only to locate knowledge. Full detail in
 [architecture.md](architecture.md).
 
-### Trace completeness
+### What `Complete` means
 
-Every dependency set carries a completeness state:
+A trace is `Complete` when, for the execution just observed:
+
+- every descendant process was followed, through `fork`, `vfork`, `clone`,
+  `clone3`, `execve` and `execveat`;
+- every syscall executed was either modelled by the backend or is on the
+  explicit list of calls that cannot name a file, create a process, or reach
+  outside the process tree;
+- every path argument was reconstructed from the tracee and resolved against
+  *that process's* working directory and descriptor table;
+- every readable open, mapping, `stat`, `access`, `readlink`, directory
+  enumeration, executed binary and failed lookup was recorded;
+- nothing volatile was read, nothing reached the network, no budget overflowed,
+  and the tracer reported no error.
+
+### What `Complete` does not mean
+
+It is a claim about **filesystem and process dependencies**, not about
+determinism. Arc does not, and a filesystem tracer cannot, account for:
+
+- the clock, timers, or sleep;
+- `getrandom`, `RDRAND`, or any other entropy source;
+- process ids, thread scheduling, or address-space layout;
+- the hostname, uptime, or kernel state;
+- anything already read into memory before Arc started watching.
+
+A command whose output depends on the time of day will be cached and replayed,
+and that replay will be stale. That is the same limit v0.1 had; complete tracing
+does not change it. Where such a dependency leaves a filesystem trace — reading
+`/dev/urandom`, reading `/proc`, opening a socket — Arc *does* notice, and
+downgrades.
+
+### Completeness states
 
 | State | Meaning | May narrow inputs |
 | --- | --- | --- |
-| `Complete` | Every read, directory enumeration, existence check and descendant process was observed | yes |
-| `Partial` | Real observations, but the backend cannot see everything | no |
-| `Unsupported` | No backend available, or tracing disabled | no |
+| `Complete` | Everything above held | yes |
+| `Partial` | Real observations, but something was unobservable or downgraded | no |
+| `Unsupported` | No backend available, or tracing switched off | no |
 | `Invalid` | Stored data failed validation | no |
 
-A run that lost events is `Partial` regardless of what the backend claims.
+### Downgrade reasons
 
-**No backend shipping in this version reports `Complete`.** Arc therefore never
-narrows the input set from a trace. What tracing *does* contribute in v0.2:
+Structured, not prose, so the engine can gate on them and `arc run --trace` can
+show them:
 
-- **Executable dependencies.** Observed process images are hashed into the
-  execution key. This is strictly stronger than v0.1, which covered only the
-  command Arc spawned itself. Missing an executable leaves the key exactly where
-  v0.1 was, so an incomplete process tree cannot cause a false hit.
-- **Observed outputs.** Files the execution created, modified or deleted are
-  recorded and shown by `arc graph`, `arc inspect` and `arc run --trace`.
+| Reason | Cause |
+| --- | --- |
+| `backend_partial` | The backend cannot observe some dependency class at all — every snapshot-based trace |
+| `unsupported_syscall` | A syscall this backend does not model, including one a newer kernel added |
+| `path_resolution_failure` | A path argument could not be read back, or is not valid UTF-8, or a `fchdir` moved a process somewhere Arc cannot name |
+| `child_escape` | A process was created that could not be followed |
+| `event_overflow` | The run exceeded the trace budget |
+| `volatile_read` | `/proc`, `/sys`, `/dev/urandom`, or another path whose contents Arc cannot meaningfully fingerprint |
+| `network_access` | A socket was connected, bound, or sent on |
+| `dependency_disappeared` | A dependency was read and is now gone, so it can no longer be fingerprinted |
+| `backend_error` | The tracer itself failed |
+
+Any one of these makes the trace `Partial`, and a `Partial` trace never narrows.
+
+### The narrowing gate
+
+`dependency::can_narrow` is the only function in Arc that decides whether
+learned knowledge may replace the project-wide scan. It requires *all* of:
+
+- the dependency schema, trace schema and trace-semantics versions match;
+- the Arc version matches;
+- the family key matches;
+- the backend's declared capabilities match those the set was learned under;
+- those capabilities cover every dependency class;
+- the stored completeness is `Complete`;
+- the downgrade list is empty;
+- at least one execution has been observed, and it observed at least one input.
+
+The last condition matters: a set naming nothing would narrow to nothing and hit
+on every change. An empty observation is a sign something went wrong, not proof
+that nothing matters.
+
+### What a narrowed fingerprint covers
+
+Exactly the same ground the project scan covered, and no less:
+
+| Recorded | Fingerprinted as |
+| --- | --- |
+| Files read, inside the project | contents |
+| Files read, outside the project | contents, with the same size/mtime cache |
+| Executed binaries | contents |
+| Directories enumerated | the sorted set of entry names and types |
+| Paths whose presence or absence was consulted | the boolean |
+| Symlinks | the link target *and* the resolved file, both |
+
+A dependency Arc cannot read is fingerprinted as a distinct "missing" marker, not
+skipped — a file that vanishes must change the key, not disappear from it.
+
+Declared `[[command]] inputs` are fingerprinted **in addition**, even when a
+complete trace is available. An explicit include is the user asserting a fact
+about their build; a trace that did not happen to read that file on this run is
+not grounds to overrule them.
+
+### Temporal classification
+
+Order is what separates an input from an intermediate, and it is why observations
+are stored as an ordered stream rather than a set.
+
+| Sequence | Classified as | Why |
+| --- | --- | --- |
+| read, then written | input *and* self-modified | It was consumed before it was changed |
+| created, then read | output | It only exists because this run made it |
+| created, then deleted | output | An intermediate |
+| looked for, absent, then created | output | The lookup was about its own intermediate |
+| enumerated | directory | The entry set is the dependency, not any one file |
+| stat'd, is a directory, never enumerated | existence | Its presence mattered; its contents did not |
+| written only | output | |
+
+A run that rewrote something it read is marked `self_modified`, and such a run
+keeps the execution key computed *before* it started. Filing it under a key
+computed afterwards would describe the world the run left behind rather than the
+one it consumed, and the next run would replay a result produced from different
+input. That is a false hit, and it is the reason the flag exists.
 
 ### Learned dependency invalidation
 
 A stored dependency set is discarded — not repaired — when any of these differ
 from the current run: the dependency schema version, the trace schema version,
-the family key, the Arc version, or the backend's declared capabilities. Changing
-`[inputs]`, `[outputs]`, `[env]`, `[trace]`, or any `[[command]]` block changes
-the family key, which invalidates the set as a consequence.
+the trace *semantics* version, the family key, the Arc version, or the backend's
+declared capabilities. Changing `[inputs]`, `[outputs]`, `[env]`, `[trace]`, or
+any `[[command]]` block changes the family key, which invalidates the set as a
+consequence.
+
+The semantics version is separate from the schema version on purpose. The data
+shape can stay identical while the *rules* change — which syscalls count as a
+read, what makes a path volatile — and a set learned under the old rules was
+called complete for reasons that no longer hold.
 
 Retracing costs one execution. Trusting a stale set costs correctness.
 
 ### Merging observations
 
-Inputs, directories, absences and outputs are **unioned** across runs: an
-execution may take a different branch next time, and forgetting a dependency
-observed once is the unsafe direction. Executables are unioned by path with the
-newest digest winning, so a toolchain upgrade is reflected rather than pinned.
-Completeness is the weakest of everything merged, never the best run's.
+Inputs, directories, existence checks, outputs and externals are **unioned**
+across runs: an execution may take a different branch next time, and forgetting a
+dependency observed once is the unsafe direction. Executables and external files
+are unioned by path with the newest digest winning, so a toolchain upgrade is
+reflected rather than pinned. Completeness is the weakest of everything merged,
+never the best run's, and downgrade reasons accumulate.
 
-A file observed as both read and written stays an input. Demoting it to an output
-would be the unsafe direction.
+The consequence is that a conditional dependency set only grows. A command that
+reads `a.toml` under one flag and `b.toml` under another ends up depending on
+both, which costs misses and never costs correctness.
 
-### Where narrowing does come from
+### Refreshing
 
-Explicit configuration, which is user knowledge rather than inference:
+A cache hit does not execute, so it cannot discover a dependency that a different
+branch would have introduced. That is safe precisely because a hit means every
+dependency Arc knows about is in the state it was in when that knowledge was
+gathered — the branch cannot have changed. As soon as any of it differs, Arc
+executes, observes again, and folds the result in.
 
-```toml
-[[command]]
-match = "cargo test*"
-inputs = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
-```
+## Modelled and observed by platform
 
-Declared inputs are **additive** with `[inputs] include` and are always
-fingerprinted. Excludes are applied to the walk only; they can never remove a
-path that a trace observed as a read. An explicit include is a statement of fact,
-an exclude is a hint.
+| | `linux-ptrace` | `snapshot+jobobject` | `snapshot` |
+| --- | --- | --- | --- |
+| File reads | yes | no | no |
+| Existence and metadata checks | yes | no | no |
+| Directory enumeration | yes | no | no |
+| Writes, creates, deletes | yes | yes | yes |
+| Process tree | yes | yes | no |
+| Executables | yes | yes | no |
+| Paths outside the project | yes | no | no |
+| Network detection | yes | no | no |
+| **Automatic narrowing** | **yes** | no | no |
 
-Narrowing is what lets Arc report a change as irrelevant. Without it, `arc
-affected` reports `unknown` rather than `unaffected`, because "I have not
-observed a dependency on this file" and "this file does not matter" are different
-claims and only the second is safe to act on.
+Environment reads are modelled by nobody. Reading `getenv` touches memory the
+process already holds, so no syscall tracer can see it; Arc keeps its
+conservative configured variable set instead.
 
-## Modelled but not observed
+## Linux tracing specifics
 
-These concepts exist in the data model so that a future backend does not force a
-schema migration. Every one of them is empty under the backends shipping today,
-and each is a reason Arc refuses to narrow.
+### The read rule
 
-- **Negative / existence dependencies.** A program that does `if
-  config.local.toml exists: load it` depended on the file's *absence*. Replaying
-  across its appearance would be a false hit. Arc's conservative project scan
-  catches this today because a new file changes the input digest; a narrowed
-  input set would not, which is precisely why narrowing requires
-  `existence_checks`.
-- **Directory reads.** A program that enumerates `plugins/` depends on the set of
-  entries, not only on the files it opened. File-open tracing alone does not
-  prove a complete dependency set.
-- **Environment reads.** Arc keeps its conservative configured variable set
-  rather than guessing which variables were actually consulted.
+**A successful open that permits reading makes the path an input**, whether or
+not any bytes were subsequently read.
+
+This is deliberately conservative and it is what makes `mmap` correct for free: a
+file cannot be mapped without first being opened, so the mapping was already
+recorded. It also means a program that opens a file and reads nothing acquires a
+dependency it does not really have, which costs a miss.
+
+`openat2` carries its flags in a struct rather than a register. Arc does not read
+tracee structs, so such an open is treated as readable — again the conservative
+direction.
+
+### Path resolution
+
+Relative paths are resolved against the *traced process's* working directory or
+the directory a descriptor names, never against Arc's own. Working directories
+and descriptor tables follow the kernel's sharing rules: `CLONE_FS` shares the
+former, `CLONE_FILES` the latter, so threads share both and forks share neither.
+`clone3` passes its flags in a struct, so its children are modelled as sharing
+nothing, which can only duplicate state rather than lose it.
+
+An `fchdir` to a descriptor Arc cannot name leaves that process's later relative
+paths unresolvable, and downgrades the trace.
+
+### `/proc`, `/sys` and devices
+
+- `/proc/self`, `/proc/thread-self` and `/proc/<pid>` are **ignored**: their
+  contents are a function of the execution itself, not of any state a previous
+  run could have left behind. Treating `/proc/self/maps` as machine state would
+  downgrade essentially every Rust and Go program for no gain in safety.
+- Everything else under `/proc` and `/sys` is **volatile**, and downgrades. This
+  is not rare in practice: Debian's coreutils probe SELinux through
+  `/sys/fs/selinux` and `/proc/filesystems`, so `mv`, `ls` and `cp` produce
+  partial traces on a stock system. Arc reports that rather than papering over
+  it.
+- `/dev/null`, `/dev/zero`, `/dev/full`, the terminal and `/dev/fd` are ignored.
+  Every other device, `/dev/random` and `/dev/urandom` included, is volatile.
+
+### Network and IPC
+
+Any `connect`, `bind`, `sendto`, `recvfrom`, `sendmsg` or `recvmsg` downgrades
+the trace, whether or not it succeeded — a refused connection still means the
+result depended on whether something was listening, and that is not a fact Arc
+can fingerprint. Pipes and socket pairs internal to the process tree are not
+socket *connections* and do not downgrade.
+
+Arc does not model shared memory or message queues. A process using them to reach
+outside its own tree is a gap; it is listed under known limits rather than
+claimed as covered.
+
+### Non-UTF-8 filenames
+
+Linux filenames are bytes. Arc's stored path identity is text, and a name that is
+not valid UTF-8 cannot make that round trip: the stored name would refer to a
+file that does not exist, which fingerprints identically forever and would hit
+when it should miss. Such a path therefore downgrades the trace, and the
+conservative project scan — which carries real `PathBuf`s alongside display
+strings and so handles arbitrary bytes — takes over.
+
+### Budgets
+
+One trace records at most 250,000 distinct `(operation, path)` pairs and tracks
+at most 20,000 processes; one learned set holds at most 100,000 inputs, 20,000
+existence checks and 20,000 external paths. Exceeding any of them sets
+`event_overflow` and forbids narrowing. Nothing is silently truncated into a
+smaller set that still claims to be complete.
 
 ## Paths, symlinks and reparse points
 
@@ -141,22 +313,26 @@ All path identity goes through `crates/arc-core/src/paths.rs`: one normalisation
 comparison form (case-folded on Windows, case-sensitive elsewhere). Containment
 compares whole segments, so `/repo-old` is never treated as inside `/repo`.
 
-Symlinks are fingerprinted by their target path, not their target's contents, so
-retargeting a link changes the input digest. Symlinks are not captured as
-outputs, since restoring one would recreate a pointer Arc never validated.
-Restoration refuses any destination whose ancestors include a symlink, which
-covers Windows junctions and reparse points.
+A symlink is fingerprinted by its target path, and the resolved target is added
+to the dependency set in its own right. Retargeting the link changes the first;
+editing the target changes the second. Symlinks are not captured as outputs,
+since restoring one would recreate a pointer Arc never validated. Restoration
+refuses any destination whose ancestors include a symlink, which covers Windows
+junctions and reparse points.
 
 ## Paths outside the project
 
-Classified as `Project`, `ArcInternal`, `External` or `System`. Arc fingerprints
-only `Project` paths plus explicitly resolved executables. It does not hash
-system directories because a process touched a DLL, and it does not silently
-treat an external read as irrelevant — external observations are recorded and
-surfaced, and their existence is one reason completeness stays `Partial`.
+Classified as `Project`, `ArcInternal`, `External` or `System`. `ArcInternal` is
+checked first, so Arc's own cache directory can never become one of its own
+inputs even when placed inside the project — the regression test for that is not
+optional.
 
-`ArcInternal` is checked first, so Arc's own cache directory can never become one
-of its own inputs even when placed inside the project.
+`External` and `System` files that a complete trace observed being read are
+fingerprinted by content, using the same size/mtime cache as project files. That
+covers `libc.so.6`, the dynamic loader's cache, interpreters, CA bundles and
+`/etc` configuration. Arc does not hash a system *directory* because a process
+touched a library in it, and it does not treat an external read as irrelevant
+merely because it is inconvenient.
 
 ## Races and their limits
 
@@ -169,15 +345,19 @@ project does not exist. The exposures, stated plainly:
   close this one.
 - **Execute-then-store.** A file modified while the command runs may be captured
   in either state.
-- **Snapshot granularity.** A write landing inside the same timestamp tick as the
-  post-execution snapshot is not seen as a write. A missed write means the file
-  stays an ordinary input, which is the v0.1 behaviour, not a hit.
+- **Observe-then-fingerprint.** A dependency read during the run and modified
+  before Arc hashes it is recorded with the later contents. This is the same
+  window as above seen from the other end.
+- **Snapshot granularity.** For the snapshot backends, a write landing inside the
+  same timestamp tick as the post-execution snapshot is not seen as a write. A
+  missed write means the file stays an ordinary input, which is the v0.1
+  behaviour, not a hit.
 - **Job assignment window.** On Windows a descendant process created between
   `spawn` and `AssignProcessToJobObject` is outside the job. Sub-millisecond, not
   zero, and it sets the trace lossy.
 
-None of these can be closed without filesystem snapshots or kernel interception.
-They are documented rather than papered over.
+The ptrace backend closes none of these and creates none of them: it observes
+syscalls as they happen, but Arc still hashes files afterwards.
 
 ## What is deliberately not cached
 
@@ -188,49 +368,63 @@ They are documented rather than papered over.
 
 ## Known limits
 
-- **Inputs are project-wide by default.** Without a read-capable backend Arc
-  cannot know that `cargo test -p foo` ignores `docs/`. Scope it with
-  `[[command]] inputs` when you know better than Arc does.
+- **Non-hermetic commands.** The clock, randomness and the network can make a
+  command produce different results from identical inputs. Arc caches what it can
+  observe; it cannot make a non-deterministic command deterministic. Where the
+  non-determinism is visible as a syscall, Arc downgrades and stops narrowing.
 - **Undeclared outputs are not restored.** A hit will not recreate files you have
   not declared in `[outputs]`. `arc run --trace` shows what a command actually
   wrote, which is the fastest way to find out what to declare.
-- **Non-hermetic commands.** A command reading the network, the clock, or a
-  database can produce different results from identical inputs. Arc caches what
-  it can observe; it cannot make a non-deterministic command deterministic.
+- **Tracing costs.** ptrace stops a tracee twice per syscall. On syscall-dense
+  work that is roughly a 40× slowdown, essentially the same cost as `strace -f`;
+  on a compile it is closer to 7×. Warm hits pay none of it, because a hit never
+  starts the tracer. `[trace] enabled = false` removes it entirely at the cost of
+  never learning anything.
 - **`.gitignore` is trusted** for input discovery. A build that depends on a
-  gitignored file needs it added via `[inputs] include`. The trace snapshot
-  deliberately ignores `.gitignore`, since generated files are usually ignored
-  and those are the writes worth seeing.
+  gitignored file needs it added via `[inputs] include`, unless a complete trace
+  observed the read — which it will.
+- **macOS and Windows do not narrow automatically.** Neither has a
+  non-privileged, non-injecting way to observe reads. `arc doctor` says so.
 
 ## Adversarial tests
 
-`crates/arc-cli/tests/cli.rs` and `tests/dependency.rs` cover, end to end against
-the real binary:
+`crates/arc-cli/tests/` covers, end to end against the real binary:
 
-- a replayed hit is byte-identical to the original output;
-- a changed input forces a miss and `--explain` names the file;
-- family identity survives content changes, separates different arguments, and is
-  invalidated by a scoping change;
-- a scoped command ignores changes outside its inputs, and still misses on a
-  change inside them;
-- deleting a dependency, adding a file inside the scope, emptying a file, and
-  replacing a file with a directory all force a miss;
-- an unscoped command is invalidated by any project change;
-- tracing never reports `complete` while reads are unobservable;
-- observed writes become outputs, never inputs;
-- Arc's cache directory is neither fingerprinted nor graphed, even inside the
-  project;
-- a corrupt metadata database executes rather than replaying, and is rebuilt;
-- six concurrent traced runs leave families, dependency sets and objects intact;
-- fake secrets injected via the environment appear in no output and in no file
-  under `$ARC_HOME`, including the database and every stored object;
-- Unicode, spaces and deep nesting survive a fingerprint round trip;
-- `arc affected` maps Git changes onto scoped executions, and reports `unknown`
-  rather than `unaffected` for families without narrowing;
-- exit codes survive, failures are not cached by default, deleted objects degrade
-  to a miss, and corrupt objects are quarantined by `cache verify`.
+**Portable** (`cli.rs`, `dependency.rs`) — a replayed hit is byte-identical; a
+changed input forces a miss and `--explain` names the file; family identity
+survives content changes, separates arguments, and is invalidated by a scoping
+change; a scoped command ignores changes outside its inputs and still misses
+inside them; deleting a dependency, adding a file in scope, emptying a file, and
+replacing a file with a directory all miss; pinning the conservative backend
+never narrows and any change then invalidates; tracing never claims more than the
+platform can see; observed writes become outputs, never inputs; Arc's cache
+directory is neither fingerprinted nor graphed; a corrupt database executes and is
+rebuilt; six concurrent traced runs leave metadata intact; fake secrets appear in
+no output and in no file under `$ARC_HOME`; Unicode, spaces and deep nesting
+survive; `arc affected` reports `unknown` rather than `unaffected` without
+narrowing; exit codes survive and failures are not cached.
 
-Unit tests cover hash framing, path normalisation and case rules, containment,
-family identity, completeness gating, merge semantics, dependency validation,
+**Linux** (`linux_trace.rs`, skipped where ptrace is unavailable) — a file that
+was read invalidates and one that was not does not; a file the run wrote is not
+an input; a negative dependency invalidates when the file appears; a metadata-only
+check is a dependency; adding a directory entry invalidates an enumeration; a
+child's and a grandchild's reads count; sixty short-lived children are all seen; a
+shebang script depends on its own text; a mapped executable in the project is a
+dependency; a created-then-read intermediate is not a precondition; a
+read-then-rewritten file never replays stale state; a renamed-into-place result is
+an output; retargeting a symlink *and* editing its target both invalidate;
+relative paths resolve against the child's working directory; a non-UTF-8 filename
+falls back rather than being forgotten; reading `/proc` and touching the network
+both prevent a completeness claim; a signalled child's status survives and is not
+cached; a two-thousand-event run degrades without panicking; Arc never learns its
+own cache; secrets never reach a traced dependency set; concurrent traced runs
+stay independent.
+
+**Unit** — hash framing, path normalisation, case rules, containment, family
+identity, temporal classification, the narrowing gate under every downgrade,
+merge semantics, dependency validation, narrowed fingerprinting of contents,
+directories, absences and disappearances, syscall classification exhaustiveness
+(no syscall may be both modelled and dismissed; an unknown number must be
+neither), volatile-path policy, per-process path resolution and thread sharing,
 Git porcelain parsing, path traversal refusal, atomic restore, glob narrowing,
 size parsing, and fingerprint encoding including truncated data.

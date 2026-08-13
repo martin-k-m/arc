@@ -29,9 +29,16 @@ pub struct TraceSummary {
     pub processes: usize,
     pub files_observed: usize,
     pub inputs: usize,
+    #[serde(default)]
+    pub directories: usize,
+    #[serde(default)]
+    pub absent: usize,
     pub outputs: usize,
     pub executables: usize,
     pub lossy: bool,
+    /// Human-readable reasons the model is not complete. Empty when it is.
+    #[serde(default)]
+    pub downgrades: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

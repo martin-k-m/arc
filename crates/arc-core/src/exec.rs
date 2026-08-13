@@ -10,6 +10,14 @@ use std::time::Instant;
 /// log in memory to make it reusable is a bad trade.
 pub const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 
+/// How a child ended.
+#[derive(Debug, Clone, Copy)]
+pub struct Wait {
+    pub code: i32,
+    /// Killed by a signal; the result says nothing about the inputs.
+    pub signaled: bool,
+}
+
 pub struct Outcome {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
@@ -17,53 +25,144 @@ pub struct Outcome {
     pub duration_ms: u64,
     /// Output exceeded `MAX_CAPTURE`, or capture was off.
     pub truncated: bool,
-    /// Killed by a signal; the result says nothing about the inputs.
     pub signaled: bool,
 }
 
+/// A tracer's hooks into the child's lifecycle.
+///
+/// The two interesting moments are before `exec`, which is the only point a
+/// process can put itself under a tracer, and the wait itself, which a
+/// ptrace-style backend must own because it is also the event loop. Backends
+/// that need neither — a filesystem-snapshot diff, a Windows job object — take
+/// the defaults.
+pub trait Supervisor {
+    /// The child must place itself under this process's control before `exec`.
+    fn traced(&self) -> bool {
+        false
+    }
+    /// Called with the child's pid as soon as it exists and before any of its
+    /// output is read.
+    fn on_spawn(&mut self, _pid: u32) {}
+    /// Take over waiting for the child. `None` means the caller waits normally.
+    fn wait(&mut self, _pid: u32) -> Option<Result<Wait>> {
+        None
+    }
+    /// Tracing could not be started. The command still runs; only the
+    /// observation is lost.
+    fn disable(&mut self, _reason: String) {}
+}
+
+/// A run with no observation at all.
+impl Supervisor for () {}
+
 /// Run `program` with `args` in `cwd`. Output is streamed to this process's
 /// stdout/stderr as it arrives and, when `capture` is set, copied into memory.
-///
-/// `on_spawn` is called with the child's pid as soon as it exists and before
-/// any of its output is read, which is the only moment a tracer can attach to
-/// the process tree.
 pub fn run(
     program: &Path,
     args: &[String],
     cwd: &Path,
     capture: bool,
-    on_spawn: &mut dyn FnMut(u32),
+    sup: &mut dyn Supervisor,
 ) -> Result<Outcome> {
-    let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(cwd);
-    if capture {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
     let start = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Arc could not start `{}`.", program.display()))?;
-    on_spawn(child.id());
+    let (mut child, traced) = spawn(program, args, cwd, capture, sup)?;
+    let pid = child.id();
+    sup.on_spawn(pid);
 
-    let (stdout, stderr, truncated) = if capture {
+    // The pumps run on their own threads because a supervising backend needs
+    // the calling thread for its event loop: ptrace requires every request to
+    // come from the thread that owns the tracee, and a child blocked writing to
+    // a full pipe would otherwise deadlock against a tracer that is waiting for
+    // it to make a syscall.
+    let pumps = capture.then(|| {
         let out = child.stdout.take().expect("piped");
         let err = child.stderr.take().expect("piped");
-        let h_out = std::thread::spawn(move || pump(out, Sink::Out));
-        let h_err = std::thread::spawn(move || pump(err, Sink::Err));
-        let (o, o_trunc) = h_out.join().unwrap()?;
-        let (e, e_trunc) = h_err.join().unwrap()?;
-        (o, e, o_trunc || e_trunc)
-    } else {
-        (Vec::new(), Vec::new(), true)
+        (
+            std::thread::spawn(move || pump(out, Sink::Out)),
+            std::thread::spawn(move || pump(err, Sink::Err)),
+        )
+    });
+
+    let wait = match traced.then(|| sup.wait(pid)).flatten() {
+        Some(Ok(w)) => w,
+        Some(Err(e)) => {
+            // The tracer broke. The command is still running and its exit status
+            // is still the answer the user needs.
+            sup.disable(format!("{e:#}"));
+            wait_normally(&mut child)?
+        }
+        None => wait_normally(&mut child)?,
     };
 
-    let status = child.wait().context("waiting for child process")?;
+    let (stdout, stderr, truncated) = match pumps {
+        Some((o, e)) => {
+            let (o, ot) = o.join().unwrap_or_else(|_| Ok((Vec::new(), true)))?;
+            let (e, et) = e.join().unwrap_or_else(|_| Ok((Vec::new(), true)))?;
+            (o, e, ot || et)
+        }
+        None => (Vec::new(), Vec::new(), true),
+    };
+
     Ok(Outcome {
-        exit_code: exit_code_of(&status),
+        exit_code: wait.code,
         stdout,
         stderr,
         duration_ms: start.elapsed().as_millis() as u64,
         truncated,
+        signaled: wait.signaled,
+    })
+}
+
+/// Start the child, falling back to an untraced spawn if the traced one is
+/// refused. Whatever a sandbox thinks of `ptrace`, the user's command runs.
+fn spawn(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    capture: bool,
+    sup: &mut dyn Supervisor,
+) -> Result<(std::process::Child, bool)> {
+    let build = || {
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(cwd);
+        if capture {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        cmd
+    };
+    if sup.traced() {
+        let mut cmd = build();
+        install_traceme(&mut cmd);
+        match cmd.spawn() {
+            Ok(c) => return Ok((c, true)),
+            Err(e) => sup.disable(format!("tracing could not be started: {e}")),
+        }
+    }
+    let child = build()
+        .spawn()
+        .with_context(|| format!("Arc could not start `{}`.", program.display()))?;
+    Ok((child, false))
+}
+
+#[cfg(target_os = "linux")]
+fn install_traceme(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` requires the closure to be async-signal-safe, because
+    // it runs in the forked child before `exec` while the parent's threads and
+    // locks are still notionally present. `traceme` issues one `ptrace` syscall
+    // and does nothing else — no allocation, no locking, no libc state.
+    unsafe {
+        cmd.pre_exec(|| crate::trace::traceme());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_traceme(_cmd: &mut Command) {}
+
+fn wait_normally(child: &mut std::process::Child) -> Result<Wait> {
+    let status = child.wait().context("waiting for child process")?;
+    Ok(Wait {
+        code: exit_code_of(&status),
         signaled: signaled(&status),
     })
 }
