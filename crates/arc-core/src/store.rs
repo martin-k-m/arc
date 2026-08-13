@@ -94,6 +94,76 @@ impl Store {
         Ok((d, size))
     }
 
+    /// Stream bytes from an untrusted source into the store, admitting them
+    /// only if they hash to `expect`.
+    ///
+    /// The data is hashed as it lands in `tmp/`, so nothing is buffered whole in
+    /// memory and no unverified byte ever appears at a blob path. A mismatch,
+    /// a truncated stream and an interrupted process all leave the same state:
+    /// a temporary file and no object.
+    pub fn put_verified(&self, r: &mut dyn std::io::Read, expect: &Digest) -> Result<u64> {
+        let tmp = self.tmp();
+        let mut f = File::create(&tmp).context("writing incoming object")?;
+        let mut hasher = crate::hash::Hasher::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut total = 0u64;
+        let outcome = (|| -> Result<()> {
+            loop {
+                let n = r.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                total += n as u64;
+                anyhow::ensure!(
+                    total <= crate::remote::protocol::MAX_OBJECT_BYTES,
+                    "object is too large"
+                );
+                hasher.raw(&buf[..n]);
+                f.write_all(&buf[..n])?;
+            }
+        })();
+        let actual = hasher.finish();
+        let ok = outcome.is_ok() && actual == *expect;
+        if ok {
+            f.sync_all()?;
+        }
+        drop(f);
+        if !ok {
+            let _ = fs::remove_file(&tmp);
+            outcome?;
+            anyhow::bail!(
+                "object {} does not match its digest (got {})",
+                expect.short(),
+                actual.short()
+            );
+        }
+        self.commit(&tmp, expect)?;
+        Ok(total)
+    }
+
+    pub fn open_blob(&self, d: &Digest) -> Result<File> {
+        File::open(self.blob_path(d)).with_context(|| format!("reading blob {}", d.short()))
+    }
+
+    /// Remove abandoned transfer files. Nothing in `tmp/` is ever a valid
+    /// object, so age is the only thing worth checking.
+    pub fn sweep_tmp(&self, older_than: std::time::Duration) -> Result<usize> {
+        let mut removed = 0;
+        let now = std::time::SystemTime::now();
+        for e in fs::read_dir(self.root.join("tmp"))? {
+            let e = e?;
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|m| now.duration_since(m).unwrap_or_default() > older_than)
+                .unwrap_or(false);
+            if stale && fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn read(&self, d: &Digest) -> Result<Vec<u8>> {
         fs::read(self.blob_path(d)).with_context(|| format!("reading blob {}", d.short()))
     }

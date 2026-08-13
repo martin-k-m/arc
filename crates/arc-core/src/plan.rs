@@ -461,7 +461,23 @@ fn run_task(
     args.push(task.program.clone());
     args.extend(task.args.iter().cloned());
 
-    let out = match exec::capture(arc, &args, &cwd, &[("ARC_HOME", arc_home)]) {
+    // Every scheduled task may fetch from the remote at once, so each child's
+    // transfer pool is divided by the number of children. Without this,
+    // `--jobs 16` would mean sixteen simultaneous transfer pools.
+    let transfers = crate::remote::RemoteConfig::default()
+        .concurrency
+        .div_ceil(opts.jobs.max(1))
+        .max(1)
+        .to_string();
+    let out = match exec::capture(
+        arc,
+        &args,
+        &cwd,
+        &[
+            ("ARC_HOME", arc_home.as_os_str()),
+            ("ARC_REMOTE_CONCURRENCY", transfers.as_ref()),
+        ],
+    ) {
         Ok(o) => o,
         Err(e) => {
             return TaskResult {

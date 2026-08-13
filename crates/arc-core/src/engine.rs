@@ -42,8 +42,10 @@ use crate::outputs;
 use crate::paths::Classifier;
 use crate::project::{Config, Project};
 use crate::record::{
-    format_command, BlobRef, CacheEntry, CacheStatus, ExecutionRecord, OutputFile, TraceSummary,
+    format_command, BlobRef, CacheEntry, CacheSource, CacheStatus, ExecutionRecord, OutputFile,
+    TraceSummary,
 };
+use crate::remote::{self, Remote};
 use crate::scan::{self, FingerprintMap};
 use crate::store::Store;
 use crate::trace::{self, Selection, Tracer};
@@ -66,6 +68,8 @@ pub struct RunOptions {
     pub trace: bool,
     /// Pin a tracing backend, for testing the fallback path.
     pub backend: Selection,
+    /// Ignore any configured remote cache for this run.
+    pub no_remote: bool,
 }
 
 /// Why Arc decided what it decided, in a form both the terminal renderer and
@@ -91,6 +95,9 @@ pub struct Explain {
     /// user explicitly asks, since it costs a second comparison pass.
     pub ignored_changes: Vec<String>,
     pub dependency_state: String,
+    /// `local` or `remote` for a hit; `none` otherwise.
+    #[serde(default)]
+    pub cache_source: String,
     pub inputs_narrowed: bool,
     /// Why narrowing was or was not applied, from the single gate.
     pub narrow_reason: String,
@@ -108,6 +115,19 @@ pub trait Progress {
 /// A run nobody is watching.
 impl Progress for () {}
 
+/// What the remote cache did during one run, when one was configured. A remote
+/// is an optimisation, so everything here is reporting, never a result.
+#[derive(Debug, Clone)]
+pub struct RemoteStatus {
+    pub endpoint: String,
+    pub namespace: String,
+    pub read: bool,
+    pub write: bool,
+    pub metrics: remote::Metrics,
+    /// Why the remote could not be used, if it could not.
+    pub error: Option<String>,
+}
+
 pub struct RunReport {
     pub record: ExecutionRecord,
     pub explain: Explain,
@@ -118,6 +138,7 @@ pub struct RunReport {
     /// Present when this run observed an execution.
     pub observations: Option<trace::Observations>,
     pub dependencies: Option<DependencySet>,
+    pub remote: Option<RemoteStatus>,
 }
 
 /// One entry per input file, stored as a blob so `--explain` can say which file
@@ -228,6 +249,7 @@ pub fn run(
         changed: Vec::new(),
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
+        cache_source: "none".into(),
         // True whenever Arc has grounds to call some change irrelevant, whether
         // it earned them by observation or was told them in `arc.toml`.
         // `narrow_reason` says which.
@@ -238,9 +260,46 @@ pub fn run(
 
     // ---- lookup ------------------------------------------------------------
     progress.stage("checking cache");
+    let remote = (!opts.no_remote)
+        .then(|| Remote::open(&plan.cfg.remote).ok())
+        .flatten();
+    let mut remote_error: Option<String> = None;
+    let mut source = CacheSource::Local;
+
     if !opts.refresh {
-        if let Some((entry, prev)) = db.lookup(&exec_key.hex())? {
-            match try_replay(&store, project, &prev) {
+        let mut local = db.lookup(&exec_key.hex())?;
+        // A local hit never touches the network. The remote is consulted only
+        // for work this machine would otherwise have to perform.
+        if local.is_none() {
+            if let Some(r) = remote.as_ref().filter(|r| r.read) {
+                progress.stage("checking remote cache");
+                match materialise_remote(r, &store, &db, &plan, program, args, &exec_key.hex()) {
+                    Ok(true) => {
+                        source = CacheSource::Remote;
+                        local = db.lookup(&exec_key.hex())?;
+                    }
+                    Ok(false) => {}
+                    Err(e) => remote_error = Some(e.to_string()),
+                }
+            }
+        }
+        if let Some((entry, prev)) = local {
+            let mut replay = try_replay(&store, project, &prev);
+            // A local record whose objects have gone missing can often be
+            // completed from the remote, which beats re-running the command.
+            if matches!(replay, Ok(None)) {
+                if let Some(r) = remote.as_ref().filter(|r| r.read) {
+                    progress.stage("repairing from remote cache");
+                    match r.download(&store, &prev.replay_digests()) {
+                        Ok(()) => {
+                            source = CacheSource::Remote;
+                            replay = try_replay(&store, project, &prev);
+                        }
+                        Err(e) => remote_error = Some(e.to_string()),
+                    }
+                }
+            }
+            match replay {
                 Ok(Some((restored_files, restored_bytes, restore_ms))) => {
                     let now = scan::now_millis();
                     db.touch_entry(&exec_key.hex(), now)?;
@@ -251,12 +310,21 @@ pub fn run(
                         started_at: now,
                         duration_ms: restore_ms,
                         cache_status: CacheStatus::Hit,
+                        cache_source: source,
                         replayed_from: Some(prev.id.clone()),
                         ..prev.clone()
                     };
                     db.put_execution(&record, None)?;
                     explain.result = "cache hit".into();
-                    explain.reason = format!("all inputs match execution {}", short(&prev.id));
+                    explain.cache_source = source.label().into();
+                    explain.reason = match source {
+                        CacheSource::Local => {
+                            format!("all inputs match execution {}", short(&prev.id))
+                        }
+                        CacheSource::Remote => {
+                            "all inputs match a result published to the remote cache".into()
+                        }
+                    };
                     return Ok(RunReport {
                         record,
                         explain,
@@ -266,6 +334,7 @@ pub fn run(
                         restored_files,
                         observations: None,
                         dependencies: Some(plan.deps),
+                        remote: status(remote.as_ref(), remote_error),
                     });
                 }
                 // A hit that cannot be safely served is a miss, never a guess.
@@ -414,6 +483,7 @@ pub fn run(
         stderr,
         outputs: captured_outputs,
         cache_status: CacheStatus::Miss,
+        cache_source: CacheSource::Local,
         replayed_from: None,
         input_manifest: manifest,
         arc_version: crate::VERSION.to_string(),
@@ -430,7 +500,20 @@ pub fn run(
     });
     db.put_execution(&record, entry.as_ref())?;
 
+    // The command has already succeeded. Publishing is best-effort from here:
+    // a remote that rejects, times out or is simply absent changes nothing
+    // about the result the user just got.
+    if store_cacheable {
+        if let Some(r) = remote.as_ref().filter(|r| r.write) {
+            progress.stage("publishing to remote cache");
+            if let Err(e) = publish(r, &store, &record, &exec_key.hex()) {
+                remote_error = Some(e.to_string());
+            }
+        }
+    }
+
     Ok(RunReport {
+        remote: status(remote.as_ref(), remote_error),
         record,
         explain,
         restore_ms: 0,
@@ -440,6 +523,112 @@ pub fn run(
         observations: observations.map(|(_, _, o)| o),
         dependencies: learned,
     })
+}
+
+fn status(remote: Option<&Remote>, error: Option<String>) -> Option<RemoteStatus> {
+    let r = remote?;
+    Some(RemoteStatus {
+        endpoint: r.endpoint().to_string(),
+        namespace: r.namespace().to_string(),
+        read: r.read,
+        write: r.write,
+        metrics: r.metrics(),
+        error,
+    })
+}
+
+/// Objects first, record last. A record is a promise that its objects can be
+/// fetched, so it is only made once they can be.
+///
+/// The result is published under both keys this run is valid for. `record.key`
+/// is what the *next* run of this family on this machine will ask for, once it
+/// has today's learned dependencies. `computed` is what a machine that has
+/// never run this family will ask for — which is every machine seeing the
+/// project for the first time, and therefore exactly the case a shared cache
+/// exists to serve. Both keys were computed from the same pre-execution state
+/// of the same inputs, so the same result answers both.
+fn publish(r: &Remote, store: &Store, record: &ExecutionRecord, computed: &str) -> Result<()> {
+    let wire = remote::from_record(record);
+    r.upload(store, &wire.digests())?;
+    r.publish(&wire)?;
+    if computed != record.key && !computed.is_empty() {
+        let mut alias = wire;
+        alias.execution_key = computed.to_string();
+        r.publish(&alias)?;
+    }
+    Ok(())
+}
+
+/// Turn a remote result into a local cache entry, or nothing at all.
+///
+/// Returns `true` only when every object the record names is present locally
+/// and verified, at which point the ordinary local-hit path takes over. A
+/// partial download is discarded rather than written: half a result is not a
+/// result.
+fn materialise_remote(
+    r: &Remote,
+    store: &Store,
+    db: &Db,
+    plan: &Plan,
+    program: &str,
+    args: &[String],
+    exec_key: &str,
+) -> Result<bool> {
+    let Some(wire) = r.lookup(exec_key)? else {
+        return Ok(false);
+    };
+    r.download(store, &wire.digests())?;
+    let now = scan::now_millis();
+    let template = ExecutionRecord {
+        schema: crate::SCHEMA_VERSION,
+        id: new_id(exec_key, now),
+        key: exec_key.to_string(),
+        program: program.to_string(),
+        args: args.to_vec(),
+        project_root: plan.family.project_root.clone(),
+        rel_cwd: plan.rel_cwd.clone(),
+        started_at: now,
+        duration_ms: 0,
+        exit_code: 0,
+        input_digest: String::new(),
+        input_file_count: 0,
+        env: EnvFingerprint {
+            vars: Vec::new(),
+            digest: String::new(),
+        },
+        toolchain: Toolchain {
+            program: program.to_string(),
+            resolved_path: None,
+            digest: String::new(),
+        },
+        stdout: None,
+        stderr: None,
+        outputs: Vec::new(),
+        cache_status: CacheStatus::Miss,
+        cache_source: CacheSource::Remote,
+        replayed_from: None,
+        input_manifest: None,
+        arc_version: crate::VERSION.to_string(),
+        family_key: plan.family_key.clone(),
+        trace: None,
+    };
+    let base = remote::to_record(&wire, &template)?;
+    for d in base.replay_digests() {
+        if !store.exists(&Digest::parse(&d)?) {
+            anyhow::bail!("remote result is incomplete");
+        }
+    }
+    db.put_execution(
+        &base,
+        Some(&CacheEntry {
+            execution_id: base.id.clone(),
+            created_at: now,
+            last_accessed: now,
+            hits: 0,
+            original_duration_ms: wire.duration_ms,
+        }),
+    )?;
+    Ok(true)
 }
 
 /// Adapts a tracer to `exec`'s lifecycle hooks, and records the fact if it
@@ -702,6 +891,7 @@ fn bypass(
         stderr: None,
         outputs: Vec::new(),
         cache_status: CacheStatus::Bypass,
+        cache_source: CacheSource::Local,
         replayed_from: None,
         input_manifest: None,
         arc_version: crate::VERSION.to_string(),
@@ -727,6 +917,7 @@ fn bypass(
         changed: Vec::new(),
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
+        cache_source: "none".into(),
         inputs_narrowed: false,
         narrow_reason: plan.narrow.reason().into(),
         fingerprint_ms: 0,
@@ -740,6 +931,7 @@ fn bypass(
         restored_files: 0,
         observations: None,
         dependencies: None,
+        remote: None,
     })
 }
 
@@ -751,7 +943,7 @@ fn try_replay(
     prev: &ExecutionRecord,
 ) -> Result<Option<(usize, u64, u64)>> {
     let start = Instant::now();
-    for d in prev.blob_digests() {
+    for d in prev.replay_digests() {
         if !store.exists(&Digest::parse(&d)?) {
             return Ok(None);
         }

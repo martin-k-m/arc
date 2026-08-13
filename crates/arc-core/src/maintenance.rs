@@ -62,6 +62,9 @@ pub fn gc(store: &Store, db: &Db) -> Result<(usize, u64)> {
     for e in db.all_executions()? {
         reachable.extend(e.blob_digests());
     }
+    // Abandoned transfers, from a cancelled run or a rejected download. An hour
+    // is comfortably longer than any in-flight write.
+    store.sweep_tmp(std::time::Duration::from_secs(3600))?;
     let mut removed = 0;
     let mut freed = 0;
     for (d, size) in store.iter_blobs()? {

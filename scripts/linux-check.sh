@@ -17,7 +17,12 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # The full image ships git, which several tests need to ask what changed.
 IMAGE=${ARC_IMAGE:-rust:1}
 
-exec docker run --rm -t \
+# A TTY is only requested when there is one to attach to: with output
+# redirected, `-t` can swallow it entirely on some Docker hosts.
+TTY=()
+[ -t 1 ] && TTY=(-t)
+
+exec docker run --rm "${TTY[@]}" \
   -v "$HERE":/src:ro \
   -v arc-linux-target:/target \
   -v arc-linux-cargo:/usr/local/cargo/registry \

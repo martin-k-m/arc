@@ -5,7 +5,8 @@ use arc_core::db::Db;
 use arc_core::engine::{self, RunOptions};
 use arc_core::maintenance;
 use arc_core::project::Project;
-use arc_core::record::CacheStatus;
+use arc_core::record::{CacheSource, CacheStatus};
+use arc_core::remote::Remote;
 use arc_core::store::Store;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeSet;
@@ -45,6 +46,9 @@ enum Cmd {
         /// Observe the execution and report what Arc learned about it
         #[arg(long)]
         trace: bool,
+        /// Ignore any configured remote cache
+        #[arg(long)]
+        no_remote: bool,
         /// Pin the tracing backend: auto, snapshot, or off
         #[arg(long, value_name = "NAME", default_value = "auto")]
         trace_backend: String,
@@ -110,6 +114,11 @@ enum Cmd {
         #[command(subcommand)]
         command: CacheCmd,
     },
+    /// Inspect the configured remote cache
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCmd,
+    },
     /// Check the local Arc installation
     Doctor,
     /// Show the effective configuration
@@ -154,6 +163,17 @@ enum CacheCmd {
 }
 
 #[derive(Subcommand)]
+enum RemoteCmd {
+    /// Show the remote cache configuration and whether it can be reached
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Contact the remote cache and report the round trip
+    Ping,
+}
+
+#[derive(Subcommand)]
 enum ConfigCmd {
     /// Print the configuration Arc is using, and where it came from
     Show,
@@ -194,6 +214,7 @@ fn real_main() -> Result<i32> {
             no_capture,
             cache_failures,
             trace,
+            no_remote,
             trace_backend,
             verbose,
             json,
@@ -208,6 +229,7 @@ fn real_main() -> Result<i32> {
                 no_capture,
                 cache_failures,
                 trace,
+                no_remote,
                 backend: arc_core::trace::Selection::parse(&trace_backend).with_context(|| {
                     format!("unknown --trace-backend `{trace_backend}`; use auto, snapshot or off")
                 })?,
@@ -236,6 +258,7 @@ fn real_main() -> Result<i32> {
         Cmd::History { limit, json } => cmd_history(&home, limit, json).map(|_| 0),
         Cmd::Inspect { id, json } => cmd_inspect(&home, &id, json).map(|_| 0),
         Cmd::Cache { command } => cmd_cache(&home, &cwd, command).map(|_| 0),
+        Cmd::Remote { command } => cmd_remote(&cwd, command),
         Cmd::Doctor => cmd_doctor(&home, &cwd).map(|_| 0),
         Cmd::Config { command } => match command {
             ConfigCmd::Show => cmd_config_show(&cwd).map(|_| 0),
@@ -319,10 +342,33 @@ fn cmd_run(
         eprintln!(
             "{} {}  {}",
             ui::brand(ui::MARK),
-            ui::badge("CACHE HIT"),
+            ui::badge(if report.record.cache_source == CacheSource::Remote {
+                "REMOTE HIT"
+            } else {
+                "CACHE HIT"
+            }),
             ui::dim(&report.record.command_line())
         );
         eprintln!("  {detail}");
+        if let Some(r) = &report.remote {
+            if report.record.cache_source == CacheSource::Remote {
+                eprintln!(
+                    "  {}",
+                    ui::dim(&format!(
+                        "fetched {} from {} in {}",
+                        ui::bytes(r.metrics.bytes_downloaded),
+                        r.endpoint,
+                        ui::duration(r.metrics.lookup_ms + r.metrics.transfer_ms)
+                    ))
+                );
+            }
+        }
+    }
+
+    // A remote problem is worth one line and no more: the command itself has
+    // already been served correctly either way.
+    if let Some(e) = report.remote.as_ref().and_then(|r| r.error.as_ref()) {
+        eprintln!("  {}", ui::yellow(&format!("remote cache: {e}")));
     }
 
     if show.json {
@@ -334,6 +380,22 @@ fn cmd_run(
             "family_key": r.family_key,
             "command": r.command_line(),
             "cache_status": r.cache_status.label(),
+            "cache": {
+                "status": r.cache_status.label().to_lowercase(),
+                "source": if r.cache_status == CacheStatus::Hit {
+                    r.cache_source.label()
+                } else {
+                    "none"
+                },
+            },
+            "remote": report.remote.as_ref().map(|rr| serde_json::json!({
+                "endpoint": rr.endpoint,
+                "namespace": rr.namespace,
+                "read": rr.read,
+                "write": rr.write,
+                "error": rr.error,
+                "metrics": rr.metrics,
+            })),
             "exit_code": r.exit_code,
             "duration_ms": r.duration_ms,
             "saved_ms": report.saved_ms,
@@ -1191,6 +1253,17 @@ fn cmd_inspect(home: &Path, id: &str, json: bool) -> Result<()> {
     }
     if let Some(from) = &rec.replayed_from {
         ui::field("Replayed from", from);
+        ui::field("Cache source", rec.cache_source.label());
+    }
+    if !rec.outputs.is_empty() {
+        ui::field(
+            "Objects",
+            &format!(
+                "{} ({})",
+                rec.outputs.len(),
+                ui::bytes(rec.outputs.iter().map(|o| o.size).sum())
+            ),
+        );
     }
     if !rec.family_key.is_empty() {
         ui::field("Family", &rec.family_key);
@@ -1437,6 +1510,106 @@ fn cmd_cache(home: &Path, cwd: &Path, command: CacheCmd) -> Result<()> {
     Ok(())
 }
 
+/// The remote as configured for this project, with the reason it is not in use
+/// when it is not. Never returns a token.
+fn remote_for(cwd: &Path) -> Result<(arc_core::remote::RemoteConfig, Result<Remote, String>)> {
+    let project = Project::discover(cwd)?;
+    let cfg = arc_core::remote::effective_config(&project.config.remote);
+    let opened = Remote::open(&project.config.remote).map_err(|d| d.reason());
+    Ok((cfg, opened))
+}
+
+fn cmd_remote(cwd: &Path, command: RemoteCmd) -> Result<i32> {
+    let (cfg, opened) = remote_for(cwd)?;
+    match command {
+        RemoteCmd::Status { json } => {
+            let reachable = opened.as_ref().ok().map(|r| r.info());
+            if json {
+                let out = serde_json::json!({
+                    "configured": opened.is_ok(),
+                    "reason": opened.as_ref().err(),
+                    "endpoint": opened.as_ref().ok().map(|r| r.endpoint()),
+                    "namespace": cfg.namespace,
+                    "read": cfg.read,
+                    "write": cfg.write,
+                    "auth": opened.as_ref().ok().map(|r| r.has_token()).unwrap_or(false),
+                    "reachable": reachable.as_ref().map(|i| i.is_ok()),
+                    "protocol": reachable.as_ref().and_then(|i| i.as_ref().ok()).map(|i| i.protocol),
+                    "error": reachable.as_ref().and_then(|i| i.as_ref().err()).map(|e| format!("{e:#}")),
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(0);
+            }
+            print!("{}", ui::banner("REMOTE CACHE"));
+            let Ok(remote) = &opened else {
+                let reason = opened.as_ref().err().cloned().unwrap_or_default();
+                println!("{}", ui::row("configured", &ui::dim(&reason)));
+                println!("{}", ui::row("cache", &ui::green("local only")));
+                println!();
+                return Ok(0);
+            };
+            println!("{}", ui::row("configured", &check(true)));
+            println!("{}", ui::row("endpoint", &ui::accent(remote.endpoint())));
+            println!("{}", ui::row("namespace", remote.namespace()));
+            println!("{}", ui::row("read", &enabled(remote.read)));
+            println!("{}", ui::row("write", &enabled(remote.write)));
+            // The presence of a credential, never the credential.
+            println!(
+                "{}",
+                ui::row(
+                    "auth",
+                    &if remote.has_token() {
+                        ui::green("token configured")
+                    } else {
+                        ui::dim("none")
+                    }
+                )
+            );
+            match remote.info() {
+                Ok(info) => {
+                    println!("{}", ui::row("reachable", &check(true)));
+                    println!("{}", ui::row("protocol", &format!("v{}", info.protocol)));
+                    println!(
+                        "{}",
+                        ui::row("server", &format!("{} {}", info.server, info.version))
+                    );
+                }
+                Err(e) => {
+                    println!("{}", ui::row("reachable", &ui::yellow(&format!("{e:#}"))));
+                    println!(
+                        "{}",
+                        ui::row("cache", &ui::green("local cache still works"))
+                    );
+                }
+            }
+            println!();
+            Ok(0)
+        }
+        RemoteCmd::Ping => {
+            let remote = opened.map_err(|e| anyhow::anyhow!("no remote cache: {e}"))?;
+            let start = std::time::Instant::now();
+            let info = remote.info()?;
+            println!(
+                "{} {} {} protocol v{} in {}",
+                ui::green(ui::MARK),
+                remote.endpoint(),
+                ui::dim("·"),
+                info.protocol,
+                ui::duration(start.elapsed().as_millis() as u64)
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn enabled(v: bool) -> String {
+    if v {
+        ui::green("enabled")
+    } else {
+        ui::dim("disabled")
+    }
+}
+
 fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
     print!("{}", ui::banner(&format!("DOCTOR  {}", arc_core::VERSION)));
     println!(
@@ -1534,6 +1707,48 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         )
     );
 
+    println!("\n{}\n", ui::bold("remote cache"));
+    match remote_for(cwd) {
+        Ok((cfg, Ok(remote))) => {
+            println!("{}", ui::row("configured", &check(true)));
+            println!("{}", ui::row("endpoint", &ui::accent(remote.endpoint())));
+            println!("{}", ui::row("namespace", remote.namespace()));
+            println!(
+                "{}",
+                ui::row(
+                    "auth",
+                    &if remote.has_token() {
+                        ui::green("configured")
+                    } else {
+                        ui::dim("none")
+                    }
+                )
+            );
+            println!("{}", ui::row("read", &enabled(cfg.read)));
+            println!("{}", ui::row("write", &enabled(cfg.write)));
+            match remote.info() {
+                Ok(info) => {
+                    println!("{}", ui::row("reachable", &check(true)));
+                    println!("{}", ui::row("protocol", &format!("v{}", info.protocol)));
+                }
+                // An unreachable remote is a degraded optimisation, not a
+                // broken installation, so doctor says so and moves on.
+                Err(e) => {
+                    println!("{}", ui::row("reachable", &ui::yellow(&format!("{e:#}"))));
+                    println!(
+                        "{}",
+                        ui::row("impact", &ui::dim("local cache still functional"))
+                    );
+                }
+            }
+        }
+        Ok((_, Err(reason))) => {
+            println!("{}", ui::row("configured", &ui::dim(&reason)));
+            println!("{}", ui::row("cache", &ui::green("local only")));
+        }
+        Err(e) => println!("{}", ui::row("configured", &ui::red(&format!("{e:#}")))),
+    }
+
     println!("\n{}\n", ui::bold("task graph"));
     match Db::open(home).and_then(|db| arc_core::graph::build(&project, &db)) {
         Ok(g) => {
@@ -1584,7 +1799,11 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         "{}",
         ui::row("selective execution", &ui::green("supported"))
     );
-    println!("{}", ui::row("remote cache", &ui::dim("not implemented")));
+    println!("{}", ui::row("remote cache", &ui::green("supported")));
+    println!(
+        "{}",
+        ui::row("remote execution", &ui::dim("not implemented"))
+    );
     Ok(())
 }
 

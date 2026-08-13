@@ -77,3 +77,18 @@ env = ["NODE_ENV"]
 name = "package"
 match = "*make package*"
 after = ["test-core"]
+
+[remote]
+# A shared cache: a result produced on one machine is reused on another.
+# Everything the remote returns is verified locally before it is used, and an
+# unreachable or misbehaving server only ever costs a cache hit.
+enabled = true
+url = "https://cache.example.com"
+# Required. Isolates execution metadata; there is no safe way to guess one.
+namespace = "my-project"
+# The *name* of an environment variable holding the bearer token. The token
+# itself never appears in configuration, history, records or logs.
+token_env = "ARC_CACHE_TOKEN"
+# An untrusted CI job (a fork's pull request) should read but not write.
+read = true
+write = true

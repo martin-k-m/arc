@@ -60,6 +60,25 @@ impl CacheStatus {
     }
 }
 
+/// Where a hit's result came from. Records written before v0.5 predate remote
+/// caching entirely, so they default to local.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheSource {
+    #[default]
+    Local,
+    Remote,
+}
+
+impl CacheSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CacheSource::Local => "local",
+            CacheSource::Remote => "remote",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobRef {
     pub digest: String,
@@ -94,6 +113,8 @@ pub struct ExecutionRecord {
     pub stderr: Option<BlobRef>,
     pub outputs: Vec<OutputFile>,
     pub cache_status: CacheStatus,
+    #[serde(default)]
+    pub cache_source: CacheSource,
     /// For a hit, the execution whose result was reused.
     pub replayed_from: Option<String>,
     /// Blob holding the `(path, digest)` list of inputs, for change explanation.
@@ -114,10 +135,18 @@ impl ExecutionRecord {
 
     /// Every blob this record depends on. Used by garbage collection.
     pub fn blob_digests(&self) -> Vec<String> {
+        let mut v = self.replay_digests();
+        v.extend(self.input_manifest.iter().map(|b| b.digest.clone()));
+        v
+    }
+
+    /// The blobs a replay actually needs. The input manifest is excluded: it
+    /// only explains *why* a past run missed, so losing it must not force a
+    /// re-execution of a result that is otherwise complete.
+    pub fn replay_digests(&self) -> Vec<String> {
         let mut v: Vec<String> = self.outputs.iter().map(|o| o.digest.clone()).collect();
         v.extend(self.stdout.iter().map(|b| b.digest.clone()));
         v.extend(self.stderr.iter().map(|b| b.digest.clone()));
-        v.extend(self.input_manifest.iter().map(|b| b.digest.clone()));
         v
     }
 }

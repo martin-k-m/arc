@@ -62,6 +62,12 @@ impl Hasher {
         self.0.update(b);
         self
     }
+    /// Unframed content bytes, for hashing a stream whose identity must equal
+    /// `hash_bytes` of the same content.
+    pub fn raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.update(bytes);
+        self
+    }
     pub fn finish(&self) -> Digest {
         Digest(*self.0.finalize().as_bytes())
     }
