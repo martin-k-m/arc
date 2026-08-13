@@ -23,24 +23,33 @@ consumer without a rewrite.
      db.dependency_set            what Arc learned about this family before
                 │
                 ▼
-     DependencySet::validate      schema, capabilities, version, family match
+     DependencySet::validate      schema, semantics, capabilities, version
                 │                 ── fails ──▶ discard, treat as no knowledge
                 ▼
-     scan::scan_inputs            content-hash the project (size/mtime fast path)
+     dependency::can_narrow       the one gate: may learned knowledge be trusted?
                 │
+        ┌───────┴────────┐
+       yes               no
+        │                │
+        ▼                ▼
+ dependency::         scan::scan_inputs
+ fingerprint          content-hash the whole project
+ files, dirs,                │
+ absences, execs            │
+        └───────┬────────────┘
                 ▼
      key::execution_key           may this exact result be reused?
                 │
                 ▼
      db.lookup ──── hit ────▶ outputs::restore ──▶ exec::replay
-                │
+                │                                  (the tracer never starts)
                miss
                 │
                 ▼
      db.release()                 drop the redb lock before the child runs
                 │
                 ▼
-     trace::start ─▶ exec::run ─▶ tracer.attach(pid) ─▶ tracer.finish()
+     trace::start ─▶ exec::run ─▶ tracer.supervise(pid) ─▶ tracer.finish()
                 │
                 ▼
      DependencySet::from_observations ─▶ merge ─▶ db.put_dependency_set
@@ -57,28 +66,28 @@ consumer without a rewrite.
 | `project` | Project discovery, `arc.toml`, per-command scoping |
 | `family` | `FamilyKey` — execution *identity* |
 | `key` | `execution_key` — execution *state*; environment and toolchain fingerprints |
-| `scan` | Input discovery and content hashing |
+| `scan` | Project-wide input discovery and content hashing |
 | `trace` | Observation backends behind one capability-declaring interface |
-| `dependency` | `DependencySet`, `Completeness`, merge and validation rules |
+| `dependency` | `DependencySet`, temporal classification, `can_narrow`, narrowed fingerprinting |
 | `graph` / `affected` | Read-only projections over families and dependency sets |
 | `git` | Optional, isolated; nothing in the run pipeline depends on it |
 | `store` | Content-addressed blobs |
 | `db` | redb metadata, schema versioning, indexes |
-| `exec` | Child process spawn, streamed tee, exit status |
+| `exec` | Child process spawn, streamed tee, exit status, the `Supervisor` hook |
 | `outputs` | Output capture and path-safe restoration |
 | `engine` | Sequences the above; holds no policy of its own |
 | `maintenance` | Stats, GC, prune, verify |
 
 ## Two keys, two questions
 
-This is the central idea of v0.2 and the easiest thing to get wrong.
+The easiest thing in Arc to get wrong.
 
 ```text
 FamilyKey                          ExecutionKey
 "have I seen this before?"         "may I reuse that result?"
 
 program + args                     everything in FamilyKey
-working directory                  + project input digest
+working directory                  + input digest      ← narrowed or project-wide
 project scoping config             + environment digest
 OS + arch                          + toolchain digest
                                    + learned dependency digest
@@ -90,9 +99,17 @@ would move the execution into a new family and Arc could never find what it had
 learned. The execution key includes everything, and is the only thing that may
 authorise a cache hit.
 
+The input digest is where narrowing lives. Under `can_narrow` it covers the
+learned dependency set; otherwise it covers a project walk. Those are different
+digests over different ground, which is why `SCHEMA_VERSION` went to 3: a v2
+entry for the same command in the same project is not comparable.
+
 `SCHEMA_VERSION`, `FAMILY_KEY_VERSION`, `DEPENDENCY_SCHEMA_VERSION`,
-`TRACE_SCHEMA_VERSION` and `DB_SCHEMA_VERSION` are separate on purpose: each can
-be bumped without invalidating more than it has to.
+`TRACE_SCHEMA_VERSION`, `TRACE_SEMANTICS_VERSION` and `DB_SCHEMA_VERSION` are
+separate on purpose: each can be bumped without invalidating more than it has to.
+`TRACE_SEMANTICS_VERSION` is the subtle one — it exists because the *rules* a
+backend applies can change while the stored shape stays identical, and a set
+called "complete" under the old rules must not be reused under the new ones.
 
 ## Storage
 
@@ -113,7 +130,11 @@ Content-addressed blobs in `$ARC_HOME/store/blobs/<2>/<62>`, metadata in
 `dependency_edges` is ordered by key, so "which families depend on this file?"
 is a contiguous range scan scoped to one project rather than a full table scan.
 Only families whose inputs are actually narrowed get rows, which bounds the
-index at the size of the declared scope rather than the size of the repository.
+index at the size of the dependency set rather than the size of the repository.
+
+Raw syscall streams are never persisted. A dependency set holds normalised paths
+and counts; `ExecutionRecord.trace` holds a summary and the downgrade reasons as
+text.
 
 ### Concurrency
 
@@ -129,42 +150,138 @@ call.
 A database whose `meta.schema` marker does not match `DB_SCHEMA_VERSION` — or
 which cannot be read at all — is deleted and rebuilt. Cache contents are
 disposable; misreading them is not. Arc never interprets an old record under new
-semantics.
+semantics, and never fails a user's command because its own cache is damaged.
 
-## Tracing backends
+## Tracing
 
-`trace::Tracer` is deliberately small: `attach(pid)` before the child runs,
-`finish()` after it exits, plus a `Capabilities` struct that says exactly what
-the backend can see. Everything downstream is gated on those capabilities rather
-than on which backend happens to be loaded.
+### The interface
 
-### Shipping today
+```rust
+trait Tracer {
+    fn name(&self) -> &'static str;
+    fn capabilities(&self) -> Capabilities;
+    fn launch(&self) -> Launch;                       // Normal | Traced
+    fn attach(&mut self, pid: u32) -> Result<()>;
+    fn supervise(&mut self, pid: u32) -> Option<Result<Wait>>;
+    fn finish(self: Box<Self>) -> Observations;
+}
+```
 
-**`snapshot`** (all platforms). Metadata walk of the project before and after
-the execution, diffed to yield creates, writes and deletes. No privileges, no
-injection, no kernel interface. Cannot see reads.
+`Capabilities` is the contract: every field is a promise the backend must keep
+for *every* execution, not a best effort. Everything downstream is gated on those
+rather than on which backend happens to be loaded.
 
-**`snapshot+jobobject`** (Windows). Adds process-tree observation: the child is
-assigned to an anonymous job object with an I/O completion port, and Windows
-posts a notification for every descendant process. This is how Arc sees that
-`cargo test` is really `cargo`, `rustc`, a linker and the test binaries. The
-`unsafe` needed for it is confined to `trace/windows_job.rs`.
+Two hooks exist because two very different mechanisms have to fit. A snapshot
+diff needs neither; a job object needs `attach`; a ptrace backend needs
+`Launch::Traced` — which tells `exec` to have the child put itself under tracing
+before `exec` — and needs to own the wait loop, because for ptrace the wait loop
+*is* the event loop.
 
-### Not built
+### `linux-ptrace`
 
-**Linux.** `ptrace` and seccomp-unotify can observe reads without privileges but
-cost a context switch per syscall; `fanotify` needs `CAP_SYS_ADMIN`. A ptrace
-backend is the most likely first source of `Completeness::Complete`.
+The v0.3 backend, and the first to reach `Completeness::Complete`.
+
+```text
+exec::run
+   │  pre_exec: ptrace(PTRACE_TRACEME)          ← the only moment this is possible
+   ▼
+child stops at exec ─▶ PTRACE_SETOPTIONS
+   │                    TRACESYSGOOD | TRACEFORK | TRACEVFORK
+   │                    TRACECLONE   | TRACEEXEC | EXITKILL
+   ▼
+┌─ waitpid(-1, __WALL) ──────────────────────────────────────┐
+│                                                            │
+│  syscall stop ─▶ PTRACE_GET_SYSCALL_INFO                   │
+│      entry ─▶ remember (nr, args); stat existence for      │
+│               creating opens; capture execve image         │
+│      exit  ─▶ classify against the fd table and cwd,       │
+│               record a FileObservation                     │
+│                                                            │
+│  PTRACE_EVENT_FORK/VFORK/CLONE ─▶ register child,          │
+│               sharing cwd/fds per CLONE_FS/CLONE_FILES     │
+│  PTRACE_EVENT_EXEC ─▶ record script + /proc/pid/exe        │
+│  signal stop ─▶ forward it unchanged                       │
+│                                                            │
+└─▶ all tracees gone ─▶ Observations                         ┘
+   │
+   ▼
+dependency::from_observations
+   │  temporal classification: ordered events ─▶ input | output |
+   │  directory | existence | intermediate
+   ▼
+DependencySet
+```
+
+Files:
+
+| File | Contains |
+| --- | --- |
+| `trace/linux/sys.rs` | Every `unsafe` line: `ptrace`, `waitpid`, `fork` (probe only), `process_vm_readv`. Nothing else in the backend is unsafe |
+| `trace/linux/syscalls.rs` | Which syscalls carry a dependency, which are provably irrelevant, and the fall-through that downgrades everything else |
+| `trace/linux/state.rs` | Per-process working directory and descriptor table, with kernel sharing rules |
+| `trace/linux/backend.rs` | The event loop and the rules turning syscalls into observations |
+| `trace/linux/mod.rs` | Availability probing and the `/proc`, `/sys`, `/dev` policy |
+
+Three decisions worth stating:
+
+**Why ptrace and not something faster.** Seccomp user notification is the
+natural successor and is far cheaper, but installing a listener has required
+`CAP_SYS_ADMIN` since it was introduced. `fanotify` and eBPF need capabilities a
+developer tool must not ask for, and observe the whole machine rather than one
+process tree — a privacy problem as much as a correctness one. `LD_PRELOAD`
+misses static binaries, misses raw syscalls, and is defeated by `setuid`; a
+tracer that silently misses Go binaries cannot claim completeness. ptrace is the
+slow option and the honest one: it needs nothing but being the parent, and it
+works under `kernel.yama.ptrace_scope = 1` because the child puts *itself* under
+observation rather than Arc attaching to a stranger.
+
+**Why `PTRACE_GET_SYSCALL_INFO` and not registers.** It reports whether a stop is
+an entry or an exit, which removes the classic ptrace bug of losing entry/exit
+alignment on a freshly cloned child. It is also architecture-independent, so Arc
+carries no per-architecture register mapping and cannot mis-trace on an
+architecture it was never built for. The cost is a Linux 5.3 floor, which the
+availability probe checks rather than assumes.
+
+**Why availability is probed by trying it.** A container may permit ptrace,
+forbid it via seccomp, or forbid it via `kernel.yama.ptrace_scope`, and only an
+attempt distinguishes them. `sys::probe` forks a child that calls
+`PTRACE_TRACEME` and stops; the answer comes from how that child stopped. The
+result is cached for the process, and `arc doctor` reports it verbatim.
+
+### `snapshot+jobobject` (Windows)
+
+Metadata walk of the project before and after the execution, diffed to yield
+creates, writes and deletes, plus process-tree observation: the child is assigned
+to an anonymous job object with an I/O completion port, and Windows posts a
+notification for every descendant. That is how Arc sees that `cargo test` is
+really `cargo`, `rustc`, a linker and the test binaries. The `unsafe` is confined
+to `trace/windows_job.rs`. It cannot see reads, so it never narrows.
+
+### `snapshot` (everywhere)
+
+The portable fallback and the pinned backend for `--trace-backend snapshot`.
+Writes only.
+
+### Still not built
 
 **macOS.** EndpointSecurity requires a signed entitlement Apple grants per
-application; `DTrace` needs SIP changes. Neither is viable for a tool installed
-with `cargo install`.
+application; DTrace needs SIP changes. Neither is viable for a tool installed
+with `cargo install`, so macOS runs the snapshot backend and says so.
 
 **Windows reads.** ETW's kernel file provider requires administrator rights, and
 last-access timestamps are disabled by default. Nothing non-privileged and
-non-injecting can observe reads, which is why the Windows backend declares
-`file_reads: false` rather than approximating it.
+non-injecting can observe reads.
 
-When a read-capable backend lands, `Completeness::Complete` becomes reachable and
-input narrowing switches on at the single gate in `dependency.rs`. No call site
-outside that module needs to change.
+## Testing on Linux from elsewhere
+
+`scripts/linux-check.sh` runs the workspace inside a container:
+
+```bash
+scripts/linux-check.sh test --workspace
+scripts/linux-check.sh clippy --workspace --all-targets --all-features -- -D warnings
+ARC_DOCKER_ARGS=--security-opt=seccomp=unconfined scripts/linux-check.sh test --workspace
+```
+
+A container is not just convenient — it is also the environment most likely to
+*refuse* ptrace, so the same run exercises both the backend and its unavailable
+path. `scripts/bench.sh` and `scripts/demo.sh` are meant to be run the same way.

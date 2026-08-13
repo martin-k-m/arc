@@ -27,9 +27,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bumped whenever anything that feeds an execution key changes meaning. Old
 /// entries then simply stop matching instead of being misinterpreted.
 ///
-/// v2 added family identity and learned-dependency digests to the key, so v1
-/// entries must not be reused: they were computed under different semantics.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v2 added family identity and learned-dependency digests to the key. v3 added
+/// automatic input narrowing, under which the input digest covers a learned
+/// dependency set rather than a project walk — the same command in the same
+/// project computes a different digest, so v2 entries must not be reused.
+pub const SCHEMA_VERSION: u32 = 3;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

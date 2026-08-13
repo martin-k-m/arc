@@ -7,10 +7,15 @@
 //! load learned dependencies ──▶ validate ──▶ (unsafe → discard)
 //!        │
 //!        ▼
-//! fingerprint inputs ─▶ execution key ─▶ lookup
-//!        │                                 │
-//!        │                            hit ─┴─ miss
-//!        ▼                             │      │
+//!   can_narrow? ──yes──▶ fingerprint learned deps only
+//!        │ no                    │
+//!        ▼                       │
+//! fingerprint whole project ─────┤
+//!                                ▼
+//!                         execution key ─▶ lookup
+//!                                          │
+//!                                     hit ─┴─ miss
+//!                                      │      │
 //!     restore  ◀────────────────────────      ▼
 //!                                          execute + trace
 //!                                             │
@@ -18,14 +23,18 @@
 //!                                       learn dependencies
 //! ```
 //!
-//! Each stage below is a function of the previous stage's output, so the
-//! ordering constraint that matters — the execution key is fixed *before* the
-//! command runs, from knowledge stored *before* the run — is visible rather
-//! than implied.
+//! Each stage is a function of the previous stage's output, so the ordering
+//! constraint that matters — the execution key is fixed *before* the command
+//! runs, from knowledge stored *before* the run — is visible rather than
+//! implied.
+//!
+//! A cache hit never starts the tracer. Learned knowledge is only refreshed by
+//! an execution, which is sound because a hit means every dependency Arc knows
+//! about is in the state it was in when that knowledge was gathered.
 
 use crate::db::Db;
-use crate::dependency::{Completeness, DependencySet};
-use crate::exec;
+use crate::dependency::{self, Completeness, DependencySet, Narrow};
+use crate::exec::{self, Supervisor, Wait};
 use crate::family;
 use crate::hash::Digest;
 use crate::key::{self, EnvFingerprint, KeyInputs, Toolchain};
@@ -35,9 +44,9 @@ use crate::project::{Config, Project};
 use crate::record::{
     format_command, BlobRef, CacheEntry, CacheStatus, ExecutionRecord, OutputFile, TraceSummary,
 };
-use crate::scan::{self, InputSet};
+use crate::scan::{self, FingerprintMap};
 use crate::store::Store;
-use crate::trace;
+use crate::trace::{self, Selection, Tracer};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -53,8 +62,10 @@ pub struct RunOptions {
     /// nothing is written to the cache.
     pub no_capture: bool,
     pub cache_failures: bool,
-    /// Force observation even on a cache hit, and report what was seen.
+    /// Report what was observed.
     pub trace: bool,
+    /// Pin a tracing backend, for testing the fallback path.
+    pub backend: Selection,
 }
 
 /// Why Arc decided what it decided, in a form both the terminal renderer and
@@ -81,8 +92,21 @@ pub struct Explain {
     pub ignored_changes: Vec<String>,
     pub dependency_state: String,
     pub inputs_narrowed: bool,
+    /// Why narrowing was or was not applied, from the single gate.
+    pub narrow_reason: String,
     pub fingerprint_ms: u64,
 }
+
+/// A place for the front end to say what Arc is doing while it does it.
+///
+/// The engine reports stages; it never decides how — or whether — they are
+/// shown. That keeps a spinner out of the pipeline and out of piped output.
+pub trait Progress {
+    fn stage(&self, _label: &str) {}
+}
+
+/// A run nobody is watching.
+impl Progress for () {}
 
 pub struct RunReport {
     pub record: ExecutionRecord,
@@ -101,6 +125,22 @@ pub struct RunReport {
 #[derive(Serialize, Deserialize)]
 struct InputManifest {
     files: Vec<(String, String)>,
+    /// Which input set this manifest describes. A narrowed manifest and a
+    /// project-wide one cover different ground, so comparing them file by file
+    /// reports every difference between the two *methods* as a change to the
+    /// project — which is noise, and misleading noise at that.
+    #[serde(default)]
+    narrowed: bool,
+}
+
+/// The fingerprint of everything this run considers an input, from whichever
+/// source was authorised.
+struct Inputs {
+    digest: Digest,
+    files: Vec<(String, String)>,
+    bytes_hashed: u64,
+    reused: usize,
+    narrowed: bool,
 }
 
 /// Everything fixed before the command can run.
@@ -114,6 +154,7 @@ struct Plan {
     command_line: String,
     deps: DependencySet,
     dep_state: Completeness,
+    narrow: Narrow,
 }
 
 pub fn run(
@@ -123,7 +164,9 @@ pub fn run(
     args: &[String],
     opts: &RunOptions,
     arc_home: &Path,
+    progress: &dyn Progress,
 ) -> Result<RunReport> {
+    progress.stage("resolving project");
     let store = Store::open(arc_home)?;
     let db = Db::open(arc_home)?;
     let plan = plan(project, cwd, program, args, arc_home, &db)?;
@@ -134,10 +177,21 @@ pub fn run(
     }
 
     // ---- fingerprint -------------------------------------------------------
+    progress.stage(if plan.narrow.allowed() {
+        "fingerprinting learned dependencies"
+    } else {
+        "fingerprinting project"
+    });
     let fp_start = Instant::now();
     let mut fps = db.load_fingerprints(&plan.project_id)?;
-    let skip = [arc_home.to_path_buf()];
-    let inputs = scan::scan_inputs(&project.root, &plan.cfg, &mut fps, &skip)?;
+    let inputs = fingerprint_inputs(
+        project,
+        arc_home,
+        &plan.cfg,
+        &plan.deps,
+        plan.narrow.allowed(),
+        &mut fps,
+    )?;
     let env = key::fingerprint_env(&plan.cfg);
     let toolchain = key::fingerprint_toolchain(program, cwd)?;
     let dep_digest = plan.deps.key_digest();
@@ -163,7 +217,7 @@ pub fn run(
         input_digest: inputs.digest.hex(),
         input_files: inputs.files.len(),
         input_bytes_hashed: inputs.bytes_hashed,
-        reused_fingerprints: inputs.reused_fingerprints,
+        reused_fingerprints: inputs.reused,
         env_digest: env.digest.clone(),
         toolchain_digest: toolchain.digest.clone(),
         dependency_digest: dep_digest.hex(),
@@ -173,11 +227,16 @@ pub fn run(
         changed: Vec::new(),
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
-        inputs_narrowed: plan.deps.inputs_are_narrowed(),
+        // True whenever Arc has grounds to call some change irrelevant, whether
+        // it earned them by observation or was told them in `arc.toml`.
+        // `narrow_reason` says which.
+        inputs_narrowed: inputs.narrowed || plan.deps.inputs_are_narrowed(),
+        narrow_reason: plan.narrow.reason().into(),
         fingerprint_ms,
     };
 
     // ---- lookup ------------------------------------------------------------
+    progress.stage("checking cache");
     if !opts.refresh {
         if let Some((entry, prev)) = db.lookup(&exec_key.hex())? {
             match try_replay(&store, project, &prev) {
@@ -232,30 +291,34 @@ pub fn run(
     // redb's exclusive lock across an arbitrarily long command would serialise
     // every other Arc process on this machine.
     db.release();
+    progress.stage("executing");
     let now = scan::now_millis();
-    let mut tracer = (plan.cfg.trace.enabled || opts.trace)
-        .then(|| trace::start(&project.root, &plan.classifier))
+    let tracer = (plan.cfg.trace.enabled || opts.trace)
+        .then(|| trace::start(&project.root, &plan.classifier, opts.backend))
         .flatten();
-    let outcome = {
-        let mut attach = |pid: u32| {
-            if let Some(t) = tracer.as_mut() {
-                let _ = t.attach(pid);
-            }
-        };
-        exec::run(&plan.resolved, args, cwd, true, &mut attach)?
+    let mut sup = TraceSupervisor {
+        tracer,
+        failures: Vec::new(),
     };
-    let observations = tracer.map(|t| {
-        let caps = t.capabilities();
-        (caps, t.name(), t.finish())
-    });
+    let outcome = exec::run(&plan.resolved, args, cwd, true, &mut sup)?;
+    let observations = sup.collect();
 
+    progress.stage("capturing outputs");
     let captured_outputs: Vec<OutputFile> =
         outputs::capture(&project.root, &plan.cfg.outputs.include, &store)?;
 
     // ---- learn -------------------------------------------------------------
+    progress.stage("learning dependencies");
     let (trace_summary, learned) = match &observations {
         Some((caps, name, obs)) => {
-            let fresh = DependencySet::from_observations(&plan.family_key, name, *caps, obs, now);
+            let fresh = DependencySet::from_observations(
+                &plan.family_key,
+                name,
+                *caps,
+                obs,
+                &project.root,
+                now,
+            );
             let merged = learn(&db, &plan, fresh, now)?;
             (
                 Some(TraceSummary {
@@ -263,10 +326,13 @@ pub fn run(
                     completeness: merged.completeness,
                     processes: obs.processes.len(),
                     files_observed: obs.files.len(),
-                    inputs: merged.inputs.len(),
+                    inputs: merged.inputs.len() + merged.external.len(),
+                    directories: merged.directories.len(),
+                    absent: merged.existence.len(),
                     outputs: merged.outputs.len(),
                     executables: merged.executables.len(),
                     lossy: obs.lossy,
+                    downgrades: merged.downgrades.iter().map(|d| d.describe()).collect(),
                 }),
                 Some(merged),
             )
@@ -278,19 +344,35 @@ pub fn run(
     // under the key that run will ask for. Without this, first observing a
     // dependency would guarantee a miss on the following run — correct, but a
     // needless one, and it would take two runs before anything ever hit.
-    let effective_key = match &learned {
-        Some(merged) => key::execution_key(&KeyInputs {
-            program,
-            args,
-            rel_cwd: &plan.rel_cwd,
-            family_key: &plan.family_key,
-            input_digest: &inputs.digest,
-            env_digest: &env.digest,
-            toolchain_digest: &toolchain.digest,
-            dependency_digest: &merged.key_digest(),
-            output_globs: &plan.cfg.outputs.include,
-        }),
-        None => exec_key,
+    // What the next run will compute, and therefore what this result must be
+    // filed under — key *and* manifest together, so the stored record describes
+    // one consistent view rather than a key over one input set and a file list
+    // over another.
+    let filed = match &learned {
+        Some(merged) => post_learn_inputs(project, arc_home, &plan, merged, &inputs)?,
+        None => None,
+    };
+    // Two things can differ from what this run computed: the learned dependency
+    // digest, which grows as executables are observed, and — the first time
+    // narrowing switches on — the input set itself.
+    let next_inputs = filed.as_ref().unwrap_or(&inputs);
+    let (effective_key, manifest_files, manifest_narrowed) = match &learned {
+        Some(merged) => (
+            key::execution_key(&KeyInputs {
+                program,
+                args,
+                rel_cwd: &plan.rel_cwd,
+                family_key: &plan.family_key,
+                input_digest: &next_inputs.digest,
+                env_digest: &env.digest,
+                toolchain_digest: &toolchain.digest,
+                dependency_digest: &merged.key_digest(),
+                output_globs: &plan.cfg.outputs.include,
+            }),
+            next_inputs.files.clone(),
+            next_inputs.narrowed,
+        ),
+        None => (exec_key, inputs.files.clone(), inputs.narrowed),
     };
 
     let store_cacheable = !outcome.truncated
@@ -299,11 +381,8 @@ pub fn run(
 
     let (stdout, stderr, manifest) = if store_cacheable {
         let manifest = InputManifest {
-            files: inputs
-                .files
-                .iter()
-                .map(|f| (f.rel.clone(), f.digest.hex()))
-                .collect(),
+            files: manifest_files,
+            narrowed: manifest_narrowed,
         };
         let mbytes = serde_json::to_vec(&manifest)?;
         (
@@ -362,6 +441,148 @@ pub fn run(
     })
 }
 
+/// Adapts a tracer to `exec`'s lifecycle hooks, and records the fact if it
+/// broke. A tracer failure must reach the dependency set — a run Arc could not
+/// fully observe is a run whose knowledge must not be trusted to narrow.
+struct TraceSupervisor {
+    tracer: Option<Box<dyn Tracer>>,
+    failures: Vec<String>,
+}
+
+impl Supervisor for TraceSupervisor {
+    fn traced(&self) -> bool {
+        self.tracer
+            .as_ref()
+            .is_some_and(|t| t.launch() == trace::Launch::Traced)
+    }
+
+    fn on_spawn(&mut self, pid: u32) {
+        if let Some(t) = self.tracer.as_mut() {
+            if let Err(e) = t.attach(pid) {
+                self.failures.push(format!("attach failed: {e}"));
+            }
+        }
+    }
+
+    fn wait(&mut self, pid: u32) -> Option<Result<Wait>> {
+        self.tracer.as_mut()?.supervise(pid)
+    }
+
+    fn disable(&mut self, reason: String) {
+        self.failures.push(reason);
+    }
+}
+
+impl TraceSupervisor {
+    fn collect(self) -> Option<(trace::Capabilities, &'static str, trace::Observations)> {
+        let t = self.tracer?;
+        let caps = t.capabilities();
+        let name = t.name();
+        let mut obs = t.finish();
+        for f in self.failures {
+            obs.lossy = true;
+            obs.downgrade(trace::Downgrade::BackendError(f));
+        }
+        Some((caps, name, obs))
+    }
+}
+
+/// Fingerprint whatever this run is allowed to treat as its input set.
+fn fingerprint_inputs(
+    project: &Project,
+    arc_home: &Path,
+    cfg: &Config,
+    deps: &DependencySet,
+    narrowed: bool,
+    fps: &mut FingerprintMap,
+) -> Result<Inputs> {
+    let skip = [arc_home.to_path_buf()];
+    if narrowed {
+        let fp = dependency::fingerprint(deps, &project.root, fps)?;
+        let mut files = fp.files;
+        let mut digest = fp.digest;
+        let mut bytes = fp.bytes_hashed;
+        let mut reused = fp.reused;
+        // Declared inputs are additive, even here. `[[command]] inputs` is the
+        // user asserting a fact about their build; a trace that did not happen
+        // to read one of those files this time is not grounds to overrule them.
+        if !cfg.inputs.include.is_empty() {
+            let declared = scan::scan_inputs(&project.root, cfg, fps, &skip)?;
+            let mut h = crate::hash::Hasher::new();
+            h.field(digest.bytes());
+            h.field(declared.digest.bytes());
+            digest = h.finish();
+            bytes += declared.bytes_hashed;
+            reused += declared.reused_fingerprints;
+            let known: std::collections::HashSet<&String> = files.iter().map(|(p, _)| p).collect();
+            let extra: Vec<(String, String)> = declared
+                .files
+                .iter()
+                .filter(|f| !known.contains(&f.rel))
+                .map(|f| (f.rel.clone(), f.digest.hex()))
+                .collect();
+            files.extend(extra);
+        }
+        return Ok(Inputs {
+            digest,
+            files,
+            bytes_hashed: bytes,
+            reused,
+            narrowed: true,
+        });
+    }
+    let set = scan::scan_inputs(&project.root, cfg, fps, &skip)?;
+    Ok(Inputs {
+        digest: set.digest,
+        files: set
+            .files
+            .iter()
+            .map(|f| (f.rel.clone(), f.digest.hex()))
+            .collect(),
+        bytes_hashed: set.bytes_hashed,
+        reused: set.reused_fingerprints,
+        narrowed: false,
+    })
+}
+
+/// The input set the *next* run of this family will fingerprint, given what was
+/// just learned.
+///
+/// After a first complete trace the next run will narrow, and a narrowed
+/// fingerprint is a different digest over different ground. Filing this result
+/// under the old key would guarantee a miss the moment narrowing switches on.
+///
+/// `None` means keep what this run already computed.
+fn post_learn_inputs(
+    project: &Project,
+    arc_home: &Path,
+    plan: &Plan,
+    merged: &DependencySet,
+    inputs: &Inputs,
+) -> Result<Option<Inputs>> {
+    // An execution that rewrote something it read leaves the filesystem in a
+    // state it never actually consumed. Fingerprinting *now* would file this
+    // result under a key describing the world after it ran, and the next run
+    // would replay a result produced from different input. That is a false hit,
+    // so such a run keeps what it computed before it started.
+    if !merged.self_modified.is_empty() {
+        return Ok(None);
+    }
+    let caps = trace::platform_capabilities();
+    let next_narrow = dependency::can_narrow(merged, &caps, &plan.family_key).allowed();
+    if next_narrow == inputs.narrowed {
+        return Ok(None);
+    }
+    Ok(Some(fingerprint_inputs(
+        project,
+        arc_home,
+        &plan.cfg,
+        merged,
+        next_narrow,
+        &mut FingerprintMap::new(),
+    )?))
+}
+
 /// Everything decided before the command may run.
 fn plan(
     project: &Project,
@@ -406,6 +627,9 @@ fn plan(
             Completeness::Unsupported,
         ),
     };
+    // The single narrowing decision for this run. Everything downstream reads
+    // it; nothing re-derives it.
+    let narrow = dependency::can_narrow(&deps, &caps, &family_key);
 
     Ok(Plan {
         cfg,
@@ -417,6 +641,7 @@ fn plan(
         command_line,
         deps,
         dep_state,
+        narrow,
     })
 }
 
@@ -456,7 +681,7 @@ fn bypass(
 ) -> Result<RunReport> {
     db.release();
     let now = scan::now_millis();
-    let outcome = exec::run(&plan.resolved, args, cwd, !opts.no_capture, &mut |_| {})?;
+    let outcome = exec::run(&plan.resolved, args, cwd, !opts.no_capture, &mut ())?;
     let record = ExecutionRecord {
         schema: crate::SCHEMA_VERSION,
         id: new_id(program, now),
@@ -509,6 +734,7 @@ fn bypass(
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
         inputs_narrowed: false,
+        narrow_reason: plan.narrow.reason().into(),
         fingerprint_ms: 0,
     };
     Ok(RunReport {
@@ -558,13 +784,17 @@ fn diff_reason(
     db: &Db,
     store: &Store,
     plan: &Plan,
-    inputs: &InputSet,
+    inputs: &Inputs,
     env: &EnvFingerprint,
 ) -> Result<(String, Vec<String>)> {
     let history = db.history(200)?;
+    // Only executions, not replays. A hit's record is a copy of the execution it
+    // replayed, so its input manifest describes that older run — which may have
+    // been fingerprinted over entirely different ground, before Arc learned
+    // enough to narrow.
     let Some(prev) = history
         .into_iter()
-        .find(|r| r.family_key == plan.family_key && r.cache_status != CacheStatus::Bypass)
+        .find(|r| r.family_key == plan.family_key && r.cache_status == CacheStatus::Miss)
     else {
         return Ok((
             "no previous execution of this command was recorded".into(),
@@ -578,7 +808,10 @@ fn diff_reason(
         let reason = match changed.first() {
             Some(first) if changed.len() == 1 => first.clone(),
             Some(first) => format!("{first} (and {} more)", changed.len() - 1),
-            None => "project inputs changed".into(),
+            None if inputs.narrowed => {
+                "Arc narrowed this command's inputs for the first time".into()
+            }
+            None => "tracked inputs changed".into(),
         };
         return Ok((reason, changed.into_iter().take(20).collect()));
     }
@@ -609,7 +842,7 @@ fn diff_reason(
 
 /// `path changed|added|removed` lines, by comparing against the stored input
 /// manifest of a previous execution.
-fn changed_inputs(store: &Store, prev: &ExecutionRecord, inputs: &InputSet) -> Result<Vec<String>> {
+fn changed_inputs(store: &Store, prev: &ExecutionRecord, inputs: &Inputs) -> Result<Vec<String>> {
     let mut changed = Vec::new();
     let Some(m) = &prev.input_manifest else {
         return Ok(changed);
@@ -620,14 +853,17 @@ fn changed_inputs(store: &Store, prev: &ExecutionRecord, inputs: &InputSet) -> R
     let Ok(old) = serde_json::from_slice::<InputManifest>(&bytes) else {
         return Ok(changed);
     };
+    if old.narrowed != inputs.narrowed {
+        return Ok(changed);
+    }
     let old_map: std::collections::HashMap<_, _> = old.files.into_iter().collect();
     let mut new_paths = std::collections::HashSet::new();
-    for f in &inputs.files {
-        new_paths.insert(f.rel.as_str());
-        match old_map.get(&f.rel) {
-            Some(d) if *d == f.digest.hex() => {}
-            Some(_) => changed.push(format!("{} changed", f.rel)),
-            None => changed.push(format!("{} added", f.rel)),
+    for (rel, digest) in &inputs.files {
+        new_paths.insert(rel.as_str());
+        match old_map.get(rel) {
+            Some(d) if d == digest => {}
+            Some(_) => changed.push(format!("{rel} changed")),
+            None => changed.push(format!("{rel} added")),
         }
     }
     for path in old_map.keys() {
@@ -639,7 +875,7 @@ fn changed_inputs(store: &Store, prev: &ExecutionRecord, inputs: &InputSet) -> R
 }
 
 /// Project files that changed since the cached execution but are outside this
-/// family's narrowed input set.
+/// family's input set.
 ///
 /// Only meaningful when the family's inputs are narrowed; otherwise Arc has no
 /// grounds to call anything irrelevant and returns nothing. Deliberately a
@@ -660,13 +896,20 @@ pub fn ignored_changes(
     let cfg = project.config_for(command_line)?;
     let mut scoped = cfg.clone();
     scoped.inputs.include.clear();
-    let mut fps = scan::FingerprintMap::new();
+    let mut fps = FingerprintMap::new();
     let all = scan::scan_inputs(&project.root, &scoped, &mut fps, &[arc_home.to_path_buf()])?;
     let considered = scan::build_globs(&cfg.inputs.include)?;
+    let dirs: Vec<&String> = deps.directories.iter().collect();
     Ok(all
         .files
         .into_iter()
-        .filter(|f| !considered.is_match(&f.rel) && !deps.inputs.contains(&f.rel))
+        .filter(|f| {
+            !considered.is_match(&f.rel)
+                && !deps.inputs.contains(&f.rel)
+                // A file inside an enumerated directory is covered by that
+                // directory's entry set, so it is not "outside the inputs".
+                && !dirs.iter().any(|d| f.rel.starts_with(&format!("{d}/")))
+        })
         .map(|f| f.rel)
         .collect())
 }

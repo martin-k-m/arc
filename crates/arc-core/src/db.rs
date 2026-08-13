@@ -37,7 +37,7 @@ const DEP_INDEX: TableDefinition<&str, &str> = TableDefinition::new("dependency_
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
 /// Bumped when table layouts change incompatibly.
-pub const DB_SCHEMA_VERSION: &str = "2";
+pub const DB_SCHEMA_VERSION: &str = "3";
 
 pub const COUNTER_HITS: &str = "hits";
 pub const COUNTER_MISSES: &str = "misses";

@@ -5,8 +5,9 @@
 //! bright cyan against deep navy — with 24-bit colour where the terminal
 //! advertises it and a plain ANSI fallback everywhere else.
 
-use std::io::IsTerminal;
-use std::sync::OnceLock;
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn colored() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -111,13 +112,128 @@ pub fn completeness_color(label: &str) -> String {
 }
 
 /// `label  value`, aligned, with the label dimmed.
+///
+/// Padded before styling: escape sequences count towards a format width but
+/// occupy no columns, so padding a coloured string silently misaligns every row.
 pub fn row(label: &str, value: &str) -> String {
-    format!("  {:<19} {}", dim(label), value)
+    format!("  {} {}", dim(&format!("{label:<19}")), value)
 }
 
 /// A tree branch line, for `arc graph`.
 pub fn branch(last: bool) -> String {
     dim(if last { "└── " } else { "├── " })
+}
+
+/// Whether motion is allowed: a real terminal, colour enabled, and no explicit
+/// opt-out. A pipe, a CI log or `NO_COLOR` gets none of this.
+fn animate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| colored() && std::env::var_os("ARC_NO_ANIM").is_none())
+}
+
+/// Braille frames, chosen because every glyph is exactly one cell wide, so the
+/// line never reflows mid-spin on a narrow terminal.
+const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPIN_MS: u64 = 80;
+
+/// A single-line spinner on stderr, showing what Arc is doing while it does it.
+///
+/// The label is shared rather than re-created per stage so a long fingerprint
+/// pass can say so without the caller juggling handles. Every write goes to
+/// stderr and is erased on stop, so a command's own stdout is never touched.
+pub struct Spinner {
+    label: Arc<Mutex<String>>,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    pub fn start(label: &str) -> Spinner {
+        let label = Arc::new(Mutex::new(label.to_string()));
+        let running = Arc::new(AtomicBool::new(true));
+        if !animate() {
+            return Spinner {
+                label,
+                running,
+                handle: None,
+            };
+        }
+        let handle = std::thread::spawn({
+            let label = label.clone();
+            let running = running.clone();
+            move || {
+                let mut i = 0usize;
+                let mut width = 0usize;
+                while running.load(Ordering::Relaxed) {
+                    let text = label.lock().map(|l| l.clone()).unwrap_or_default();
+                    let line = format!("  {} {}", brand(FRAMES[i % FRAMES.len()]), dim(&text));
+                    width = width.max(text.chars().count() + 4);
+                    eprint!("\r{line}");
+                    let _ = std::io::stderr().flush();
+                    i += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(SPIN_MS));
+                }
+                eprint!("\r{}\r", " ".repeat(width));
+                let _ = std::io::stderr().flush();
+            }
+        });
+        Spinner {
+            label,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn set(&self, label: &str) {
+        if let Ok(mut l) = self.label.lock() {
+            *l = label.to_string();
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if !self.running.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Stopping on drop is what makes the spinner safe to hold across an early
+/// return or an error path: the line is always erased.
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A short flourish before a headline result. The mark grows from a dot to
+/// Arc's diamond, which reads as the moment the answer lands.
+///
+/// Deliberately under a fifth of a second: long enough to notice, short enough
+/// that nobody waiting on a build ever resents it.
+pub fn flourish() {
+    if !animate() {
+        return;
+    }
+    for frame in ["·", "◦", "◇", "◆"] {
+        eprint!("\r  {} ", brand(frame));
+        let _ = std::io::stderr().flush();
+        std::thread::sleep(std::time::Duration::from_millis(35));
+    }
+    eprint!("\r     \r");
+    let _ = std::io::stderr().flush();
+}
+
+/// A horizontal meter, for proportions worth seeing at a glance.
+pub fn meter(fraction: f64, width: usize) -> String {
+    let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    format!(
+        "{}{}",
+        brand(&"━".repeat(filled)),
+        dim(&"━".repeat(width - filled))
+    )
 }
 
 pub fn duration(ms: u64) -> String {

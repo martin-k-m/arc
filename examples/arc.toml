@@ -9,9 +9,16 @@ max_size = "20GB"
 cache_failures = false
 
 [trace]
-# Observe executions to learn their dependencies. Costs one metadata walk of the
-# project per run. Turn it off for very large trees where the walk outweighs the
-# command; caching keeps working without it.
+# Observe executions to learn what they actually depend on.
+#
+# On Linux this is real syscall tracing: it makes the first run of a command
+# several times slower and every later cache hit dramatically cheaper, because a
+# hit fingerprints only the learned dependencies and never starts the tracer.
+# Elsewhere it costs one metadata walk of the project per run.
+#
+# Turn it off for a CI job that will never hit, or a tree so large that the walk
+# outweighs the command. Caching keeps working without it; it just falls back to
+# hashing the whole project.
 enabled = true
 
 [inputs]
@@ -32,9 +39,13 @@ include = ["target/release/mytool"]
 include = ["MY_FEATURE_FLAG"]
 exclude = ["TERM"]
 
-# Per-command scoping. This is where input narrowing comes from: Arc cannot
-# observe file reads on any platform it currently supports, so telling it what a
-# command depends on is the one way to make unrelated edits stop invalidating it.
+# Per-command scoping.
+#
+# Where Arc can observe reads (Linux), it narrows on its own and these blocks are
+# an addition rather than the only source of knowledge — declared inputs are
+# always fingerprinted, even if a trace did not happen to read them. Everywhere
+# else this is the *only* way to make unrelated edits stop invalidating a
+# command.
 #
 # `match` is a glob against the whole command line. Declarations from every
 # matching block are unioned with the settings above, so two blocks can never

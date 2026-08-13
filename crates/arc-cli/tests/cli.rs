@@ -73,6 +73,23 @@ fn write_file_cmd(rel: &str, text: &str) -> Vec<String> {
     }
 }
 
+/// A command that genuinely reads a project file.
+///
+/// Where the tracer is complete, only a command that *reads* a file depends on
+/// it, so a test about invalidation has to use one. Where it is not, the whole
+/// project is the input set and this behaves identically.
+fn read_cmd(rel: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            "cmd".into(),
+            "/c".into(),
+            format!("type {}", rel.replace('/', "\\")),
+        ]
+    } else {
+        vec!["sh".into(), "-c".into(), format!("cat {rel}")]
+    }
+}
+
 fn fail_cmd(code: i32) -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".into(), "/c".into(), format!("exit {code}")]
@@ -110,7 +127,10 @@ fn second_identical_run_is_a_hit_and_replays_output_exactly() {
 #[test]
 fn changing_an_input_forces_a_miss_and_explains_which_file() {
     let sb = Sandbox::new();
-    let cmd = echo("x");
+    let cmd = read_cmd("input.txt");
+    run(&sb, &[], &cmd);
+    // A second run settles any narrowing: the first execution is what teaches
+    // Arc that this command reads the file at all.
     run(&sb, &[], &cmd);
     sb.write("input.txt", "two");
 

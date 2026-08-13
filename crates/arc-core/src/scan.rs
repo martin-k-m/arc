@@ -33,7 +33,7 @@ pub type FingerprintMap = HashMap<String, (u64, i64, Digest)>;
 
 /// Files whose mtime is younger than this are always re-hashed, since a write
 /// within the filesystem's timestamp granularity could otherwise go unseen.
-const MTIME_TRUST_LAG_MS: i64 = 2_000;
+pub const MTIME_TRUST_LAG_MS: i64 = 2_000;
 
 pub fn build_globs(patterns: &[String]) -> Result<GlobSet> {
     let mut b = GlobSetBuilder::new();
@@ -66,7 +66,10 @@ pub fn scan_inputs(
     let include = build_globs(&cfg.inputs.include)?;
     let use_include = !cfg.inputs.include.is_empty();
 
-    let mut paths: Vec<String> = Vec::new();
+    // The real path is carried alongside its display form. On Unix a filename
+    // is bytes, not text, so re-deriving the path from a lossy string would make
+    // Arc unable to open the very file it just found.
+    let mut paths: Vec<(String, PathBuf)> = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .parents(false)
@@ -89,14 +92,14 @@ pub fn scan_inputs(
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if rel.is_empty() || exclude.is_match(&rel) {
+        let display = rel.to_string_lossy().replace('\\', "/");
+        if display.is_empty() || exclude.is_match(&display) {
             continue;
         }
-        if use_include && !include.is_match(&rel) {
+        if use_include && !include.is_match(&display) {
             continue;
         }
-        paths.push(rel);
+        paths.push((display, entry.path().to_path_buf()));
     }
     paths.sort();
     paths.dedup();
@@ -104,7 +107,7 @@ pub fn scan_inputs(
     let now_ms = now_millis();
     let entries: Vec<FileEntry> = paths
         .par_iter()
-        .map(|rel| fingerprint_one(root, rel, fps, now_ms))
+        .map(|(rel, path)| fingerprint_one(path, rel, fps, now_ms))
         .collect::<Result<Vec<_>>>()?;
 
     let mut bytes_hashed = 0;
@@ -122,9 +125,9 @@ pub fn scan_inputs(
     }
     let digest = h.finish();
 
-    for e in &entries {
-        if let Ok(md) = std::fs::symlink_metadata(root.join(&e.rel)) {
-            fps.insert(e.rel.clone(), (md.len(), mtime_millis(&md), e.digest));
+    for ((rel, path), e) in paths.iter().zip(&entries) {
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            fps.insert(rel.clone(), (md.len(), mtime_millis(&md), e.digest));
         }
     }
 
@@ -136,9 +139,8 @@ pub fn scan_inputs(
     })
 }
 
-fn fingerprint_one(root: &Path, rel: &str, fps: &FingerprintMap, now_ms: i64) -> Result<FileEntry> {
-    let path = root.join(rel);
-    let md = std::fs::symlink_metadata(&path)
+fn fingerprint_one(path: &Path, rel: &str, fps: &FingerprintMap, now_ms: i64) -> Result<FileEntry> {
+    let md = std::fs::symlink_metadata(path)
         .with_context(|| format!("reading metadata for {}", path.display()))?;
     let symlink = md.file_type().is_symlink();
     let size = md.len();
@@ -159,10 +161,10 @@ fn fingerprint_one(root: &Path, rel: &str, fps: &FingerprintMap, now_ms: i64) ->
     }
 
     let digest = if symlink {
-        let target = std::fs::read_link(&path)?;
+        let target = std::fs::read_link(path)?;
         hash_bytes(target.to_string_lossy().replace('\\', "/").as_bytes())
     } else {
-        hash_file(&path)?
+        hash_file(path)?
     };
     Ok(FileEntry {
         rel: rel.into(),
@@ -183,7 +185,7 @@ fn is_exec(_md: &std::fs::Metadata) -> bool {
     false
 }
 
-fn mtime_millis(md: &std::fs::Metadata) -> i64 {
+pub fn mtime_millis(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

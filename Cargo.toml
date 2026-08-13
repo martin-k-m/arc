@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/arc-core", "crates/arc-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
@@ -20,6 +20,9 @@ ignore = "0.4"
 rayon = "1.8"
 redb = "2"
 clap = { version = "4.5", features = ["derive"] }
+# Raw Linux syscall bindings for the ptrace backend. `libc` is a bindings crate,
+# not a C dependency: nothing is compiled from source and no toolchain is needed.
+libc = "0.2"
 # Pure-Rust Win32 bindings. Needed for job-object process-tree observation;
 # no C toolchain, and only the four modules below are compiled in.
 windows-sys = { version = "0.59", features = [

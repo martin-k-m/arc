@@ -14,7 +14,7 @@
 //! degrades to the v0.1 behaviour of that file remaining an ordinary input; it
 //! can never turn into a cache hit that should have been a miss.
 
-use super::model::{FileObservation, FileOp, Observations};
+use super::model::{Downgrade, FileObservation, FileOp, Observations};
 use super::{Capabilities, Tracer};
 use crate::paths::{display_form, Classifier, Scope};
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     process_tree: false,
     executables: false,
     outside_project: false,
+    network_detection: false,
 };
 
 /// Snapshotting a tree with more entries than this is not worth the wall-clock
@@ -86,15 +87,22 @@ impl Tracer for SnapshotTracer {
 
         let lossy = self.truncated || truncated;
         let mut notes = Vec::new();
+        // This backend never observes reads, so every trace it produces is
+        // partial by construction. Saying so here rather than inferring it from
+        // the capability flags keeps one code path for "why is this not
+        // complete?".
+        let mut downgrades = vec![Downgrade::BackendPartial];
         if lossy {
             notes.push(format!(
                 "project has more than {MAX_ENTRIES} files; write observation is incomplete"
             ));
+            downgrades.push(Downgrade::EventOverflow);
         }
         Observations {
             files,
             processes: Vec::new(),
             lossy,
+            downgrades,
             notes,
         }
     }
