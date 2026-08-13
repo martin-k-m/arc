@@ -141,7 +141,8 @@ digests over different ground, which is why `SCHEMA_VERSION` went to 3: a v2
 entry for the same command in the same project is not comparable.
 
 `SCHEMA_VERSION`, `FAMILY_KEY_VERSION`, `DEPENDENCY_SCHEMA_VERSION`,
-`TRACE_SCHEMA_VERSION`, `TRACE_SEMANTICS_VERSION`, `GRAPH_SCHEMA_VERSION` and
+`TRACE_SCHEMA_VERSION`, `TRACE_SEMANTICS_VERSION`, `GRAPH_SCHEMA_VERSION`,
+`PROTOCOL_VERSION` and
 `DB_SCHEMA_VERSION` are separate on purpose: each can be bumped without invalidating more than it has to.
 `TRACE_SEMANTICS_VERSION` is the subtle one — it exists because the *rules* a
 backend applies can change while the stored shape stays identical, and a set
@@ -323,3 +324,70 @@ ARC_DOCKER_ARGS=--security-opt=seccomp=unconfined scripts/linux-check.sh test --
 A container is not just convenient — it is also the environment most likely to
 *refuse* ptrace, so the same run exercises both the backend and its unavailable
 path. `scripts/bench.sh` and `scripts/demo.sh` are meant to be run the same way.
+
+## The remote cache
+
+```text
+                        ExecutionKey
+                             │
+                             ▼
+                       local metadata ──hit──▶ restore ──▶ done
+                             │ miss
+                             ▼
+                       remote client
+                             │
+              ┌──────────────┼───────────────┐
+              ▼              ▼               ▼
+       GET execution   POST objects/  GET objects/{digest}
+         metadata         missing        (bounded parallel)
+              │              │               │
+              └──────────────┴───────┬───────┘
+                                     ▼
+                            hash every object
+                                     │
+                                     ▼
+                               local CAS commit
+                                     │
+                                     ▼
+                            local cache entry written
+                                     │
+                                     ▼
+                          ordinary local restore path
+```
+
+Upload runs the same pipeline backwards, and in a fixed order:
+
+```text
+execution succeeds ─▶ local CAS + metadata commit
+                            │
+                            ▼
+                  POST objects/missing        (one round trip for the set)
+                            │
+                            ▼
+                  PUT objects/{digest} ...    (bounded parallel, deflate above 4 KB)
+                            │
+                            ▼
+                  PUT executions/{key}        (last, always)
+```
+
+| Module | Responsibility |
+|---|---|
+| `remote::protocol` | Wire types, limits, and the validation both ends run |
+| `remote` | HTTP client, retry, bounded transfers, metrics, config resolution |
+| `arc-cache` | Reference server: filesystem CAS, namespaced records, auth |
+
+The protocol types live in `arc-core` so the client and the reference server
+share one definition of the format and one implementation of its validation.
+The server crate is separate, so the `arc` binary does not ship an HTTP server
+it will never run.
+
+**Why blocking HTTP.** `ureq` with `rustls` is pure Rust: no OpenSSL, no C
+toolchain, no async runtime. Arc's engine is synchronous, and transfer
+concurrency is a bounded worker pool over a slice of digests — a few dozen lines
+against the cost of making unrelated core modules async.
+
+**Why the scheduler needs no remote code.** `arc affected --run` spawns
+`arc run` per task, so each task gets remote lookup, verification and upload
+through the ordinary engine. The scheduler's only remote-aware decision is
+dividing the transfer pool by `--jobs`, so sixteen tasks do not open sixteen
+full-sized transfer pools.

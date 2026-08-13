@@ -350,6 +350,81 @@ refuses any path that would land outside the project, including through `..`, an
 absolute path, or a symlinked parent directory, and aborts before writing
 anything if any entry is unsafe.
 
+## Sharing a cache between machines
+
+A result produced on one machine can be replayed on another. Start the reference
+server anywhere both can reach:
+
+```bash
+arc-cache serve --listen 127.0.0.1:7890 --data ./arc-cache-data
+```
+
+Point the project at it:
+
+```toml
+[remote]
+url = "http://127.0.0.1:7890"
+namespace = "demo"
+```
+
+Then the second machine does not repeat the first machine's work:
+
+```console
+$ ARC_HOME=/tmp/a arc run sh -c 'sleep 1 && build'
+built
+
+$ ARC_HOME=/tmp/b arc run sh -c 'sleep 1 && build'
+✦ REMOTE HIT  sh -c sleep 1 && build
+  restored in 4ms · saved 1.0s · 1 file (20 B)
+  fetched 20 B from 127.0.0.1:7890 in 3ms
+
+$ ARC_HOME=/tmp/b arc run sh -c 'sleep 1 && build'
+✦ CACHE HIT  sh -c sleep 1 && build
+  restored in 2ms · saved 1.0s · 1 file (20 B)
+```
+
+The third run makes **no network requests at all**: a remote hit is promoted
+into the local cache, and a local hit never opens a connection.
+
+```console
+$ arc remote status
+  configured    ✓
+  endpoint      127.0.0.1:7890
+  namespace     demo
+  read          enabled
+  write         enabled
+  auth          none
+  reachable     ✓
+  protocol      v1
+  server        arc-cache 0.5.0
+```
+
+`arc affected --run` benefits automatically: every scheduled task goes through
+the same engine, so tasks another machine has already built come back as hits.
+
+Full options:
+
+```toml
+[remote]
+enabled = true
+url = "https://cache.example.com"
+namespace = "my-project"
+token_env = "ARC_CACHE_TOKEN"   # the variable's *name*, never a token
+read = true                     # untrusted CI: read = true, write = false
+write = true
+```
+
+`--no-remote` skips the remote for one run. `ARC_REMOTE_URL`,
+`ARC_REMOTE_NAMESPACE`, `ARC_REMOTE_READ`, `ARC_REMOTE_WRITE` and
+`ARC_REMOTE_ENABLED` override the file, which is usually how CI configures it.
+
+**A remote cache is an optimisation and is treated as untrusted.** Every
+downloaded object is re-hashed before it is admitted; every record is validated
+before it is read; every restored path goes through the same safety checks as a
+local one. A corrupt object, a missing object, a malformed record, an expired
+credential or an unreachable server all mean the same thing: run the command.
+See [docs/remote-protocol.md](docs/remote-protocol.md) for the wire format.
+
 ## Correctness
 
 A fast wrong answer is worthless, so Arc executes whenever it is unsure. See
@@ -388,7 +463,29 @@ Graph operations are not where the time goes (x86-64, release,
 | 10,000 tasks, 29,691 edges | 26 ms | 13 ms | 14 ms | 6 ms |
 | 10,000-deep chain | 10 ms | 6 ms | 11 ms | 4 ms |
 
-All of it is `O(V + E)`: edge derivation joins a producer index rather than
+Remote cache, reference server on loopback with injected round-trip latency
+(`cargo run --release -p arc-cache --example remote_bench`):
+
+| Payload | RTT | Wire | Upload | Lookup | Download | Second fetch | Requests |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 object, 1 MB | 0 ms | 6.2 KB | 11 ms | 6 ms | 4 ms | 0 ms | 5 |
+| 100 objects, 1.6 MB | 0 ms | 16.8 KB | 110 ms | 8 ms | 122 ms | 3 ms | 203 |
+| 1,000 objects, 1.1 MB | 0 ms | 1.1 MB | 805 ms | 8 ms | 2,080 ms | 42 ms | 2,003 |
+| 1 object, 1 MB | 50 ms | 6.2 KB | 107 ms | 50 ms | 57 ms | 0 ms | 5 |
+| 100 objects, 1.6 MB | 50 ms | 16.8 KB | 756 ms | 51 ms | 706 ms | 4 ms | 203 |
+
+Two things to read from this. **Missing-object negotiation is one round trip**,
+not one per object, so the second fetch of the same set costs almost nothing at
+any latency — that column is what a warm CI runner actually pays. And
+**compression is decided per object**: source-like data above 4 KB shrinks by
+~99%, while the 1 KB objects fall below the threshold and are sent raw, because
+deflating them costs more than it saves.
+
+What the numbers also show is that the protocol is still one request per
+distinct object. A thousand tiny objects is 2,003 requests, and at 50 ms that
+dominates everything else.
+
+Graph work is `O(V + E)`: edge derivation joins a producer index rather than
 comparing task pairs, traversal is breadth-first over a three-level lattice, and
 ordering is Kahn's algorithm with a label-ordered ready set. Cycle detection is
 iterative Tarjan, so a ten-thousand-deep chain does not touch the stack.
@@ -423,14 +520,15 @@ relationships, with transitive affected analysis and bounded-parallel selective
 execution; content-addressed storage with deduplication; output
 capture and restore; execution-family identity; learned dependency sets with
 explicit completeness and structured downgrade reasons; process-tree and write
-observation on Windows; the dependency graph; `arc affected` against Git; cache
+observation on Windows; a verified remote cache with a reference server, so one
+machine's result is another machine's hit; the dependency graph; `arc affected` against Git; cache
 statistics, LRU pruning, garbage collection, integrity verification; execution
 history and inspection; JSON output for tooling; and safe concurrent use from
 several terminals.
 
 Not built, and deliberately not stubbed: read-capable tracing on macOS or
-Windows (and therefore automatic narrowing there), remote caching, distributed
-execution, and any agent protocol. `arc doctor` reports capabilities honestly.
+Windows (and therefore automatic narrowing there), remote *execution*, cloud
+storage backends for the cache server, and any agent protocol. `arc doctor` reports capabilities honestly.
 
 ## License
 

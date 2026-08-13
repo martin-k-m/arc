@@ -20,3 +20,7 @@ toml.workspace = true
 [dev-dependencies]
 tempfile = "3"
 serde_json.workspace = true
+# The reference server runs in-process for tests, so a fault can be injected
+# without a second binary or a fixed port.
+arc-cache = { path = "../arc-cache" }
+arc-core.workspace = true

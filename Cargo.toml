@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/arc-core", "crates/arc-cli"]
+members = ["crates/arc-core", "crates/arc-cli", "crates/arc-cache"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
@@ -20,6 +20,12 @@ ignore = "0.4"
 rayon = "1.8"
 redb = "2"
 clap = { version = "4.5", features = ["derive"] }
+# Blocking HTTP with a pure-Rust TLS stack: no OpenSSL, no C toolchain, and no
+# async runtime pulled into an otherwise synchronous engine.
+ureq = "2.10"
+url = "2"
+# miniz_oxide backend only. Pure Rust; `zlib`/`libz-sys` are not enabled.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Raw Linux syscall bindings for the ptrace backend. `libc` is a bindings crate,
 # not a C dependency: nothing is compiled from source and no toolchain is needed.
 libc = "0.2"

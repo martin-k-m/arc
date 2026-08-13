@@ -14,6 +14,7 @@ pub struct Config {
     pub outputs: OutputsConfig,
     pub env: EnvConfig,
     pub trace: TraceConfig,
+    pub remote: crate::remote::RemoteConfig,
     /// Per-command scoping, written as repeated `[[command]]` tables.
     #[serde(rename = "command")]
     pub commands: Vec<CommandConfig>,

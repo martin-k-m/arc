@@ -210,7 +210,7 @@ pub fn capture(
     program: &Path,
     args: &[String],
     cwd: &Path,
-    env: &[(&str, &Path)],
+    env: &[(&str, &std::ffi::OsStr)],
 ) -> Result<Outcome> {
     let start = Instant::now();
     let mut cmd = Command::new(program);

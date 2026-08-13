@@ -576,3 +576,114 @@ rewritten wholesale, so its old edges disappear with it.
 - Every scheduled task goes through the normal engine, so cache correctness is
   unchanged by scheduling.
 - Graph rows are per project; two projects never share a graph.
+
+## The remote cache
+
+Arc 0.5 adds a shared cache. The invariant it introduces is one sentence:
+
+> Remote cache data is untrusted until Arc has verified it locally.
+
+Everything below follows from that, and from the fact that a remote cache is an
+optimisation. Arc may miss a remote hit, fail an upload, or find the server
+gone; none of those may change what the user's command does.
+
+### Trust model
+
+Assume the server is buggy, corrupt, or hostile. It can return anything for any
+request. What it cannot do is make Arc replay a result Arc has not verified, or
+write a file Arc has not validated.
+
+Three checks stand between a response and a replay.
+
+1. **Metadata validation.** A record is rejected unless its protocol version,
+   cache-semantics version, execution key, OS, architecture, digest syntax,
+   entry count and every output path pass. An invalid record is a miss.
+2. **Object verification.** Every downloaded object is hashed as it is received
+   and admitted only if it hashes to the digest that was asked for. A
+   `Content-Length`, an `ETag`, a `200` and a server-supplied digest header are
+   not evidence of anything.
+3. **Restore validation.** Remote outputs go through exactly the same
+   `outputs::restore` path as local ones: no absolute paths, no `..`, no
+   symlinked ancestor, and every destination resolved before any is written.
+   There is no second restoration implementation for remote data.
+
+### How a remote result becomes a local one
+
+```
+execution key ─▶ local lookup ─miss─▶ remote lookup ─▶ validate record
+                                                         │
+                          fetch only objects not held ◀───┘
+                                   │
+                          hash each on arrival
+                                   │
+                          commit to local CAS
+                                   │
+                          write a local cache entry
+                                   │
+                          ordinary local replay
+```
+
+A remote hit is converted into a *valid local hit* before a single output byte
+is written. That is why the next run of the same command is a plain local hit
+with no network at all, and why remote data can never take a shortcut past a
+check that local data must pass.
+
+If any object is missing, corrupt, truncated, or the connection dies partway,
+the entry is discarded whole and the command executes. Nothing is partially
+restored: half a result is not a result.
+
+### Publishing
+
+Objects first, record last. A record is a promise that its objects can be
+fetched, so it is only made once they can be. If the record write then fails,
+some objects are orphaned on the server — an acceptable cost, and the opposite
+ordering is not acceptable at all.
+
+Uploads are idempotent by construction: an object is named by its content, and a
+record is compared byte-for-byte with what is already stored. Two clients
+publishing the same result concurrently both succeed. A client publishing a
+*different* result for the same execution key is refused rather than allowed to
+overwrite, because under Arc's contract at most one of the two can be valid and
+the server cannot tell which.
+
+### Server-side verification
+
+The reference server hashes every uploaded object itself and refuses bytes that
+do not match the digest in the URL. Client-side verification would catch the
+poisoning eventually, but only after the bad object had been served to everyone.
+Defence in depth costs one hash per upload.
+
+### Cross-machine compatibility
+
+The execution key already covers OS, architecture, cache-semantics version,
+program, arguments, working directory *relative to the project root*, the
+environment fingerprint, the content hash of the resolved executable, and every
+input Arc knows about. Two machines that agree on all of those agree on the
+result; two that do not, do not share a key.
+
+Absolute paths are deliberately absent from the key, so the same project checked
+out at `/home/a/repo` and `C:\src\repo` produces the same key — which is what
+makes a shared cache useful at all. Machine-specific state does not slip through
+this: a dependency outside the project is identified by its content, and a
+different toolchain binary is a different toolchain digest.
+
+Namespaces isolate execution records. Objects are content-addressed and may be
+deduplicated across namespaces; a client only ever learns the digests named by
+records it can read.
+
+### Offline behaviour
+
+DNS failure, connection refused, timeout, TLS failure, 5xx, malformed response,
+bad credentials — all of them mean "no remote result", and the run proceeds
+locally. Timeouts are bounded, retries are bounded and apply only to transport
+faults and 5xx, and a local hit never opens a connection in the first place.
+Normal development does not become dependent on a network.
+
+### Credentials
+
+The configuration holds the *name* of an environment variable, never a token.
+The name is validated as an identifier, not evaluated as shell syntax. Tokens
+are never written to the database, the object store, execution records, history,
+JSON output, logs, or error messages, and redirects are not followed so a
+credential cannot be forwarded to another host. `arc doctor` and `arc remote
+status` report that a token is configured, never what it is.

@@ -19,6 +19,7 @@ pub mod paths;
 pub mod plan;
 pub mod project;
 pub mod record;
+pub mod remote;
 pub mod scan;
 pub mod store;
 pub mod trace;
