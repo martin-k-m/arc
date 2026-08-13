@@ -428,3 +428,151 @@ directories, absences and disappearances, syscall classification exhaustiveness
 neither), volatile-path policy, per-process path resolution and thread sharing,
 Git porcelain parsing, path traversal refusal, atomic restore, glob narrowing,
 size parsing, and fingerprint encoding including truncated data.
+
+## The task graph
+
+### Node and edge identity
+
+A node is an execution **family**, the same identity the cache uses, so it
+survives input changes, output changes, hits and misses. An edge `A → B` means
+**B depends on A, and A must precede B**. That direction is the same in the
+model, the JSON, the CLI and here.
+
+Edges are derived from stored per-task rows every time the graph is loaded, and
+never persisted. Rewriting a task's row therefore cannot leave a stale edge
+behind — the failure mode a persisted edge table invites, and the reason this
+one does not exist.
+
+### When an edge exists
+
+An edge is created only when a path one task **produces** intersects something
+another task **consumes**:
+
+| Consumer's dependency | Matching producer output | Edge kind |
+| --- | --- | --- |
+| A file it read | the same path | `output` |
+| A directory it enumerated | any path inside that directory | `directory` |
+| A path whose presence it consulted | the same path | `existence` |
+| A `[[command]] inputs` glob | any produced path the glob matches | `declared` |
+| — | — | `manual`, from `[[command]] after` |
+
+Path matching goes through `paths::PathKey`, the same authoritative identity the
+cache uses: case-folded on Windows only, `.`/`..` resolved, never a display
+string comparison.
+
+Three consequences worth stating:
+
+- **Directory and existence edges are what make the graph honest.** A task that
+  lists `plugins/` depends on a producer writing `plugins/new.so` even though
+  that file did not exist when either was traced. A task that branched on
+  `generated/config.json` being absent depends on whoever can create it.
+- **Outputs come from the temporal classification, not from raw writes.** A file
+  a task creates and then reads back is its own intermediate, so it produces no
+  edge to anyone. This is the v0.3 rule reused, not a second one.
+- **Self-edges are suppressed.** A task consuming what it produced is not its own
+  prerequisite.
+
+### Scope
+
+Only paths inside the project take part. Existence dependencies outside it are
+dropped when the row is written, and external reads were never outputs of
+anything. Two projects that both touch `/tmp/shared` do not become one graph:
+rows are keyed by project, and the graph is loaded per project.
+
+### Multiple producers
+
+When two tasks produce the same path, Arc does not choose. Both edges are
+created — covering both is conservative, picking one is a guess — and the path is
+reported as an ambiguity by `arc graph`, `arc doctor` and the JSON. Every edge
+through an ambiguous path carries `ambiguous: true`.
+
+### Cycles
+
+Cycles are found with Tarjan's algorithm, iteratively, so a deep chain cannot
+overflow the stack. A strongly connected component of more than one task, or a
+task that reaches itself, is reported as a cycle by `arc graph` and `arc doctor`.
+
+For scheduling, an SCC is condensed into **one group** that runs serially in
+stable order, and the group as a whole waits for everything outside it that it
+depends on. Arc does not pretend the cycle is a DAG, and it never deadlocks
+waiting for a prerequisite that cannot finish.
+
+### Affected propagation
+
+`affected::analyse` takes a graph and a set of changed paths and returns one of
+three verdicts per task. It is pure: no Git, no database, no terminal, which is
+what makes it reusable for anything that needs "given these changes, what is the
+minimal safe order?".
+
+1. **Direct.** A change is a task's own dependency if it is a file it read, lies
+   inside a directory it enumerated, is a path whose presence it consulted, or
+   matches one of its declared input globs. Deletions and additions count the
+   same way; a rename contributes both its old and new path.
+2. **Transitive.** Verdicts propagate along edges, breadth first over the lattice
+   `Unaffected < Unknown < Affected`. A task is only re-queued when its verdict
+   strengthens, so each edge is relaxed at most twice and a cycle terminates.
+3. **Fallback.** A task no change reached is `Unaffected` only if its inputs are
+   provable — a complete trace, or declared scope. Otherwise it is `Unknown`.
+
+**Unknown is never unaffected**, and uncertainty propagates: a task consuming
+something an unknown task produces is itself unknown. `arc affected --run`
+selects affected *and* unknown, so the only tasks skipped are those Arc proved
+irrelevant.
+
+Every verdict carries its causes, so `arc affected --explain` can answer "why is
+this running?" by walking back to the changed path.
+
+### Selective execution
+
+The plan is a topological order of the selected subgraph, deterministic to the
+tie-break: ready tasks are drained in label order, never in hash order. Each
+task then runs through `arc run`, so it still passes the ordinary cache, trace
+and learn pipeline. **Affected does not mean executed**: a task whose exact state
+is already cached restores and reports `hit`, and its consumers proceed from the
+restored outputs.
+
+Bounded parallelism, defaulting to available parallelism capped at 16, with
+`--jobs N` to override and `--jobs 1` for a deterministic serial run. Tasks are
+run as child `arc run` processes, which is also what keeps the metadata database
+free of in-process contention; concurrent Arc processes were already safe.
+
+Output is buffered per task and printed as a block when it finishes, so two
+tasks running at once never interleave mid-line.
+
+### Failure and cancellation
+
+A task whose prerequisite failed, was blocked, or was cancelled is reported
+`blocked` and **never started**. Independent branches continue by default;
+`--fail-fast` stops scheduling new work after the first failure. `arc affected
+--run` exits non-zero if anything failed or was blocked — individual exit codes
+cannot be preserved when several tasks fail, so a single indicator is the honest
+summary.
+
+Ctrl-C stops new work being scheduled. Children already running are in the same
+process group, receive the signal from the terminal, and are reaped normally.
+
+### Dynamic graph changes
+
+Running a task can change what it produces, which can change the graph the plan
+was built from. Arc plans once, from the pre-run graph, and does not re-plan
+mid-flight. The conservative consequence is accepted deliberately: a task whose
+relevance only appears *after* an upstream task runs is not picked up until the
+next `arc affected`. What cannot happen is the reverse — a task being dropped
+from a plan because an upstream run made it look irrelevant — because the plan is
+never narrowed after it is built.
+
+Between runs, a changed output set is picked up immediately: the task's row is
+rewritten wholesale, so its old edges disappear with it.
+
+### Invariants
+
+- An edge exists only where produced and consumed paths intersect, or where
+  `after` declares one.
+- Unknown dependency knowledge never proves independence, for a task or for
+  anything downstream of it.
+- An ambiguous producer never silently becomes a single producer.
+- Cycle detection and every traversal are iterative and terminating.
+- A dependent of a failed task never executes.
+- Every scheduled task goes through the normal engine, so cache correctness is
+  unchanged by scheduling.
+- Graph rows are per project; two projects never share a graph.

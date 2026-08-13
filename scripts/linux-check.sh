@@ -14,7 +14,8 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=${ARC_IMAGE:-rust:1-slim}
+# The full image ships git, which several tests need to ask what changed.
+IMAGE=${ARC_IMAGE:-rust:1}
 
 exec docker run --rm -t \
   -v "$HERE":/src:ro \
@@ -26,7 +27,8 @@ exec docker run --rm -t \
   -w /work \
   "$IMAGE" \
   bash -c '
-    cp -r /src/. /work
+    # The host target directory is another platform's and can be gigabytes.
+    tar -C /src -cf - --exclude=./target --exclude=./.git . | tar -C /work -xf -
     # The slim image ships no clippy or rustfmt; add them only when asked for,
     # so a plain `test` run does not pay for a component download.
     case "$1" in

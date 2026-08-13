@@ -324,14 +324,16 @@ fn observed_writes_are_recorded_as_outputs_not_inputs() {
 
     let graph = json(&sb.arc(&["graph", "--json"]));
     let node = &graph["nodes"][0];
-    let outputs: Vec<String> = serde_json::from_value(node["outputs"].clone()).unwrap();
+    let produces: Vec<String> = serde_json::from_value(node["produces"].clone()).unwrap();
     assert!(
-        outputs.iter().any(|o| o.contains("generated.txt")),
+        produces.iter().any(|o| o.contains("generated.txt")),
         "the write should be learned as an output: {node}"
     );
-    let inputs: Vec<String> = serde_json::from_value(node["inputs"].clone()).unwrap();
+    let consumed = node["consumes"].as_array().unwrap();
     assert!(
-        !inputs.iter().any(|i| i.contains("generated.txt")),
+        !consumed
+            .iter()
+            .any(|c| c["path"].as_str().unwrap_or("").contains("generated.txt")),
         "a file this execution created is not an input to it: {node}"
     );
 }
@@ -340,13 +342,15 @@ fn observed_writes_are_recorded_as_outputs_not_inputs() {
 fn the_process_tree_contributes_executables_to_the_cache_key() {
     let sb = Sandbox::new();
     sb.run(&["--trace"]);
-    let graph = json(&sb.arc(&["graph", "--json"]));
-    let execs: Vec<String> = serde_json::from_value(graph["nodes"][0]["executables"].clone())
-        .expect("executables array");
+    let id = json(&sb.arc(&["history", "--json"]))[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rec = json(&sb.arc(&["inspect", &id, "--json"]));
     if cfg!(windows) {
         assert!(
-            !execs.is_empty(),
-            "the job-object backend should identify at least the child itself"
+            rec["trace"]["executables"].as_u64().unwrap() > 0,
+            "the job-object backend should identify at least the child itself: {rec}"
         );
     }
     // Whatever was observed, the run must remain reusable.
@@ -553,14 +557,13 @@ fn affected_maps_git_changes_onto_scoped_executions() {
     // A change inside the declared scope.
     sb.write("src/a.txt", "modified");
     let report = json(&sb.arc(&["affected", "--json"]));
-    let fam = &report["families"][0];
-    assert_eq!(fam["verdict"], "affected", "{report}");
+    assert_eq!(report["tasks"][0]["verdict"], "affected", "{report}");
 
     // A change outside it.
     sb.git(&["checkout", "--", "src/a.txt"]);
     sb.write("docs/design.md", "modified");
     let report = json(&sb.arc(&["affected", "--json"]));
-    assert_eq!(report["families"][0]["verdict"], "unaffected", "{report}");
+    assert_eq!(report["tasks"][0]["verdict"], "unaffected", "{report}");
 }
 
 #[test]
@@ -574,10 +577,17 @@ fn affected_says_unknown_rather_than_unaffected_without_narrowing() {
     sb.write("docs/design.md", "modified");
 
     let report = json(&sb.arc(&["affected", "--json"]));
-    assert_eq!(
-        report["families"][0]["verdict"], "unknown",
-        "an unscoped family must never be declared unaffected: {report}"
-    );
+    let verdict = report["tasks"][0]["verdict"].as_str().unwrap();
+    if narrows() {
+        // A complete trace makes the family provable, so `unaffected` is a
+        // conclusion Arc earned rather than a guess.
+        assert_eq!(verdict, "unaffected", "{report}");
+    } else {
+        assert_eq!(
+            verdict, "unknown",
+            "without proof, a family must never be declared unaffected: {report}"
+        );
+    }
 }
 
 #[test]
@@ -602,8 +612,13 @@ fn graph_json_is_stable_and_reports_narrowing_honestly() {
     let graph = json(&sb.arc(&["graph", "--json"]));
     assert!(graph["schema"].is_number());
     let node = &graph["nodes"][0];
-    assert!(node["command"].as_str().unwrap().contains("echo"));
+    assert!(node["label"].as_str().unwrap().contains("echo"));
     assert!(node["completeness"].is_string());
+    assert!(
+        node["program"].is_string(),
+        "a task must be re-runnable: {node}"
+    );
+    assert!(node["args"].is_array());
     // The flag must agree with what the platform can actually observe: claiming
     // narrowed inputs Arc did not earn is exactly the lie this guards against.
     assert_eq!(
@@ -611,14 +626,11 @@ fn graph_json_is_stable_and_reports_narrowing_honestly() {
         narrows(),
         "{node}"
     );
-    for field in [
-        "inputs",
-        "directories",
-        "existence",
-        "outputs",
-        "executables",
-    ] {
+    for field in ["produces", "consumes", "declared_inputs", "after"] {
         assert!(node[field].is_array(), "missing {field}: {node}");
+    }
+    for field in ["edges", "ambiguities", "cycles", "unresolved"] {
+        assert!(graph[field].is_array(), "missing {field}: {graph}");
     }
 }
 

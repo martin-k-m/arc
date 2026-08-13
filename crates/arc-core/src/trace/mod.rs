@@ -161,6 +161,14 @@ impl Selection {
         }
     }
 
+    pub fn name(&self) -> &'static str {
+        match self {
+            Selection::Auto => "auto",
+            Selection::Snapshot => "snapshot",
+            Selection::Off => "off",
+        }
+    }
+
     /// `ARC_TRACE_BACKEND` overrides the default, so a container or CI job can
     /// pin the conservative backend without editing `arc.toml`.
     pub fn from_env() -> Selection {

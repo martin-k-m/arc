@@ -7,6 +7,7 @@
 
 use crate::dependency::DependencySet;
 use crate::family::ExecutionFamily;
+use crate::graph::TaskNode;
 use crate::hash::Digest;
 use crate::record::{CacheEntry, ExecutionRecord};
 use crate::scan::FingerprintMap;
@@ -25,19 +26,18 @@ const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
 const FAMILIES: TableDefinition<&str, &str> = TableDefinition::new("execution_families");
 /// family key -> `DependencySet`.
 const DEPENDENCIES: TableDefinition<&str, &str> = TableDefinition::new("dependency_sets");
-/// `{project_id}\0{rel path}\0{family key}` -> `""`.
+/// `{project_id}\0{family key}` -> `TaskNode`.
 ///
-/// A prefix scan over `{project_id}\0{rel}\0` answers "which families depend on
-/// this file?" without touching unrelated projects, which is what keeps
-/// `arc affected` from degenerating into a full table scan as the database
-/// grows. redb tables are ordered by key, so the range is contiguous.
-const DEP_INDEX: TableDefinition<&str, &str> = TableDefinition::new("dependency_edges");
+/// Everything the task graph needs, compactly, so building it is one contiguous
+/// range scan per project. Edges are derived from these rows in memory and never
+/// stored, which makes a stale edge structurally impossible.
+const GRAPH: TableDefinition<&str, &str> = TableDefinition::new("task_graph");
 /// Metadata schema marker. A database written by an incompatible version is
 /// rebuilt rather than reinterpreted.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
 /// Bumped when table layouts change incompatibly.
-pub const DB_SCHEMA_VERSION: &str = "3";
+pub const DB_SCHEMA_VERSION: &str = "4";
 
 pub const COUNTER_HITS: &str = "hits";
 pub const COUNTER_MISSES: &str = "misses";
@@ -82,7 +82,7 @@ impl Db {
             txn.open_table(COUNTERS)?;
             txn.open_table(FAMILIES)?;
             txn.open_table(DEPENDENCIES)?;
-            txn.open_table(DEP_INDEX)?;
+            txn.open_table(GRAPH)?;
             txn.open_table(META)?.insert("schema", DB_SCHEMA_VERSION)?;
             Ok(())
         })?;
@@ -377,54 +377,57 @@ impl Db {
         })
     }
 
-    /// Store a dependency set and rebuild its slice of the path index.
+    /// Store a dependency set together with the task-graph row derived from it,
+    /// in one transaction, so the graph can never describe a family whose
+    /// dependency set was not written.
     pub fn put_dependency_set(
         &self,
         project_id: &str,
         set: &DependencySet,
-        indexed: &[String],
+        node: &TaskNode,
     ) -> Result<()> {
         let json = serde_json::to_string(set)?;
-        let prefix = format!("{project_id}\0");
+        let node_json = serde_json::to_string(node)?;
         let family = set.family_key.clone();
-        let keys: Vec<String> = indexed
-            .iter()
-            .map(|rel| format!("{prefix}{rel}\0{family}"))
-            .collect();
+        let graph_key = format!("{project_id}\0{family}");
         self.write(|txn| {
             txn.open_table(DEPENDENCIES)?
                 .insert(family.as_str(), json.as_str())?;
-            let mut idx = txn.open_table(DEP_INDEX)?;
-            let stale: Vec<String> = idx
-                .iter()?
-                .filter_map(|r| r.ok())
-                .filter(|(k, v)| k.value().starts_with(&prefix) && v.value() == family)
-                .map(|(k, _)| k.value().to_string())
-                .collect();
-            for k in stale {
-                idx.remove(k.as_str())?;
-            }
-            for k in &keys {
-                idx.insert(k.as_str(), "")?;
-            }
+            txn.open_table(GRAPH)?
+                .insert(graph_key.as_str(), node_json.as_str())?;
             Ok(())
         })
     }
 
-    /// Families known to depend on `rel` within `project_id`.
-    pub fn families_depending_on(&self, project_id: &str, rel: &str) -> Result<Vec<String>> {
-        let lo = format!("{project_id}\0{rel}\0");
-        let hi = format!("{project_id}\0{rel}\u{1}");
+    /// Every task-graph row for one project, in key order.
+    pub fn task_nodes(&self, project_id: &str) -> Result<Vec<TaskNode>> {
+        let (lo, hi) = project_range(project_id);
         self.read(|txn| {
-            let idx = txn.open_table(DEP_INDEX)?;
+            let t = txn.open_table(GRAPH)?;
             let mut out = Vec::new();
-            for row in idx.range(lo.as_str()..hi.as_str())? {
-                let (k, _) = row?;
-                if let Some(f) = k.value().rsplit('\0').next() {
-                    out.push(f.to_string());
+            for row in t.range(lo.as_str()..hi.as_str())? {
+                if let Ok(n) = serde_json::from_str(row?.1.value()) {
+                    out.push(n);
                 }
             }
             Ok(out)
+        })
+    }
+
+    pub fn task_node(&self, project_id: &str, family_key: &str) -> Result<Option<TaskNode>> {
+        let key = format!("{project_id}\0{family_key}");
+        self.read(|txn| {
+            let t = txn.open_table(GRAPH)?;
+            Ok(t.get(key.as_str())?
+                .and_then(|v| serde_json::from_str(v.value()).ok()))
+        })
+    }
+
+    pub fn drop_task_node(&self, project_id: &str, family_key: &str) -> Result<()> {
+        let key = format!("{project_id}\0{family_key}");
+        self.write(|txn| {
+            txn.open_table(GRAPH)?.remove(key.as_str())?;
+            Ok(())
         })
     }
 
@@ -468,6 +471,13 @@ fn decode_fingerprints(mut b: &[u8]) -> FingerprintMap {
         b = &rest[48..];
     }
     map
+}
+
+/// Bounds of one project's slice of a `{project_id}\0…` keyspace. `\u{1}` is the
+/// next code point after the NUL separator, so the range covers every key for
+/// this project and none for any other.
+fn project_range(project_id: &str) -> (String, String) {
+    (format!("{project_id}\0"), format!("{project_id}\u{1}"))
 }
 
 fn hex(bytes: &[u8]) -> String {

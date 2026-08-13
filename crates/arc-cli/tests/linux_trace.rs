@@ -307,10 +307,12 @@ fn a_file_created_then_read_within_one_run_is_not_a_precondition() {
 
     let graph = sb.arc(&["graph", "--json"]);
     let g: serde_json::Value = serde_json::from_str(&stdout(&graph)).unwrap();
-    let inputs: Vec<String> = serde_json::from_value(g["nodes"][0]["inputs"].clone()).unwrap();
+    let consumed = g["nodes"][0]["consumes"].as_array().unwrap();
     assert!(
-        !inputs.iter().any(|i| i.contains("tmp.txt")),
-        "tmp.txt must not be an input: {inputs:?}"
+        !consumed
+            .iter()
+            .any(|c| c["path"].as_str().unwrap_or("").contains("tmp.txt")),
+        "tmp.txt must not be an input: {consumed:?}"
     );
 }
 
@@ -355,14 +357,17 @@ fn a_result_renamed_into_place_is_an_output_not_an_input() {
     let graph = sb.arc(&["graph", "--json"]);
     let g: serde_json::Value = serde_json::from_str(&stdout(&graph)).unwrap();
     let node = &g["nodes"][0];
-    let inputs: Vec<String> = serde_json::from_value(node["inputs"].clone()).unwrap();
-    let outputs: Vec<String> = serde_json::from_value(node["outputs"].clone()).unwrap();
+    let produces: Vec<String> = serde_json::from_value(node["produces"].clone()).unwrap();
     assert!(
-        outputs.iter().any(|o| o == "result.tmp"),
+        produces.iter().any(|o| o == "result.tmp"),
         "the temporary is a product of the run: {node}"
     );
     assert!(
-        !inputs.iter().any(|i| i == "result.tmp"),
+        !node["consumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "result.tmp"),
         "a file created and renamed away is never a precondition: {node}"
     );
 }
@@ -653,4 +658,174 @@ fn concurrent_traced_runs_stay_independent() {
         "each distinct command is its own family, however they interleaved"
     );
     assert!(stdout(&sb.arc(&["cache", "verify"])).contains("No corruption"));
+}
+
+// ------------------------------------------------------------- task graph ----
+
+/// Task-graph edges that only a read-capable tracer can discover: nothing here
+/// is declared in `arc.toml`, so every edge comes from observation alone.
+mod graph {
+    use super::*;
+
+    fn project(sb: &Sandbox, config: &str) {
+        sb.write("arc.toml", config);
+    }
+
+    fn graph_json(sb: &Sandbox) -> serde_json::Value {
+        let out = sb.arc(&["graph", "--json"]);
+        serde_json::from_str(&stdout(&out)).expect("graph json")
+    }
+
+    fn edges(sb: &Sandbox) -> Vec<(String, String)> {
+        let g = graph_json(sb);
+        let label = |k: &str| {
+            g["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["family_key"] == k)
+                .map(|n| n["label"].as_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    label(e["from"].as_str().unwrap()),
+                    label(e["to"].as_str().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    const NAMES: &str = r#"
+[[command]]
+name = "producer"
+match = "*the-producer*"
+
+[[command]]
+name = "consumer"
+match = "*the-consumer*"
+"#;
+
+    #[test]
+    fn an_observed_write_and_read_form_an_edge_with_no_configuration() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        sb.write("seed.txt", "one");
+        sb.learn("cat seed.txt > out.txt # the-producer");
+        sb.learn("cat out.txt > /dev/null # the-consumer");
+        assert!(
+            edges(&sb).contains(&("producer".into(), "consumer".into())),
+            "{:?}",
+            edges(&sb)
+        );
+    }
+
+    #[test]
+    fn a_generated_intermediate_creates_no_edge() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        sb.script(
+            "gen.sh",
+            "#!/bin/sh\necho x > tmp.txt\ncat tmp.txt > /dev/null\nrm -f tmp.txt\n",
+        );
+        sb.learn("./gen.sh # the-producer");
+        sb.learn("echo unrelated # the-consumer");
+        assert!(edges(&sb).is_empty(), "{:?}", edges(&sb));
+    }
+
+    #[test]
+    fn a_producer_writing_into_an_enumerated_directory_is_an_edge() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        std::fs::create_dir(sb.root.join("plugins")).unwrap();
+        sb.write("plugins/a", "a");
+        sb.learn("for p in plugins/*; do echo $p; done # the-consumer");
+        sb.learn("echo new > plugins/b # the-producer");
+        assert!(
+            edges(&sb).contains(&("producer".into(), "consumer".into())),
+            "a new entry in an enumerated directory is a dependency: {:?}",
+            edges(&sb)
+        );
+    }
+
+    #[test]
+    fn a_producer_of_a_path_whose_absence_mattered_is_an_edge() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        sb.script(
+            "check.sh",
+            "#!/bin/sh\nif [ -f optional.cfg ]; then echo yes; else echo no; fi\n",
+        );
+        sb.learn("./check.sh # the-consumer");
+        sb.learn("echo x > optional.cfg # the-producer");
+        assert!(
+            edges(&sb).contains(&("producer".into(), "consumer".into())),
+            "{:?}",
+            edges(&sb)
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_path_does_not_break_graph_construction() {
+        needs_tracer!();
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        let name = OsStr::from_bytes(b"weird-\xff.txt");
+        std::fs::write(sb.root.join(name), "one").unwrap();
+        assert_ok(&sb.sh("for f in weird-*; do cat \"$f\"; done > out.txt # the-producer"));
+        assert_ok(&sb.sh("cat out.txt > /dev/null # the-consumer"));
+        let out = sb.arc(&["graph", "--json"]);
+        assert_ok(&out);
+        serde_json::from_str::<serde_json::Value>(&stdout(&out)).expect("valid json");
+    }
+
+    #[test]
+    fn two_paths_naming_the_same_file_produce_one_edge() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        std::fs::create_dir(sb.root.join("sub")).unwrap();
+        sb.learn("echo x > sub/out.txt # the-producer");
+        // The consumer reaches the same file through `.` and `..`, which must
+        // normalise to one dependency rather than three.
+        sb.learn("cat ./sub/../sub/out.txt > /dev/null # the-consumer");
+        let e = edges(&sb);
+        assert_eq!(
+            e.iter()
+                .filter(|(a, b)| a == "producer" && b == "consumer")
+                .count(),
+            1,
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_between_two_tasks_is_reported_and_still_schedulable() {
+        needs_tracer!();
+        let sb = Sandbox::new();
+        project(&sb, NAMES);
+        sb.write("x.txt", "x");
+        sb.write("y.txt", "y");
+        sb.learn("cat y.txt > /dev/null; echo a > x.txt # the-producer");
+        sb.learn("cat x.txt > /dev/null; echo b > y.txt # the-consumer");
+        let g = graph_json(&sb);
+        assert_eq!(g["cycles"].as_array().unwrap().len(), 1, "{g}");
+
+        let text = stdout(&sb.arc(&["graph"]));
+        assert!(text.contains("cycles"), "{text}");
+        // The scheduler must terminate rather than wait for a prerequisite that
+        // can never finish.
+        let plan = sb.arc(&["affected", "--run", "--dry-run"]);
+        assert_ok(&plan);
+    }
 }

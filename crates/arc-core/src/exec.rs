@@ -202,6 +202,39 @@ fn pump(mut src: impl Read, sink: Sink) -> Result<(Vec<u8>, bool)> {
     Ok((captured, truncated))
 }
 
+/// Run a command to completion, capturing its output instead of streaming it.
+///
+/// Used by the scheduler, where several tasks run at once and interleaving
+/// their output onto one terminal would make all of it unreadable.
+pub fn capture(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    env: &[(&str, &Path)],
+) -> Result<Outcome> {
+    let start = Instant::now();
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("Arc could not start `{}`.", program.display()))?;
+    Ok(Outcome {
+        exit_code: exit_code_of(&out.status),
+        stdout: out.stdout,
+        stderr: out.stderr,
+        duration_ms: start.elapsed().as_millis() as u64,
+        truncated: false,
+        signaled: signaled(&out.status),
+    })
+}
+
 /// Replay captured output on a cache hit, byte for byte.
 pub fn replay(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let mut o = std::io::stdout().lock();

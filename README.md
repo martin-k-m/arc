@@ -52,8 +52,9 @@ arc run cargo test              # cache a test run
 arc run -- cargo test -- --nocapture   # everything after -- goes to the child
 arc run --trace cargo test      # run and report what Arc observed
 arc run --explain pytest        # why did Arc rerun this?
-arc graph                       # what Arc has learned about this project
-arc affected                    # which executions do my changes touch?
+arc graph                       # the task graph Arc has learned
+arc affected                    # which tasks do my changes reach?
+arc affected --run              # run exactly those, in order, in parallel
 arc history                     # what has Arc executed
 arc inspect a82f1e              # everything recorded about one execution
 arc cache stats                 # size, reuse, time saved
@@ -123,6 +124,9 @@ whole project, which is what v0.1 and v0.2 did. `arc doctor` tells you which.
 | Platform | OS and architecture |
 | Arc schema version | Bumped whenever key semantics change |
 
+Once several commands are known, those same facts become a graph: see
+[the task graph](#the-task-graph).
+
 ## Tracing
 
 ```console
@@ -177,6 +181,109 @@ and stays conservative rather than pretending otherwise.
 Complete also does not mean *deterministic*. The clock, `getrandom` and the
 scheduler are outside any filesystem tracer's reach; see
 [docs/correctness.md](docs/correctness.md) for the exact contract.
+
+## The task graph
+
+Arc watches what each command reads and writes, so it also learns how commands
+feed each other. One task's output being another's input *is* the edge; nothing
+has to be declared.
+
+```console
+$ arc run ./generate-schema.sh    # writes generated/schema.json
+$ arc run ./generate-client.sh    # reads it, writes generated/client.ts
+$ arc run ./test-api.sh           # reads that
+$ arc run ./test-web.sh           # reads src/web.rs
+
+$ arc graph
+
+◆ TASK GRAPH
+/work/repo
+
+generate-schema
+└── generate-client
+    └── test-api
+test-web
+
+  4 tasks · 2 edges · 4 complete · 0 partial
+```
+
+Change something, and Arc propagates:
+
+```console
+$ vim schema/api.yaml
+
+$ arc affected
+
+◆ AFFECTED
+  changed
+    modified   schema/api.yaml
+
+  affected
+    generate-client
+    generate-schema
+    test-api
+
+  unaffected
+    test-web
+```
+
+`--explain` shows the chain it followed:
+
+```console
+$ arc affected --explain
+...
+  affected
+    test-api
+      because generate-client is affected, via generated/client.ts
+        because generate-schema is affected, via generated/schema.json
+          because schema/api.yaml changed
+```
+
+Then run exactly that subgraph, producers before consumers, independent tasks
+concurrently:
+
+```console
+$ arc affected --run --dry-run
+
+◆ EXECUTION PLAN
+  step 1
+    generate-schema
+  step 2
+    generate-client
+  step 3
+    test-api
+
+  3 of 4 tasks would run; 1 skipped
+
+$ arc affected --run
+
+◆ RUNNING
+  3 of 4 tasks · 8 at a time
+
+       RAN generate-schema                          41ms
+       RAN generate-client                          37ms
+       RAN test-api                                 60ms
+
+◆ 3 ran  140ms
+```
+
+Every task still goes through the ordinary cache, so **affected does not mean
+executed**: a task whose exact state is already stored reports `HIT` and restores
+instead, and its consumers carry on from the restored files.
+
+`--jobs N` bounds concurrency (default: available parallelism, capped at 16);
+`--jobs 1` is serial and deterministic. A task whose prerequisite failed is
+reported `BLOCKED` and never starts; independent branches continue unless you
+pass `--fail-fast`. `arc affected --run` exits non-zero if anything failed.
+
+What Arc will not do is guess. Two tasks writing the same path is reported as an
+ambiguity rather than resolved; a cycle is reported and scheduled as one serial
+group rather than pretended away; and a task whose dependencies were never fully
+observed is `unknown`, which **runs**, because unknown is not unaffected.
+
+`arc graph --task <name>`, `arc graph --affected` and `--json` narrow or export
+it. `[[command]] name` gives a task a readable label, and `after = ["build"]`
+adds an edge no filesystem observation could reveal.
 
 ## Scoping a command
 
@@ -271,7 +378,32 @@ Measured in a `rust:1-slim` container on Linux x86-64, median of 7
 | Read 400 files | 6 ms | 269 ms | 249 ms | **19 ms** |
 | `rustc`, 120 modules | 67 ms | 471 ms | 384 ms | **26 ms** |
 
-Read that honestly: **ptrace tracing is expensive.** It stops the traced process
+Graph operations are not where the time goes (x86-64, release,
+`cargo run -p arc-core --example graph_bench`):
+
+| Graph | Build | Affected | Plan | Topological order |
+| --- | --- | --- | --- | --- |
+| 100 tasks, 261 edges | 0.2 ms | 0.1 ms | 0.1 ms | 0.0 ms |
+| 1,000 tasks, 2,895 edges | 1.7 ms | 0.7 ms | 0.8 ms | 0.4 ms |
+| 10,000 tasks, 29,691 edges | 26 ms | 13 ms | 14 ms | 6 ms |
+| 10,000-deep chain | 10 ms | 6 ms | 11 ms | 4 ms |
+
+All of it is `O(V + E)`: edge derivation joins a producer index rather than
+comparing task pairs, traversal is breadth-first over a three-level lattice, and
+ordering is Kahn's algorithm with a label-ordered ready set. Cycle detection is
+iterative Tarjan, so a ten-thousand-deep chain does not touch the stack.
+
+The scheduler's own overhead is small next to the work it schedules — twelve
+independent 200 ms tasks, each a full `arc run` with its own cache lookup:
+
+| `--jobs` | Wall clock |
+| --- | --- |
+| 1 | 2900 ms |
+| 2 | 1458 ms |
+| 4 | 809 ms |
+| 8 | 572 ms |
+
+Read the tracing numbers honestly: **ptrace tracing is expensive.** It stops the traced process
 twice per syscall, so syscall-dense work slows by roughly 40× — the same
 workload under `strace -f` takes 243 ms against Arc's 269 ms, so essentially all
 of that cost is ptrace itself, not Arc's bookkeeping. On a compile, where the
@@ -286,7 +418,9 @@ anything.
 ## Status
 
 Working today: local execution caching; complete dependency tracing on Linux with
-automatic input narrowing; content-addressed storage with deduplication; output
+automatic input narrowing; a task graph inferred from observed output-to-input
+relationships, with transitive affected analysis and bounded-parallel selective
+execution; content-addressed storage with deduplication; output
 capture and restore; execution-family identity; learned dependency sets with
 explicit completeness and structured downgrade reasons; process-tree and write
 observation on Windows; the dependency graph; `arc affected` against Git; cache
