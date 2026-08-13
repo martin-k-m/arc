@@ -1,0 +1,26 @@
+# A worked example. Copy to your project root and delete what you do not need.
+# Arc works with no configuration at all; this file only narrows its guesses.
+
+[cache]
+enabled = true
+max_size = "20GB"
+# Cache runs that exited non-zero. Off by default: a failure usually says more
+# about the environment than about the inputs.
+cache_failures = false
+
+[inputs]
+# Empty means "the whole project, honouring .gitignore". Narrowing this is the
+# single biggest win for a large repository.
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+exclude = ["**/*.md"]
+
+[outputs]
+# Files Arc captures after a miss and restores on a hit. Leave empty to cache
+# only stdout, stderr and the exit code, which is what a test run needs.
+include = ["target/release/mytool"]
+
+[env]
+# Added to Arc's default set of build-relevant variables. Values are hashed,
+# never stored.
+include = ["MY_FEATURE_FLAG"]
+exclude = ["TERM"]
