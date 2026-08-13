@@ -5,6 +5,8 @@
 //! lock, so short critical sections plus bounded retry is what makes two
 //! concurrent `arc run` invocations safe rather than corrupt.
 
+use crate::dependency::DependencySet;
+use crate::family::ExecutionFamily;
 use crate::hash::Digest;
 use crate::record::{CacheEntry, ExecutionRecord};
 use crate::scan::FingerprintMap;
@@ -19,6 +21,23 @@ const HISTORY: TableDefinition<&str, &str> = TableDefinition::new("history");
 const CACHE: TableDefinition<&str, &str> = TableDefinition::new("cache_entries");
 const FINGERPRINTS: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints");
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+/// family key -> `ExecutionFamily`.
+const FAMILIES: TableDefinition<&str, &str> = TableDefinition::new("execution_families");
+/// family key -> `DependencySet`.
+const DEPENDENCIES: TableDefinition<&str, &str> = TableDefinition::new("dependency_sets");
+/// `{project_id}\0{rel path}\0{family key}` -> `""`.
+///
+/// A prefix scan over `{project_id}\0{rel}\0` answers "which families depend on
+/// this file?" without touching unrelated projects, which is what keeps
+/// `arc affected` from degenerating into a full table scan as the database
+/// grows. redb tables are ordered by key, so the range is contiguous.
+const DEP_INDEX: TableDefinition<&str, &str> = TableDefinition::new("dependency_edges");
+/// Metadata schema marker. A database written by an incompatible version is
+/// rebuilt rather than reinterpreted.
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+/// Bumped when table layouts change incompatibly.
+pub const DB_SCHEMA_VERSION: &str = "2";
 
 pub const COUNTER_HITS: &str = "hits";
 pub const COUNTER_MISSES: &str = "misses";
@@ -28,6 +47,14 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Db {
     path: PathBuf,
+    /// The open database, reused across transactions within one phase of a run.
+    ///
+    /// Opening redb takes an exclusive file lock, so this handle must never be
+    /// held across a child execution or concurrent Arc processes would serialise
+    /// on the slowest command. [`Db::release`] drops it at exactly that point;
+    /// the next call transparently reopens. Reusing it elsewhere turns seven
+    /// file opens per run into two.
+    open: std::cell::RefCell<Option<Database>>,
 }
 
 impl Db {
@@ -35,20 +62,61 @@ impl Db {
         std::fs::create_dir_all(arc_home)?;
         let db = Db {
             path: arc_home.join("arc.redb"),
+            open: std::cell::RefCell::new(None),
         };
+        // Metadata from an incompatible layout — or a file too damaged to read
+        // at all — is discarded, not migrated. Cache contents are disposable;
+        // misreading them is not, and failing the user's command over a broken
+        // cache would be worse than either.
+        if db.path.exists() && db.schema_version() != Some(DB_SCHEMA_VERSION.to_string()) {
+            // Windows refuses to unlink a file that is still open.
+            db.release();
+            std::fs::remove_file(&db.path)
+                .with_context(|| format!("replacing unusable {}", db.path.display()))?;
+        }
         db.write(|txn| {
             txn.open_table(EXECUTIONS)?;
             txn.open_table(HISTORY)?;
             txn.open_table(CACHE)?;
             txn.open_table(FINGERPRINTS)?;
             txn.open_table(COUNTERS)?;
+            txn.open_table(FAMILIES)?;
+            txn.open_table(DEPENDENCIES)?;
+            txn.open_table(DEP_INDEX)?;
+            txn.open_table(META)?.insert("schema", DB_SCHEMA_VERSION)?;
             Ok(())
         })?;
         Ok(db)
     }
 
+    /// `None` covers every reason the marker could not be read: the table does
+    /// not exist (an older Arc), or the file is not a database at all. Both mean
+    /// the same thing to the caller — do not trust what is there.
+    fn schema_version(&self) -> Option<String> {
+        self.read(|txn| match txn.open_table(META) {
+            Ok(t) => Ok(t.get("schema")?.map(|v| v.value().to_string())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        })
+        .unwrap_or(None)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Close the database if it is open. Call this before running a child
+    /// process so other Arc processes are not locked out for its duration.
+    pub fn release(&self) {
+        *self.open.borrow_mut() = None;
+    }
+
+    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let mut slot = self.open.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(self.database()?);
+        }
+        f(slot.as_ref().expect("just opened"))
     }
 
     fn database(&self) -> Result<Database> {
@@ -73,16 +141,16 @@ impl Db {
     }
 
     fn write<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> Result<T>) -> Result<T> {
-        let db = self.database()?;
-        let txn = db.begin_write().context("beginning write transaction")?;
-        let out = f(&txn)?;
-        txn.commit().context("committing transaction")?;
-        Ok(out)
+        self.with_db(|db| {
+            let txn = db.begin_write().context("beginning write transaction")?;
+            let out = f(&txn)?;
+            txn.commit().context("committing transaction")?;
+            Ok(out)
+        })
     }
 
     fn read<T>(&self, f: impl FnOnce(&redb::ReadTransaction) -> Result<T>) -> Result<T> {
-        let db = self.database()?;
-        f(&db.begin_read().context("beginning read transaction")?)
+        self.with_db(|db| f(&db.begin_read().context("beginning read transaction")?))
     }
 
     pub fn put_execution(&self, rec: &ExecutionRecord, entry: Option<&CacheEntry>) -> Result<()> {
@@ -264,7 +332,104 @@ impl Db {
         })
     }
 
+    /// Record that a family was seen, creating it on first sight.
+    pub fn touch_family(&self, family: &ExecutionFamily) -> Result<()> {
+        let fresh = serde_json::to_string(family)?;
+        self.write(|txn| {
+            let mut t = txn.open_table(FAMILIES)?;
+            let merged = match t.get(family.key.as_str())? {
+                Some(raw) => match serde_json::from_str::<ExecutionFamily>(raw.value()) {
+                    Ok(prev) => serde_json::to_string(&ExecutionFamily {
+                        first_seen: prev.first_seen,
+                        runs: prev.runs + 1,
+                        ..family.clone()
+                    })?,
+                    // A record that will not parse is replaced, not trusted.
+                    Err(_) => fresh.clone(),
+                },
+                None => fresh.clone(),
+            };
+            t.insert(family.key.as_str(), merged.as_str())?;
+            Ok(())
+        })
+    }
+
+    pub fn families(&self) -> Result<Vec<ExecutionFamily>> {
+        self.read(|txn| {
+            let t = txn.open_table(FAMILIES)?;
+            let mut out = Vec::new();
+            for row in t.iter()? {
+                if let Ok(f) = serde_json::from_str(row?.1.value()) {
+                    out.push(f);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// A malformed dependency record reads as absent, so Arc retraces instead
+    /// of trusting data it cannot parse.
+    pub fn dependency_set(&self, family_key: &str) -> Result<Option<DependencySet>> {
+        self.read(|txn| {
+            let t = txn.open_table(DEPENDENCIES)?;
+            Ok(t.get(family_key)?
+                .and_then(|v| serde_json::from_str(v.value()).ok()))
+        })
+    }
+
+    /// Store a dependency set and rebuild its slice of the path index.
+    pub fn put_dependency_set(
+        &self,
+        project_id: &str,
+        set: &DependencySet,
+        indexed: &[String],
+    ) -> Result<()> {
+        let json = serde_json::to_string(set)?;
+        let prefix = format!("{project_id}\0");
+        let family = set.family_key.clone();
+        let keys: Vec<String> = indexed
+            .iter()
+            .map(|rel| format!("{prefix}{rel}\0{family}"))
+            .collect();
+        self.write(|txn| {
+            txn.open_table(DEPENDENCIES)?
+                .insert(family.as_str(), json.as_str())?;
+            let mut idx = txn.open_table(DEP_INDEX)?;
+            let stale: Vec<String> = idx
+                .iter()?
+                .filter_map(|r| r.ok())
+                .filter(|(k, v)| k.value().starts_with(&prefix) && v.value() == family)
+                .map(|(k, _)| k.value().to_string())
+                .collect();
+            for k in stale {
+                idx.remove(k.as_str())?;
+            }
+            for k in &keys {
+                idx.insert(k.as_str(), "")?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Families known to depend on `rel` within `project_id`.
+    pub fn families_depending_on(&self, project_id: &str, rel: &str) -> Result<Vec<String>> {
+        let lo = format!("{project_id}\0{rel}\0");
+        let hi = format!("{project_id}\0{rel}\u{1}");
+        self.read(|txn| {
+            let idx = txn.open_table(DEP_INDEX)?;
+            let mut out = Vec::new();
+            for row in idx.range(lo.as_str()..hi.as_str())? {
+                let (k, _) = row?;
+                if let Some(f) = k.value().rsplit('\0').next() {
+                    out.push(f.to_string());
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn clear_all(&self) -> Result<()> {
+        self.release();
         std::fs::remove_file(&self.path).ok();
         Ok(())
     }

@@ -176,9 +176,16 @@ pub struct KeyInputs<'a> {
     /// Working directory relative to the project root, so a cache stays valid
     /// when the same repository lives at a different absolute path.
     pub rel_cwd: &'a str,
+    /// Identity of the execution kind. Included so two families can never share
+    /// a cache entry even if every other component coincides.
+    pub family_key: &'a str,
     pub input_digest: &'a Digest,
     pub env_digest: &'a str,
     pub toolchain_digest: &'a str,
+    /// Learned dependencies that participate in the key — today the executables
+    /// observed in the process tree. Strictly additive: covering more can only
+    /// cause misses.
+    pub dependency_digest: &'a Digest,
     pub output_globs: &'a [String],
 }
 
@@ -193,9 +200,11 @@ pub fn execution_key(k: &KeyInputs<'_>) -> Digest {
         h.field(a);
     }
     h.field(k.rel_cwd);
+    h.field(k.family_key);
     h.field(k.input_digest.bytes());
     h.field(k.env_digest);
     h.field(k.toolchain_digest);
+    h.field(k.dependency_digest.bytes());
     h.field((k.output_globs.len() as u64).to_le_bytes());
     for g in k.output_globs {
         h.field(g);
@@ -226,17 +235,23 @@ mod tests {
     use super::*;
     use crate::hash::hash_bytes;
 
-    fn key(args: &[&str], input: &Digest) -> Digest {
+    fn key_with(args: &[&str], input: &Digest, deps: &Digest, family: &str) -> Digest {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         execution_key(&KeyInputs {
             program: "cargo",
             args: &args,
             rel_cwd: "",
+            family_key: family,
             input_digest: input,
             env_digest: "e",
             toolchain_digest: "t",
+            dependency_digest: deps,
             output_globs: &[],
         })
+    }
+
+    fn key(args: &[&str], input: &Digest) -> Digest {
+        key_with(args, input, &Digest::default(), "f")
     }
 
     #[test]
@@ -248,6 +263,21 @@ mod tests {
         assert_ne!(key(&["test"], &i1), key(&["test"], &i2));
         // Argument boundaries must matter.
         assert_ne!(key(&["a b"], &i1), key(&["a", "b"], &i1));
+    }
+
+    #[test]
+    fn key_covers_family_and_learned_dependencies() {
+        let i = hash_bytes(b"1");
+        let d1 = hash_bytes(b"deps-1");
+        let d2 = hash_bytes(b"deps-2");
+        assert_ne!(
+            key_with(&["test"], &i, &d1, "f"),
+            key_with(&["test"], &i, &d2, "f")
+        );
+        assert_ne!(
+            key_with(&["test"], &i, &d1, "f1"),
+            key_with(&["test"], &i, &d1, "f2")
+        );
     }
 
     #[test]
