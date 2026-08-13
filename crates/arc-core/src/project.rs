@@ -42,6 +42,28 @@ impl Default for TraceConfig {
 /// Declared inputs are additive with `[inputs] include`, and are always
 /// fingerprinted even if an exclude pattern would have dropped them: an
 /// explicit include is a statement of fact, an exclude is only a hint.
+/// Whether a command may be sent to a worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemotePolicy {
+    /// Eligible, if Arc can build a complete enough environment for it. There
+    /// is deliberately no `always`: eligibility is not negotiable.
+    #[default]
+    Auto,
+    /// Never. For commands whose effects Arc cannot see — a deploy, a publish,
+    /// anything that touches the world outside the project.
+    Never,
+}
+
+impl RemotePolicy {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RemotePolicy::Auto => "auto",
+            RemotePolicy::Never => "never",
+        }
+    }
+}
+
 /// Which CI events may publish to the remote cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +112,12 @@ pub struct CommandConfig {
     pub args: Vec<String>,
     /// Free-form labels, for selecting subsets in CI.
     pub tags: Vec<String>,
+    /// Whether this command may run on a remote worker: `auto` or `never`.
+    ///
+    /// Deliberately absent from the family key: where a command runs must not
+    /// change its identity, or a result produced locally could never be reused
+    /// remotely and vice versa.
+    pub remote: Option<RemotePolicy>,
     /// Task names this command must follow, for dependencies no filesystem
     /// observation can reveal.
     pub after: Vec<String>,
@@ -243,6 +271,12 @@ impl Config {
             cfg.inputs.exclude.extend(c.exclude.iter().cloned());
             cfg.outputs.include.extend(c.outputs.iter().cloned());
             cfg.env.include.extend(c.env.iter().cloned());
+            // The most restrictive matching block wins: one block saying a
+            // command must not leave this machine is not overridden by another
+            // that is merely silent on the question.
+            if c.remote == Some(RemotePolicy::Never) {
+                cfg.remote.execution.enabled = false;
+            }
         }
         Ok(cfg)
     }

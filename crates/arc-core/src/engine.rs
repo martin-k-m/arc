@@ -70,6 +70,9 @@ pub struct RunOptions {
     pub backend: Selection,
     /// Ignore any configured remote cache for this run.
     pub no_remote: bool,
+    /// Override the configured remote *execution* policy. `None` follows
+    /// configuration; remote execution is off unless something turns it on.
+    pub remote_execution: Option<bool>,
 }
 
 /// Why Arc decided what it decided, in a form both the terminal renderer and
@@ -98,6 +101,12 @@ pub struct Explain {
     /// `local` or `remote` for a hit; `none` otherwise.
     #[serde(default)]
     pub cache_source: String,
+    /// Where the command ran, when it ran: `local`, `remote`, or `none`.
+    #[serde(default)]
+    pub execution_source: String,
+    /// Why remote execution was or was not used.
+    #[serde(default)]
+    pub remote_execution: String,
     pub inputs_narrowed: bool,
     /// Why narrowing was or was not applied, from the single gate.
     pub narrow_reason: String,
@@ -110,6 +119,10 @@ pub struct Explain {
 /// shown. That keeps a spinner out of the pipeline and out of piped output.
 pub trait Progress {
     fn stage(&self, _label: &str) {}
+    /// Output arriving from somewhere the terminal cannot see directly, such as
+    /// a command running on a worker. Informational: nothing about correctness
+    /// depends on it being shown.
+    fn log(&self, _text: &str) {}
 }
 
 /// A run nobody is watching.
@@ -139,6 +152,21 @@ pub struct RunReport {
     pub observations: Option<trace::Observations>,
     pub dependencies: Option<DependencySet>,
     pub remote: Option<RemoteStatus>,
+    pub remote_execution: Option<RemoteExecStatus>,
+}
+
+/// What remote execution did, when it was considered at all.
+#[derive(Debug, Clone)]
+pub struct RemoteExecStatus {
+    pub endpoint: String,
+    /// Whether the command actually ran on a worker.
+    pub used: bool,
+    /// Eligibility verdict, or the failure that sent the work back here.
+    pub reason: String,
+    pub job_id: Option<String>,
+    pub queued_ms: u64,
+    pub published: bool,
+    pub timings: Option<remote::dispatch::Timings>,
 }
 
 /// One entry per input file, stored as a blob so `--explain` can say which file
@@ -250,6 +278,8 @@ pub fn run(
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
         cache_source: "none".into(),
+        execution_source: "none".into(),
+        remote_execution: String::new(),
         // True whenever Arc has grounds to call some change irrelevant, whether
         // it earned them by observation or was told them in `arc.toml`.
         // `narrow_reason` says which.
@@ -335,6 +365,7 @@ pub fn run(
                         observations: None,
                         dependencies: Some(plan.deps),
                         remote: status(remote.as_ref(), remote_error),
+                        remote_execution: None,
                     });
                 }
                 // A hit that cannot be safely served is a miss, never a guess.
@@ -361,21 +392,69 @@ pub fn run(
     // redb's exclusive lock across an arbitrarily long command would serialise
     // every other Arc process on this machine.
     db.release();
-    progress.stage("executing");
     let now = scan::now_millis();
-    let tracer = (plan.cfg.trace.enabled || opts.trace)
-        .then(|| trace::start(&project.root, &plan.classifier, opts.backend))
-        .flatten();
-    let mut sup = TraceSupervisor {
-        tracer,
-        failures: Vec::new(),
-    };
-    let outcome = exec::run(&plan.resolved, args, cwd, true, &mut sup)?;
-    let observations = sup.collect();
 
-    progress.stage("capturing outputs");
-    let captured_outputs: Vec<OutputFile> =
-        outputs::capture(&project.root, &plan.cfg.outputs.include, &store)?;
+    // Remote execution is only ever reached from here: after a local miss and a
+    // remote miss. It never runs work that was already available.
+    let mut remote_exec: Option<RemoteExecStatus> = None;
+    let remote_run = try_remote_execution(
+        opts,
+        &plan,
+        project,
+        &store,
+        remote.as_ref(),
+        program,
+        args,
+        &exec_key.hex(),
+        &inputs,
+        &env,
+        progress,
+        &mut remote_exec,
+    )?;
+    explain.remote_execution = remote_exec
+        .as_ref()
+        .map(|s| s.reason.clone())
+        .unwrap_or_else(|| "not enabled".into());
+
+    let (outcome, observations, captured_outputs) = match remote_run {
+        Some(r) => {
+            progress.stage("restoring outputs");
+            // The ordinary restore path, with the ordinary safety checks: a
+            // worker's result is not a special kind of result.
+            outputs::restore(&project.root, &r.outputs, &store)?;
+            exec::replay(&r.stdout, &r.stderr)?;
+            explain.execution_source = "remote".into();
+            (
+                exec::Outcome {
+                    exit_code: r.exit_code,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    duration_ms: r.duration_ms,
+                    truncated: r.truncated,
+                    signaled: r.signaled,
+                },
+                None,
+                r.outputs,
+            )
+        }
+        None => {
+            progress.stage("executing");
+            let tracer = (plan.cfg.trace.enabled || opts.trace)
+                .then(|| trace::start(&project.root, &plan.classifier, opts.backend))
+                .flatten();
+            let mut sup = TraceSupervisor {
+                tracer,
+                failures: Vec::new(),
+            };
+            let outcome = exec::run(&plan.resolved, args, cwd, true, &mut sup)?;
+            let observations = sup.collect();
+            explain.execution_source = "local".into();
+            progress.stage("capturing outputs");
+            let captured: Vec<OutputFile> =
+                outputs::capture(&project.root, &plan.cfg.outputs.include, &store)?;
+            (outcome, observations, captured)
+        }
+    };
 
     // ---- learn -------------------------------------------------------------
     progress.stage("learning dependencies");
@@ -524,6 +603,7 @@ pub fn run(
 
     Ok(RunReport {
         remote: status(remote.as_ref(), remote_error),
+        remote_execution: remote_exec,
         record,
         explain,
         restore_ms: 0,
@@ -533,6 +613,169 @@ pub fn run(
         observations: observations.map(|(_, _, o)| o),
         dependencies: learned,
     })
+}
+
+/// Decide whether this miss should run on a worker, and run it there if so.
+///
+/// Returns `None` for every reason there is — not configured, not eligible, not
+/// compatible, worker refused — and the command then runs locally, which is
+/// what would have happened without a worker at all. The one case that does not
+/// fall back is a command that may still be running elsewhere: re-running it
+/// here could duplicate whatever it does.
+#[allow(clippy::too_many_arguments)]
+fn try_remote_execution(
+    opts: &RunOptions,
+    plan: &Plan,
+    project: &Project,
+    store: &Store,
+    cache: Option<&Remote>,
+    program: &str,
+    args: &[String],
+    exec_key: &str,
+    inputs: &Inputs,
+    env: &EnvFingerprint,
+    progress: &dyn Progress,
+    status: &mut Option<RemoteExecStatus>,
+) -> Result<Option<remote::dispatch::RemoteOutcome>> {
+    let cfg = &plan.cfg.remote.execution;
+    let wanted = opts.remote_execution.unwrap_or(cfg.enabled);
+    if !wanted || opts.no_remote {
+        return Ok(None);
+    }
+    let mut note = |endpoint: &str, reason: String| {
+        *status = Some(RemoteExecStatus {
+            endpoint: endpoint.to_string(),
+            used: false,
+            reason,
+            job_id: None,
+            queued_ms: 0,
+            published: false,
+            timings: None,
+        });
+        Ok(None::<remote::dispatch::RemoteOutcome>)
+    };
+
+    let executor = match remote::Executor::open(&plan.cfg.remote) {
+        Ok(e) => e,
+        Err(d) => return note("", d.reason()),
+    };
+    // Inputs travel through the shared cache, so a worker without one is a
+    // worker Arc cannot feed.
+    let Some(cache) = cache.filter(|c| c.write) else {
+        return note(
+            executor.endpoint(),
+            "the remote cache is not writable".into(),
+        );
+    };
+
+    progress.stage("checking worker");
+    let caps = match executor.capabilities() {
+        Ok(c) => c,
+        Err(e) => return note(executor.endpoint(), format!("worker unavailable: {e}")),
+    };
+
+    let eligibility = remote::eligibility::can_remote_execute(
+        &remote::eligibility::Candidate {
+            program,
+            args,
+            rel_cwd: &plan.rel_cwd,
+            deps: &plan.deps,
+            narrow: &plan.narrow,
+            dep_state: plan.dep_state,
+            env,
+            allow_env: &cfg.allow_env,
+        },
+        &caps,
+    );
+    let Some(materialisation) = eligibility.materialisation() else {
+        return note(executor.endpoint(), eligibility.reason());
+    };
+
+    // The manifest is exactly what was fingerprinted, so the environment the
+    // worker builds is the one the execution key describes.
+    let complete = materialisation == remote::eligibility::Materialisation::Narrowed;
+    // The *content* hash of the resolved executable, which is what a worker can
+    // check against its own copy. The toolchain fingerprint is a composite over
+    // the program name as well, so it means nothing on another machine.
+    let program_digest = match crate::hash::hash_file(&plan.resolved) {
+        Ok(d) => d.hex(),
+        Err(e) => return note(executor.endpoint(), format!("{e}")),
+    };
+    let tools =
+        remote::eligibility::tool_requirements(program, &program_digest, &plan.deps, complete);
+    let names = remote::eligibility::transmittable_env(env, &cfg.allow_env);
+    let sent_env: Vec<(String, String)> = names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok().map(|v| (n.clone(), v)))
+        .collect();
+
+    let request = remote::dispatch::Request {
+        execution_key: exec_key,
+        family_key: &plan.family_key,
+        program,
+        args,
+        rel_cwd: &plan.rel_cwd,
+        inputs: &inputs.files,
+        materialisation,
+        env: sent_env,
+        tools,
+        output_globs: &plan.cfg.outputs.include,
+        cache_failures: opts.cache_failures || plan.cfg.cache.cache_failures,
+        limits: remote::execution::Limits {
+            timeout_ms: cfg.timeout_ms,
+            ..Default::default()
+        },
+    };
+
+    let endpoint = executor.endpoint().to_string();
+    let result = remote::dispatch::execute(
+        &executor,
+        cache,
+        store,
+        &project.root,
+        &request,
+        &|s| progress.stage(s),
+        &mut |text| progress.log(text),
+        &|| false,
+    );
+    match result {
+        Ok(remote::dispatch::Dispatched::Executed(outcome)) => {
+            *status = Some(RemoteExecStatus {
+                endpoint,
+                used: true,
+                reason: format!("executed on {}", caps.worker),
+                job_id: Some(outcome.job_id.clone()),
+                queued_ms: outcome.queued_ms,
+                published: outcome.published,
+                timings: Some(outcome.timings.clone()),
+            });
+            Ok(Some(*outcome))
+        }
+        Ok(remote::dispatch::Dispatched::Fallback(reason)) => {
+            note(&endpoint, format!("running locally: {reason}"))
+        }
+        // The command may still be running on the worker. Running it again here
+        // could duplicate whatever it did — a deploy done twice, a package
+        // published twice — so the run fails rather than guessing.
+        Ok(remote::dispatch::Dispatched::Unsafe(reason)) => {
+            *status = Some(RemoteExecStatus {
+                endpoint,
+                used: false,
+                reason: format!("did not complete: {reason}"),
+                job_id: None,
+                queued_ms: 0,
+                published: false,
+                timings: None,
+            });
+            anyhow::bail!(
+                "remote execution did not complete: {reason}
+
+The command may still be running on the worker, so Arc will not run it again here.
+Run it locally with --no-remote-execution."
+            )
+        }
+        Err(e) => note(&endpoint, format!("running locally: {e:#}")),
+    }
 }
 
 fn status(remote: Option<&Remote>, error: Option<String>) -> Option<RemoteStatus> {
@@ -933,6 +1176,8 @@ fn bypass(
         ignored_changes: Vec::new(),
         dependency_state: plan.dep_state.label().into(),
         cache_source: "none".into(),
+        execution_source: "local".into(),
+        remote_execution: "not enabled".into(),
         inputs_narrowed: false,
         narrow_reason: plan.narrow.reason().into(),
         fingerprint_ms: 0,
@@ -947,6 +1192,7 @@ fn bypass(
         observations: None,
         dependencies: None,
         remote: None,
+        remote_execution: None,
     })
 }
 

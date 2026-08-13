@@ -425,6 +425,64 @@ local one. A corrupt object, a missing object, a malformed record, an expired
 credential or an unreachable server all mean the same thing: run the command.
 See [docs/remote-protocol.md](docs/remote-protocol.md) for the wire format.
 
+## Running work on another machine
+
+Arc can execute a cache miss on a remote worker. The result comes back as an
+ordinary cache record, so the next machine to want it gets a plain remote hit
+and nothing runs at all.
+
+```bash
+# terminal 1 — the shared cache
+arc-cache serve --listen 127.0.0.1:7920 --data ./cache-data
+
+# terminal 2 — a worker
+arc-worker serve --listen 127.0.0.1:7921 --data ./worker-data \
+  --cache-url http://127.0.0.1:7920 --max-jobs 4
+```
+
+```toml
+[remote]
+url = "http://127.0.0.1:7920"
+namespace = "my-project"
+
+[remote.execution]
+enabled = true
+url = "http://127.0.0.1:7921"
+```
+
+```text
+◆ REMOTE EXEC  sh -c "make build"
+  ran in 2.1s · queued 0ms · 812 KB in, 4.1 MB out · 127.0.0.1:7921
+```
+
+**Remote execution is off unless you turn it on**, and even then Arc only sends
+a command it can send honestly. It refuses — and runs the command locally — when
+the worker is a different platform, when an argument names a path on your
+machine, when a required variable looks like a secret, when a complete trace saw
+the command read something outside the project, or when any executable it needs
+is not byte-identical on the worker. Executables are matched by content, never
+by a version string.
+
+What crosses the wire is exactly what Arc fingerprinted, referenced by digest,
+fetched by the worker from the shared cache. A second execution over the same
+inputs transfers nothing.
+
+Nothing the worker says is believed. Every object is re-hashed on the way into
+your store and restored through the same path a local cache hit uses.
+
+Eight machines wanting the same miss cause one execution: submission is
+idempotent on the execution key, and the rest wait for the first.
+
+> Remote execution runs your repository's commands on another machine. The
+> reference worker isolates the filesystem, the environment and the process
+> tree, but it is not a defence against hostile code and does not isolate the
+> network. Run workers you would trust with the repositories that can reach
+> them.
+
+[docs/remote-execution.md](docs/remote-execution.md) covers the protocol,
+eligibility, the sandbox, and the failure modes.
+`scripts/remote-exec-demo.sh` runs all of it locally.
+
 ## Continuous integration
 
 `arc ci` is the CI entry point. It works out what a branch changed, runs only
@@ -607,7 +665,8 @@ capture and restore; execution-family identity; learned dependency sets with
 explicit completeness and structured downgrade reasons; process-tree and write
 observation on Windows; a verified remote cache with a reference server, so one
 machine's result is another machine's hit; shared task knowledge, so a fresh CI
-runner can prove work unnecessary without having run it once; branch-aware CI
+runner can prove work unnecessary without having run it once; remote execution
+of cache misses on compatible workers, with a reference worker; branch-aware CI
 selection with GitHub Actions support, fork-safe cache-write policy and job
 summaries; the dependency graph; `arc affected` against Git; cache
 statistics, LRU pruning, garbage collection, integrity verification; execution
@@ -615,7 +674,8 @@ history and inspection; JSON output for tooling; and safe concurrent use from
 several terminals.
 
 Not built, and deliberately not stubbed: read-capable tracing on macOS or
-Windows (and therefore automatic narrowing there), remote *execution*, cloud
+Windows (and therefore automatic narrowing there), hermetic worker environments,
+container or VM management for workers, distributed worker scheduling, cloud
 storage backends for the cache server, and any agent protocol. `arc doctor` reports capabilities honestly.
 
 ## License

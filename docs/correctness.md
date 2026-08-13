@@ -806,3 +806,125 @@ summary or a workflow command without being stripped of control characters and
 escaped for its destination. Workflow-command values additionally encode `%`,
 carriage return and newline, so no provider-controlled string can begin a
 `::error::`. Identity remains bytes; only presentation is sanitised.
+
+## Remote execution
+
+A worker is an execution backend, not a second Arc. It runs a command Arc has
+already decided must run, and produces a result Arc verifies exactly as it
+verifies any other remote data.
+
+### The trust rule
+
+A worker is untrusted until its result is independently validated. "Success" is
+not a claim Arc accepts:
+
+* The job must describe the execution key that was asked for; a worker cannot
+  answer a question nobody asked.
+* Every output path is validated — no traversal, no absolute paths, no
+  drive-qualified paths — before anything is written.
+* Every object is fetched from the shared cache and re-hashed on the way into
+  the local store. A worker that publishes bytes not matching their digest
+  publishes nothing usable.
+* Restoration is the ordinary `outputs::restore` path, with the ordinary
+  ancestor-symlink and containment checks. There is no remote-specific restore.
+
+The client verifies what the server stored, and the server verifies what the
+worker uploaded. Each layer checks the one below it.
+
+### Eligibility
+
+Remote execution is off unless a project turns it on, and even then it happens
+only when Arc can build a sufficiently complete and compatible environment. The
+gate is one function. It refuses on platform mismatch, semantics mismatch,
+protocol mismatch, host-bound arguments, secret-shaped environment
+dependencies, reads outside the project observed by a complete trace, an
+executable whose contents differ on the worker, and an explicit
+`remote = "never"`.
+
+What Arc sends is exactly what it fingerprinted: the learned dependency set when
+a complete trace authorises narrowing, otherwise every project file. It never
+sends less than the fingerprint covers in order to make a transfer cheaper.
+
+### What compatibility does not establish
+
+The `environment_id` a worker advertises covers the platform, the architecture,
+Arc's semantics version and the libc flavour. Matched executables cover the
+programs Arc knows the command runs.
+
+**Neither covers the shared libraries those executables load, the kernel, the
+locale data, the CPU's instruction set extensions, or anything else the host
+supplies.** Two machines with the same `environment_id` and byte-identical
+toolchains can still differ. Arc's position is that this is a property of the
+worker fleet rather than something a hash can certify: run workers you have
+reason to believe are equivalent, and Arc will not silently paper over the ones
+that are not. Where it can tell — OS, architecture, semantics, executable
+contents — it checks and refuses.
+
+The limits that have always applied still apply, and remote execution makes them
+easier to notice rather than worse: a command that reads the clock, consumes
+randomness, or depends on scheduling order is not made deterministic by running
+somewhere else.
+
+### Secrets
+
+A variable that looks like a secret and is set makes a command ineligible. Arc
+hashes such variables for cache identity; that is not consent to transmit them.
+A project may name specific variables in `[remote.execution] allow_env`, which
+is deliberately explicit and deliberately per-variable. Nothing else is sent —
+the request carries only the variables the execution key depends on.
+
+The worker's own environment is never inherited by a command. The child's
+environment is constructed from nothing, so the worker's cache credentials
+cannot leak into a build.
+
+### Singleflight and duplicate work
+
+Submission is idempotent on the execution key. A worker already running that
+execution returns the same job, so N clients wanting one result cause one
+execution, and a retried request after a network hiccup cannot start a second.
+
+Before executing, the worker rechecks the shared cache: a result published while
+the job was queued is returned instead of recomputing it.
+
+Cancellation is advisory and waiter-counted. One client giving up does not
+discard work the others are still waiting for.
+
+### Failure and fallback
+
+Infrastructure failure and command failure are different answers and are never
+flattened together. A command that exits non-zero is a completed execution with
+that exit code, preserved exactly, and cached only under the same rules a local
+failure would be.
+
+When the environment fails, what Arc may do next depends on whether the command
+might have started:
+
+* **Safe to run locally** — incompatible worker, unavailable inputs, sandbox
+  setup failure, overloaded queue, unreachable worker. Nothing ran, so Arc runs
+  it here.
+* **Not safe** — timeout, cancellation, a worker lost mid-job. The command may
+  still be running somewhere. Running it again could duplicate whatever it does,
+  so Arc fails with an explanation rather than guessing. `--no-remote-execution`
+  is the deliberate override.
+
+A worker restart loses the jobs it was running. Arc does not fake recovery: the
+client's wait times out and it reports that, because a job whose state is
+genuinely unknown is not a job to draw conclusions from.
+
+### Side effects
+
+Arc can only represent a command's effects as files and streams. A command that
+deploys, publishes, or writes to a database has effects Arc cannot see, capture,
+or restore — and remote execution makes that concrete, because the effect would
+happen on a machine the user never looked at. Such commands should carry
+`remote = "never"`. Arc does not try to detect them heuristically; it defaults
+to the conservative side of everything it can detect and leaves the rest to a
+declaration.
+
+### The sandbox's limits
+
+The reference worker isolates the filesystem, the environment and the process
+tree. It does not isolate the network, and it says so in its advertised
+capabilities rather than implying otherwise. It is not a defence against hostile
+code: a command runs as the worker's user. This is stated plainly because a
+sandbox believed to be stronger than it is, is worse than one known to be weak.

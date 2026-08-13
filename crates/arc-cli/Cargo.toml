@@ -23,4 +23,5 @@ serde_json.workspace = true
 # The reference server runs in-process for tests, so a fault can be injected
 # without a second binary or a fixed port.
 arc-cache = { path = "../arc-cache" }
+arc-worker = { path = "../arc-worker" }
 arc-core.workspace = true

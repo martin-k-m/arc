@@ -116,3 +116,31 @@ tasks = ["test-core", "lint"]
 #
 # Whatever this says, never pass a cache-write token to a fork's pull request.
 remote_write = "trusted"
+
+[remote.execution]
+# Run cache misses on a remote worker. Off by default: a shared cache is a safe
+# default, but sending commands to another machine is a decision somebody makes.
+#
+# Arc only sends a command it can send honestly. Anything it cannot — a
+# different platform, an argument naming a path on this machine, a required
+# variable that looks like a secret, a read outside the project, a toolchain
+# whose contents differ — runs locally instead, and `arc run --explain` says
+# which it was.
+enabled = false
+url = "http://127.0.0.1:7921"
+# Falls back to [remote] token_env when empty. A token that may read the cache
+# is not automatically a token that may make a machine run commands.
+token_env = "ARC_WORKER_TOKEN"
+# Variables that may be sent to a worker despite looking like secrets. Empty by
+# default, and deliberately per-variable: there is no wildcard.
+allow_env = []
+# Give up on a remote execution after this long and report it, rather than
+# waiting forever on a worker that may be gone.
+timeout_ms = 1800000
+
+# Commands whose effects Arc cannot see should never leave this machine. Arc
+# does not try to detect them; say so.
+[[command]]
+name = "deploy"
+command = "./scripts/deploy.sh"
+remote = "never"

@@ -108,6 +108,8 @@ already proven safe by the concurrency tests.
 | `plan` | `ExecutionPlan` and the bounded-parallel scheduler |
 | `git` | Optional, isolated; nothing in the run pipeline depends on it |
 | `ci` | Provider detection, revision resolution, canonical tasks, run reporting |
+| `remote::eligibility` | The single gate deciding whether a command may leave this machine |
+| `remote::dispatch` | Submitting one execution and turning its result into an ordinary outcome |
 | `store` | Content-addressed blobs |
 | `db` | redb metadata, schema versioning, indexes |
 | `exec` | Child process spawn, streamed tee, exit status, the `Supervisor` hook |
@@ -156,6 +158,58 @@ The graph CI analyses is the stored one plus, for declared tasks this machine
 has never seen, a node built from remote knowledge or an empty placeholder. A
 placeholder is unprovable by construction, so a task nobody knows anything about
 is `Unknown` and runs.
+
+## Remote execution
+
+```text
+                    client
+                      │
+              local cache lookup
+                      │ miss
+              remote cache lookup
+                      │ miss
+                 eligibility gate ──── no ──▶ local execution
+                      │ yes
+                 stage inputs ──▶ shared CAS
+                      │
+                 POST /v1/exec/{ns}/jobs   (idempotent on the execution key)
+                      │
+                   worker
+                      ├── recheck shared cache
+                      ├── fetch missing inputs ──▶ worker CAS (verified)
+                      ├── materialise workspace   (copy, never hardlink)
+                      ├── resolve and verify tools
+                      ├── run in an isolated session
+                      ├── capture outputs ──▶ worker CAS
+                      └── publish objects, then the record ──▶ shared CAS
+                      │
+                    client
+                      ├── fetch result objects (re-hashed on the way in)
+                      ├── ordinary outputs::restore
+                      └── ordinary execution record
+```
+
+A remote execution produces the same `ExecutionRecord` a local one does, so the
+learn/record/publish tail of the pipeline is untouched. The one difference is
+that a remote execution is not traced, so it teaches Arc nothing new about the
+command's dependencies: a family that only ever runs remotely stays at whatever
+completeness it had.
+
+`arc-worker` is one process that is both execution server and worker. The split
+is internal — `sandbox` knows nothing about HTTP, and the server knows nothing
+about process groups — so the two can become separate services without the
+protocol changing.
+
+### Graph dataflow across locations
+
+```text
+producer      consumer     where the outputs travel
+────────      ────────     ────────────────────────
+remote    →   remote       shared CAS only; the client sees metadata
+local     →   remote       uploaded with the consumer's input manifest
+remote    →   local        verified into the local store, then restored
+cache hit →   remote       already present remotely
+```
 
 ## Two keys, two questions
 

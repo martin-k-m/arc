@@ -11,6 +11,9 @@
 // which is convert it to a message and fall back.
 #![allow(clippy::result_large_err)]
 
+pub mod dispatch;
+pub mod eligibility;
+pub mod execution;
 pub mod protocol;
 
 use crate::hash::{Digest, Hasher};
@@ -47,6 +50,41 @@ pub struct RemoteConfig {
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub concurrency: usize,
+    pub execution: ExecutionConfig,
+}
+
+/// Remote *execution*, which is off unless a project turns it on. A shared
+/// cache is a safe default; sending commands to another machine is a decision
+/// somebody has to make.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExecutionConfig {
+    pub enabled: bool,
+    /// The worker endpoint. Separate from the cache URL: a worker and a cache
+    /// are different services even when one machine runs both.
+    pub url: String,
+    /// Name of the environment variable holding the worker's bearer token.
+    /// Falls back to the cache's `token_env` when empty.
+    pub token_env: String,
+    /// Variables that may be sent to a worker despite looking like secrets.
+    /// Empty by default, and deliberately awkward to fill in.
+    pub allow_env: Vec<String>,
+    pub timeout_ms: u64,
+    /// How often to ask a running job for its state.
+    pub poll_ms: u64,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        ExecutionConfig {
+            enabled: false,
+            url: String::new(),
+            token_env: String::new(),
+            allow_env: Vec::new(),
+            timeout_ms: execution::DEFAULT_TIMEOUT_MS,
+            poll_ms: 250,
+        }
+    }
 }
 
 impl Default for RemoteConfig {
@@ -61,6 +99,7 @@ impl Default for RemoteConfig {
             connect_timeout_ms: 3_000,
             request_timeout_ms: 30_000,
             concurrency: 8,
+            execution: ExecutionConfig::default(),
         }
     }
 }
@@ -112,6 +151,18 @@ pub fn effective_config(cfg: &RemoteConfig) -> RemoteConfig {
     if let Some(v) = number("ARC_REMOTE_TIMEOUT_MS") {
         c.request_timeout_ms = v;
         c.connect_timeout_ms = c.connect_timeout_ms.min(v);
+    }
+    if let Some(v) = flag("ARC_REMOTE_EXECUTION") {
+        c.execution.enabled = v;
+    }
+    if let Ok(v) = std::env::var("ARC_REMOTE_EXECUTION_URL") {
+        c.execution.url = v;
+    }
+    if let Some(v) = number("ARC_REMOTE_EXECUTION_TIMEOUT_MS") {
+        c.execution.timeout_ms = v;
+    }
+    if let Some(v) = number("ARC_REMOTE_EXECUTION_POLL_MS") {
+        c.execution.poll_ms = v;
     }
     c
 }
@@ -549,6 +600,243 @@ impl Remote {
         }
         Err(anyhow!(last.unwrap_or_else(|| "request failed".into())))
     }
+}
+
+/// Client for a remote execution worker.
+///
+/// Separate from [`Remote`] because they are separate services: a worker
+/// executes, a cache stores. The worker publishes into the cache, so results
+/// never flow through this connection — only control.
+pub struct Executor {
+    agent: ureq::Agent,
+    base: String,
+    endpoint: String,
+    namespace: String,
+    token: Option<String>,
+    poll: Duration,
+    timeout: Duration,
+    requests: AtomicU64,
+}
+
+impl Executor {
+    pub fn open(cfg: &RemoteConfig) -> std::result::Result<Executor, Disabled> {
+        let cfg = effective_config(cfg);
+        let exec = &cfg.execution;
+        // Whether remote execution is *wanted* is the caller's decision — a
+        // command-line flag can turn it on for one run. This only answers
+        // whether a worker could be reached at all.
+        if exec.url.trim().is_empty() {
+            return Err(Disabled::NotConfigured);
+        }
+        if cfg.namespace.trim().is_empty() {
+            return Err(Disabled::NoNamespace);
+        }
+        if !protocol::valid_namespace(cfg.namespace.trim()) {
+            return Err(Disabled::Invalid(format!(
+                "invalid [remote] namespace `{}`",
+                cfg.namespace
+            )));
+        }
+        let url = parse_endpoint(exec.url.trim()).map_err(Disabled::Invalid)?;
+        let token_env = if exec.token_env.trim().is_empty() {
+            cfg.token_env.as_str()
+        } else {
+            exec.token_env.as_str()
+        };
+        let token = read_token(token_env).map_err(Disabled::Invalid)?;
+        let agent = ureq::AgentBuilder::new()
+            .user_agent(USER_AGENT)
+            // Same rule as the cache client: a redirect must never carry the
+            // Authorization header to another host.
+            .redirects(0)
+            .timeout_connect(Duration::from_millis(cfg.connect_timeout_ms))
+            .timeout_read(Duration::from_millis(cfg.request_timeout_ms))
+            .timeout_write(Duration::from_millis(cfg.request_timeout_ms))
+            .build();
+        Ok(Executor {
+            endpoint: url.host,
+            base: format!("{}{}", url.base, execution::EXEC_PREFIX),
+            namespace: cfg.namespace.trim().to_string(),
+            token,
+            poll: Duration::from_millis(exec.poll_ms.clamp(20, 10_000)),
+            timeout: Duration::from_millis(exec.timeout_ms.max(1_000)),
+            requests: AtomicU64::new(0),
+            agent,
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    fn auth(&self, r: ureq::Request) -> ureq::Request {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        match &self.token {
+            Some(t) => r.set("Authorization", &format!("Bearer {t}")),
+            None => r,
+        }
+    }
+
+    pub fn capabilities(&self) -> Result<execution::Capabilities> {
+        let url = format!("{}/capabilities", self.base);
+        let resp = retry(|| self.auth(self.agent.get(&url)).call())?;
+        let caps: execution::Capabilities = read_json(resp, 256 * 1024)?;
+        if caps.protocol != execution::EXEC_PROTOCOL_VERSION {
+            bail!(
+                "worker speaks execution protocol v{}, this Arc speaks v{}",
+                caps.protocol,
+                execution::EXEC_PROTOCOL_VERSION
+            );
+        }
+        Ok(caps)
+    }
+
+    /// Submit an execution. Idempotent on the execution key: a worker already
+    /// running this exact execution returns that job rather than starting a
+    /// second one, so a retried request cannot duplicate expensive work.
+    pub fn submit(&self, req: &execution::ExecutionRequest) -> Result<execution::Job> {
+        req.validate().map_err(|e| anyhow!(e))?;
+        let url = format!("{}/{}/jobs", self.base, self.namespace);
+        let body = serde_json::to_vec(req)?;
+        let resp = retry(|| {
+            self.auth(self.agent.post(&url))
+                .set("Content-Type", "application/json")
+                .send_bytes(&body)
+        })?;
+        let job: execution::Job = read_json(resp, protocol::MAX_METADATA_BYTES)?;
+        job.validate(&req.execution_key).map_err(|e| anyhow!(e))?;
+        Ok(job)
+    }
+
+    pub fn job(&self, id: &str, expect_key: &str) -> Result<execution::Job> {
+        let url = format!("{}/{}/jobs/{}", self.base, self.namespace, job_id(id)?);
+        let resp = retry(|| self.auth(self.agent.get(&url)).call())?;
+        let job: execution::Job = read_json(resp, protocol::MAX_METADATA_BYTES)?;
+        job.validate(expect_key).map_err(|e| anyhow!(e))?;
+        Ok(job)
+    }
+
+    pub fn log(&self, id: &str, offset: u64) -> Result<execution::LogChunk> {
+        let url = format!(
+            "{}/{}/jobs/{}/log?offset={offset}",
+            self.base,
+            self.namespace,
+            job_id(id)?
+        );
+        let resp = retry(|| self.auth(self.agent.get(&url)).call())?;
+        read_json(resp, (execution::MAX_LOG_BYTES as usize) + 4096)
+    }
+
+    /// Ask the worker to stop. Advisory: other clients may be waiting on the
+    /// same execution, and their work is not this client's to discard.
+    pub fn cancel(&self, id: &str) -> Result<()> {
+        let url = format!(
+            "{}/{}/jobs/{}/cancel",
+            self.base,
+            self.namespace,
+            job_id(id)?
+        );
+        self.auth(self.agent.post(&url)).call().ok();
+        Ok(())
+    }
+
+    /// Poll until the job reaches a terminal state, forwarding new log output
+    /// as it appears.
+    pub fn wait(
+        &self,
+        job: execution::Job,
+        expect_key: &str,
+        mut on_log: impl FnMut(&str),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<execution::Job> {
+        let started = Instant::now();
+        let mut job = job;
+        let mut offset = 0u64;
+        while !job.state.terminal() {
+            if cancelled() {
+                let _ = self.cancel(&job.id);
+                bail!("cancelled");
+            }
+            if started.elapsed() > self.timeout {
+                let _ = self.cancel(&job.id);
+                bail!("remote execution exceeded the client timeout");
+            }
+            std::thread::sleep(self.poll);
+            job = self.job(&job.id, expect_key)?;
+            while offset < job.log_len {
+                let chunk = match self.log(&job.id, offset) {
+                    Ok(c) => c,
+                    // Logs are informational; losing them must not fail a run.
+                    Err(_) => break,
+                };
+                if chunk.text.is_empty() {
+                    break;
+                }
+                on_log(&chunk.text);
+                offset = chunk.offset + chunk.len;
+            }
+        }
+        while offset < job.log_len {
+            let Ok(chunk) = self.log(&job.id, offset) else {
+                break;
+            };
+            if chunk.text.is_empty() {
+                break;
+            }
+            on_log(&chunk.text);
+            offset = chunk.offset + chunk.len;
+        }
+        Ok(job)
+    }
+}
+
+fn job_id(id: &str) -> Result<&str> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id.len() <= execution::MAX_JOB_ID_LEN
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "malformed job id"
+    );
+    Ok(id)
+}
+
+/// Bounded retry for the execution endpoints. Submission is included because it
+/// is idempotent on the execution key.
+fn retry(
+    f: impl Fn() -> std::result::Result<ureq::Response, ureq::Error>,
+) -> Result<ureq::Response> {
+    let mut last = None;
+    for attempt in 0..RETRY_ATTEMPTS {
+        match f() {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let retryable = match &e {
+                    ureq::Error::Status(code, _) => *code >= 500,
+                    ureq::Error::Transport(_) => true,
+                };
+                last = Some(describe(e));
+                if !retryable {
+                    break;
+                }
+                if attempt + 1 < RETRY_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(RETRY_BASE_MS << attempt));
+                }
+            }
+        }
+    }
+    Err(anyhow!(last.unwrap_or_else(|| "request failed".into())))
 }
 
 /// Errors never carry the request URL's credentials because Arc never puts any

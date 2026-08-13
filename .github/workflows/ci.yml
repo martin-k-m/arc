@@ -31,6 +31,20 @@ jobs:
       - run: cargo run --release -q -p arc-core --example graph_bench
       - run: cargo run --release -q -p arc-core --example ci_bench
 
+  # Remote execution needs a cache, a worker and a client talking to each other
+  # over real sockets, which only an end-to-end run exercises.
+  remote-execution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: git config --global user.email ci@example.com
+      - run: git config --global user.name ci
+      - run: cargo test -p arc-cli --test remote_exec -- --test-threads=3
+      - run: bash scripts/remote-exec-demo.sh
+      - run: bash scripts/exec-bench.sh
+
   # The Linux tracer is the one component whose behaviour depends on the
   # sandbox it runs in, so it is exercised both ways: under a container's
   # default seccomp profile, and with ptrace explicitly forbidden. The second
