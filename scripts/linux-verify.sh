@@ -12,6 +12,13 @@ cargo fmt --all -- --check && echo LINUX_FMT_OK || echo LINUX_FMT_FAILED
 cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 |
   grep -E '^(error|warning)' -A 8 | head -40
 echo LINUX_CLIPPY_DONE
+git config --global user.email ci@example.com
+git config --global user.name ci
+git config --global init.defaultBranch main
 cargo test --workspace -- --test-threads=2 2>&1 |
   grep -E '^test result|^error|FAILED|panicked'
 echo LINUX_TESTS_DONE
+cargo run --release -q -p arc-core --example ci_bench
+echo LINUX_BENCH_DONE
+bash scripts/ci-demo.sh 2>&1 | tail -80
+echo LINUX_DEMO_DONE

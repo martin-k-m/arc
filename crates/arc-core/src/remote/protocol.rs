@@ -246,6 +246,127 @@ impl RemoteExecution {
     }
 }
 
+pub const MAX_TASK_PATHS: usize = 100_000;
+pub const MAX_BATCH_TASKS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireConsumes {
+    File,
+    Directory,
+    Existence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireConsumed {
+    pub path: WirePath,
+    pub kind: WireConsumes,
+}
+
+/// What one machine knows about a task's *dependencies*, published so another
+/// machine need not rediscover it by running everything once.
+///
+/// This is optimisation data and nothing more. It carries `program` and `args`
+/// only so a recipient can confirm the record describes the task it already
+/// intends to run; a recipient never learns a command from here. See
+/// [`RemoteTask::matches_local`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTask {
+    pub protocol: u32,
+    /// Meaning of the task row itself.
+    pub graph_semantics: u32,
+    /// Meaning of the dependency set it was derived from.
+    pub dependency_semantics: u32,
+    /// Meaning of the trace observations behind that dependency set.
+    pub trace_semantics: u32,
+    pub os: String,
+    pub arch: String,
+    pub family_key: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub rel_cwd: String,
+    pub completeness: String,
+    /// Whether the publisher's knowledge was complete enough to rule changes
+    /// out. False means the recipient must treat the task as unknown.
+    pub inputs_narrowed: bool,
+    pub produces: Vec<WirePath>,
+    pub consumes: Vec<WireConsumed>,
+    pub declared_inputs: Vec<String>,
+    pub observations: u64,
+    pub arc_version: String,
+}
+
+impl RemoteTask {
+    pub fn validate(&self, expect_family: Option<&str>) -> Result<(), String> {
+        if self.protocol != PROTOCOL_VERSION {
+            return Err(format!("unsupported task protocol {}", self.protocol));
+        }
+        if !valid_digest(&self.family_key) {
+            return Err("malformed family key".into());
+        }
+        if let Some(f) = expect_family {
+            if f != self.family_key {
+                return Err("task record does not describe the requested family".into());
+            }
+        }
+        if self.produces.len() + self.consumes.len() > MAX_TASK_PATHS {
+            return Err("task record names too many paths".into());
+        }
+        for p in &self.produces {
+            p.decode()?;
+        }
+        for c in &self.consumes {
+            c.path.decode()?;
+        }
+        for g in &self.declared_inputs {
+            if g.len() > 4096 || g.contains('\0') {
+                return Err("malformed declared input pattern".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this Arc may read the record at all. Dependency knowledge derived
+    /// under different semantics describes a different question, and a
+    /// dependency set observed on another platform says nothing about this one.
+    pub fn compatible_with_host(&self) -> Result<(), String> {
+        if self.graph_semantics != crate::graph::GRAPH_SCHEMA_VERSION
+            || self.dependency_semantics != crate::dependency::DEPENDENCY_SCHEMA_VERSION
+            || self.trace_semantics != crate::trace::TRACE_SEMANTICS_VERSION
+        {
+            return Err("task record uses different dependency semantics".into());
+        }
+        if self.os != std::env::consts::OS || self.arch != std::env::consts::ARCH {
+            return Err(format!(
+                "task record was observed on {}/{}",
+                self.os, self.arch
+            ));
+        }
+        Ok(())
+    }
+
+    /// The identity check that keeps a cache server from ever influencing *what*
+    /// CI executes: the record must describe the command the checked-out
+    /// repository already defines, or it is discarded.
+    pub fn matches_local(&self, program: &str, args: &[String], rel_cwd: &str) -> bool {
+        self.program == program && self.args == args && self.rel_cwd == rel_cwd
+    }
+
+    pub fn canonical(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLookupRequest {
+    pub families: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLookupResponse {
+    pub tasks: Vec<RemoteTask>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingRequest {
     pub digests: Vec<String>,

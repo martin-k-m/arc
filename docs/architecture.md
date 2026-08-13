@@ -107,12 +107,55 @@ already proven safe by the concurrency tests.
 | `affected` | Direct and transitive propagation with provenance; pure, reusable |
 | `plan` | `ExecutionPlan` and the bounded-parallel scheduler |
 | `git` | Optional, isolated; nothing in the run pipeline depends on it |
+| `ci` | Provider detection, revision resolution, canonical tasks, run reporting |
 | `store` | Content-addressed blobs |
 | `db` | redb metadata, schema versioning, indexes |
 | `exec` | Child process spawn, streamed tee, exit status, the `Supervisor` hook |
 | `outputs` | Output capture and path-safe restoration |
 | `engine` | Sequences the above; holds no policy of its own |
 | `maintenance` | Stats, GC, prune, verify |
+
+## CI
+
+```text
+CI provider environment ─▶ CiContext ─▶ revision resolver
+                                              │
+                                              ▼
+                                     git diff (base..head)
+                                              │
+     arc.toml canonical tasks ─────▶ task graph ◀───── remote task knowledge
+                                              │
+                                              ▼
+                                     affected analysis
+                                              │
+                                              ▼
+                                      execution plan
+                                              │
+                                              ▼
+                                    v0.4 scheduler ─▶ arc run
+                                              │
+                                    local / remote / execute
+                                              │
+                                              ▼
+                                       CiRunSummary
+                                              │
+                        terminal · JSON · GitHub job summary
+```
+
+Provider knowledge is confined to `ci::context` and `ci::github`. Everything
+downstream sees a `CiContext`, so adding a provider means adding a detector, not
+a code path. Nothing in `ci` renders; nothing in the CLI decides.
+
+`arc ci` adds no scheduler, no cache and no execution path of its own. It
+computes a set of family keys and hands them to the v0.4 planner, which hands
+them to the v0.4 scheduler, which runs `arc run` per task — so every CI task
+goes through exactly the pipeline a developer's `arc run` goes through, remote
+cache included.
+
+The graph CI analyses is the stored one plus, for declared tasks this machine
+has never seen, a node built from remote knowledge or an empty placeholder. A
+placeholder is unprovable by construction, so a task nobody knows anything about
+is `Unknown` and runs.
 
 ## Two keys, two questions
 

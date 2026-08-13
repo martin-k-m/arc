@@ -96,6 +96,44 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run the work a branch's changes require, and report what was reused
+    Ci {
+        /// Revision to compare against; overrides anything the CI provider says
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
+        /// Revision to compare; without it, the working tree is compared
+        #[arg(long, value_name = "REV")]
+        head: Option<String>,
+        /// Analyse and plan, but execute nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Say why each task was selected or skipped
+        #[arg(long)]
+        explain: bool,
+        /// Limit the run to these CI task names or tags
+        #[arg(long, value_name = "NAME")]
+        task: Vec<String>,
+        /// Tasks to run at once (default: available parallelism, capped at 16)
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Stop starting new tasks after the first failure
+        #[arg(long)]
+        fail_fast: bool,
+        /// Allow Arc to deepen the repository to obtain the base commit
+        #[arg(long)]
+        fetch: bool,
+        /// Ignore any configured remote cache
+        #[arg(long)]
+        no_remote: bool,
+        /// Publish results even when the event is not one Arc considers trusted
+        #[arg(long)]
+        remote_write: bool,
+        /// Do not write a GitHub job summary or step outputs
+        #[arg(long)]
+        no_summary: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show recent executions
     History {
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -255,6 +293,39 @@ fn real_main() -> Result<i32> {
             explain,
             json,
         } => cmd_affected(&home, &cwd, run, dry_run, jobs, fail_fast, explain, json),
+        Cmd::Ci {
+            base,
+            head,
+            dry_run,
+            explain,
+            task,
+            jobs,
+            fail_fast,
+            fetch,
+            no_remote,
+            remote_write,
+            no_summary,
+            json,
+        } => cmd_ci(
+            &home,
+            &cwd,
+            arc_core::ci::analysis::CiOptions {
+                base,
+                head,
+                tasks: task,
+                fetch,
+                no_remote,
+                force_remote_write: remote_write,
+            },
+            CiDisplay {
+                dry_run,
+                explain,
+                json,
+                summary: !no_summary,
+                jobs,
+                fail_fast,
+            },
+        ),
         Cmd::History { limit, json } => cmd_history(&home, limit, json).map(|_| 0),
         Cmd::Inspect { id, json } => cmd_inspect(&home, &id, json).map(|_| 0),
         Cmd::Cache { command } => cmd_cache(&home, &cwd, command).map(|_| 0),
@@ -1157,6 +1228,278 @@ fn explain_cause(
     out
 }
 
+struct CiDisplay {
+    dry_run: bool,
+    explain: bool,
+    json: bool,
+    summary: bool,
+    jobs: Option<usize>,
+    fail_fast: bool,
+}
+
+fn cmd_ci(
+    home: &Path,
+    cwd: &Path,
+    opts: arc_core::ci::analysis::CiOptions,
+    show: CiDisplay,
+) -> Result<i32> {
+    use arc_core::ci::{self, context::Environment, CiRunSummary};
+
+    let project = Project::discover(cwd)?;
+    let db = Db::open(home)?;
+    let env = Environment::process();
+    let analysis = ci::analysis::analyse(&project, &db, cwd, &env, &opts)?;
+    let plan = analysis.plan.clone().unwrap_or_else(|| {
+        unreachable!("analysis always produces a plan");
+    });
+
+    // Arc does not invent work. Without declared tasks there is nothing CI can
+    // select from, and guessing `npm test` would be a different product.
+    if analysis.known_tasks == 0 && !show.json {
+        render_ci_header(&analysis);
+        println!(
+            "\n  {}\n\n  {}\n\n    [[command]]\n    name = \"test\"\n    command = \"cargo\"\n    args = [\"test\"]\n\n    [ci]\n    tasks = [\"test\"]\n",
+            ui::yellow("no CI tasks are declared"),
+            ui::dim("declare what CI should run in arc.toml:")
+        );
+        return Ok(0);
+    }
+
+    let jobs = show.jobs.unwrap_or_else(arc_core::plan::default_jobs);
+    let run = if show.dry_run || plan.is_empty() {
+        None
+    } else {
+        if !show.json {
+            render_ci_header(&analysis);
+            eprintln!(
+                "\n  {}\n",
+                ui::dim(&format!(
+                    "running {} of {} tasks · {jobs} at a time",
+                    plan.tasks.len(),
+                    analysis.known_tasks
+                ))
+            );
+        }
+        db.release();
+        // The scheduler runs `arc run` per task, so the remote policy has to
+        // travel to the children: a fork's build must not be able to publish
+        // merely because it was started by a trusted workflow.
+        let mut child_env = Vec::new();
+        if !analysis.remote_write {
+            child_env.push(("ARC_REMOTE_WRITE".to_string(), "0".to_string()));
+        }
+        if opts.no_remote {
+            child_env.push(("ARC_REMOTE_ENABLED".to_string(), "0".to_string()));
+        }
+        Some(arc_core::plan::execute(
+            &plan,
+            &project.root,
+            home,
+            &arc_core::plan::SchedulerOptions {
+                jobs,
+                fail_fast: show.fail_fast,
+                child_env,
+                ..Default::default()
+            },
+            &TaskObserver { json: show.json },
+        )?)
+    };
+
+    let summary = CiRunSummary::build(&analysis, run.as_ref());
+    if show.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": arc_core::SCHEMA_VERSION,
+                "dry_run": show.dry_run,
+                "analysis": analysis,
+                "plan": plan,
+                "summary": summary,
+            }))?
+        );
+    } else {
+        if run.is_none() {
+            render_ci_header(&analysis);
+        }
+        render_ci_summary(&analysis, &summary, show.dry_run, show.explain);
+    }
+
+    if show.summary {
+        publish_ci_summary(&env, &analysis, &summary, show.dry_run);
+    }
+    Ok(summary.exit_code)
+}
+
+/// GitHub's own channels: a Markdown job summary, step outputs for later steps,
+/// and an annotation for anything that made the analysis less certain. None of
+/// them is load-bearing, so none of them can fail the build.
+fn publish_ci_summary(
+    env: &arc_core::ci::context::Environment,
+    analysis: &arc_core::ci::analysis::CiAnalysis,
+    summary: &arc_core::ci::CiRunSummary,
+    dry_run: bool,
+) {
+    use arc_core::ci::{self, github};
+    if let Some(path) = env.get("GITHUB_STEP_SUMMARY") {
+        let _ = github::write_summary(
+            Path::new(path),
+            &ci::summary_markdown(analysis, summary, dry_run),
+        );
+    }
+    if let Some(path) = env.get("GITHUB_OUTPUT") {
+        let _ = github::write_outputs(Path::new(path), &ci::outputs(summary));
+    }
+    if analysis.provider == "github-actions" && !analysis.diff_available {
+        // stderr, so `--json` on stdout stays a single parseable document.
+        for note in analysis.notes.iter().take(3) {
+            eprintln!("{}", github::warning(&format!("arc: {note}")));
+        }
+    }
+}
+
+fn render_ci_header(a: &arc_core::ci::analysis::CiAnalysis) {
+    use arc_core::ci::sanitize;
+    print!("{}", ui::banner("ARC CI"));
+    println!(
+        "{}",
+        ui::row(
+            "provider",
+            &format!(
+                "{} {} {}",
+                ui::accent(&sanitize(&a.provider)),
+                ui::dim("·"),
+                sanitize(&a.event)
+            )
+        )
+    );
+    let rev = |v: &Option<String>| v.as_deref().map(short).unwrap_or_else(|| "unknown".into());
+    println!("{}", ui::row("base", &rev(&a.base)));
+    println!("{}", ui::row("head", &rev(&a.head)));
+    println!(
+        "{}",
+        ui::row(
+            "changed",
+            &if a.diff_available {
+                ui::plural(a.changed_files, "file", "files")
+            } else {
+                ui::yellow("cannot establish a complete diff")
+            }
+        )
+    );
+    for note in a.notes.iter().take(4) {
+        println!("{}", ui::row("note", &ui::yellow(&sanitize(note))));
+    }
+}
+
+fn render_ci_summary(
+    a: &arc_core::ci::analysis::CiAnalysis,
+    s: &arc_core::ci::CiRunSummary,
+    dry_run: bool,
+    explain: bool,
+) {
+    use arc_core::ci::{human_ms, sanitize, TaskOutcome};
+    let c = &s.counts;
+    println!("\n  {}", ui::dim("plan"));
+    println!("    {} affected", c.affected);
+    println!("    {} unknown", c.unknown);
+    println!("    {} unaffected", c.skipped);
+
+    // Explanations come from the analysis, not the run: a dry run has verdicts
+    // and reasons but no outcomes, and "why" is a question about the plan.
+    if explain {
+        println!("\n  {}", ui::dim("why"));
+        for t in &a.selected {
+            println!(
+                "    {} {}",
+                ui::bold(&sanitize(&t.name)),
+                ui::dim(&format!("· {}", t.verdict.label()))
+            );
+            for reason in t.reasons.iter().take(2) {
+                println!("      {}", ui::dim(&sanitize(reason)));
+            }
+        }
+        for name in &a.skipped {
+            println!(
+                "    {} {}",
+                ui::bold(&sanitize(name)),
+                ui::dim("· skipped, no known dependency intersects the change")
+            );
+        }
+    }
+
+    if dry_run {
+        println!(
+            "\n  {}\n",
+            ui::bold(&format!("would run {} of {} tasks", c.selected, c.known))
+        );
+        return;
+    }
+
+    println!("\n  {}", ui::dim("cache"));
+    println!("    {} local", c.local_hits);
+    println!("    {} remote", c.remote_hits);
+    println!("    {} executed", c.executed);
+
+    println!("\n  {}", ui::dim("time"));
+    println!("    {:<10} {}", "arc", ui::duration(s.arc_ms));
+    println!("    {:<10} {}", "work", ui::duration(s.work_ms));
+    println!(
+        "    {:<10} {}",
+        "saved",
+        if s.estimated_avoided_ms > 0 {
+            ui::green(&format!("~{} estimated", human_ms(s.estimated_avoided_ms)))
+        } else {
+            ui::dim("unknown, no execution history yet")
+        }
+    );
+    if s.avoided_without_history > 0 && s.estimated_avoided_ms > 0 {
+        println!(
+            "    {:<10} {}",
+            "",
+            ui::dim(&format!(
+                "{} reused tasks have no recorded duration",
+                s.avoided_without_history
+            ))
+        );
+    }
+
+    let failed = c.failed + c.blocked;
+    let passed = c.selected.saturating_sub(failed);
+    eprintln!(
+        "\n{} {}\n",
+        if failed == 0 {
+            ui::green(ui::MARK)
+        } else {
+            ui::red(ui::MARK)
+        },
+        ui::bold(&format!(
+            "{passed}/{} tasks passed{}",
+            c.selected,
+            if failed > 0 {
+                format!(", {failed} did not")
+            } else {
+                String::new()
+            }
+        ))
+    );
+    for t in s.tasks.iter().filter(|t| t.outcome == TaskOutcome::Blocked) {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("blocked"),
+            ui::dim(&sanitize(&t.name))
+        );
+    }
+    if !a.remote_write {
+        eprintln!(
+            "  {}",
+            ui::dim(&format!(
+                "remote cache read-only: {}",
+                sanitize(&a.remote_write_reason)
+            ))
+        );
+    }
+}
+
 fn cmd_history(home: &Path, limit: usize, json: bool) -> Result<()> {
     let db = Db::open(home)?;
     let rows = db.history(limit)?;
@@ -1749,6 +2092,59 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         Err(e) => println!("{}", ui::row("configured", &ui::red(&format!("{e:#}")))),
     }
 
+    println!("\n{}\n", ui::bold("continuous integration"));
+    {
+        use arc_core::ci::context::{CiContext, Environment};
+        let env = Environment::process();
+        let ctx = CiContext::detect(&env);
+        println!("{}", ui::row("provider", &ui::accent(ctx.provider.label())));
+        println!("{}", ui::row("event", ctx.event.label()));
+        println!("{}", ui::row("trust", &ui::dim(ctx.trust.label())));
+        let resolution = arc_core::ci::revisions::resolve(cwd, &ctx, None, None, false);
+        println!(
+            "{}",
+            ui::row(
+                "diff available",
+                &match &resolution.comparison {
+                    arc_core::ci::revisions::Comparison::Unknown { reason } =>
+                        ui::yellow(&arc_core::ci::sanitize(reason)),
+                    c => ui::green(c.label()),
+                }
+            )
+        );
+        println!("{}", ui::row("shallow clone", &check(!resolution.shallow)));
+        match arc_core::ci::tasks::canonical(&project, &[]) {
+            Ok(t) if t.is_empty() => println!(
+                "{}",
+                ui::row(
+                    "ci tasks",
+                    &ui::dim("none declared ([[command]] + [ci] tasks)")
+                )
+            ),
+            Ok(t) => println!(
+                "{}",
+                ui::row(
+                    "ci tasks",
+                    &t.iter()
+                        .map(|c| arc_core::ci::sanitize(&c.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            ),
+            Err(e) => println!("{}", ui::row("ci tasks", &ui::red(&format!("{e:#}")))),
+        }
+        println!(
+            "{}",
+            ui::row(
+                "remote write",
+                &format!("policy {}", project.config.ci.remote_write.label())
+            )
+        );
+        for w in arc_core::ci::volatile_env_warnings(&project.config) {
+            println!("{}", ui::row("warning", &ui::yellow(&w)));
+        }
+    }
+
     println!("\n{}\n", ui::bold("task graph"));
     match Db::open(home).and_then(|db| arc_core::graph::build(&project, &db)) {
         Ok(g) => {
@@ -1800,6 +2196,21 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
         ui::row("selective execution", &ui::green("supported"))
     );
     println!("{}", ui::row("remote cache", &ui::green("supported")));
+    println!(
+        "{}",
+        ui::row("shared task knowledge", &ui::green("supported"))
+    );
+    println!(
+        "{}",
+        ui::row(
+            "ci integration",
+            &if arc_core::git::available(cwd) {
+                ui::green("github actions, generic")
+            } else {
+                ui::yellow("needs git on PATH")
+            }
+        )
+    );
     println!(
         "{}",
         ui::row("remote execution", &ui::dim("not implemented"))

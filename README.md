@@ -425,6 +425,91 @@ local one. A corrupt object, a missing object, a malformed record, an expired
 credential or an unreachable server all mean the same thing: run the command.
 See [docs/remote-protocol.md](docs/remote-protocol.md) for the wire format.
 
+## Continuous integration
+
+`arc ci` is the CI entry point. It works out what a branch changed, runs only
+the work that change requires, reuses everything the local and remote caches
+already hold, and reports why each task ran or did not.
+
+Declare what CI should run:
+
+```toml
+[[command]]
+name = "test-core"
+command = "cargo"
+args = ["test", "-p", "arc-core"]
+inputs = ["crates/arc-core/**", "Cargo.toml", "Cargo.lock"]
+
+[[command]]
+name = "lint"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets"]
+
+[ci]
+tasks = ["test-core", "lint"]
+```
+
+Then, in GitHub Actions:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0        # Arc compares two commits; give it the history
+
+- run: arc ci
+  env:
+    ARC_CACHE_TOKEN: ${{ secrets.ARC_CACHE_TOKEN }}
+```
+
+```text
+◆ ARC CI
+  provider            github-actions · pull_request
+  base                a1b2c3d4e5f6
+  head                f6e5d4c3b2a1
+  changed             8 files
+
+  plan
+    4 affected
+    1 unknown
+    23 unaffected
+
+  cache
+    1 local
+    4 remote
+    1 executed
+
+  time
+    arc        142ms
+    work       1.8s
+    saved      ~24.6s estimated
+```
+
+Arc reads GitHub's event payload directly, so pull requests, pushes and merge
+queues each get the right base — no API token, no network. Anything it cannot
+resolve, including a shallow clone missing the base commit, means it cannot
+prove anything and every declared task runs. It never quietly calls work
+unnecessary.
+
+**Fork pull requests never publish to the shared cache.** Arc's default policy
+publishes only from events it can positively identify as trusted, and enforces
+that on every task it schedules. Do not hand a cache-write token to a fork's
+pull request; [docs/ci.md](docs/ci.md#fork-pull-requests) has the safe pattern.
+
+A fresh runner has no task graph of its own, so Arc publishes each task's
+learned dependencies alongside its results and fetches them in one batched
+request. That knowledge is used to *select* work, never to authorise a cache
+hit: a compromised cache server can make Arc run more work, never different
+work and never less.
+
+Reproduce any CI decision locally:
+
+```bash
+arc ci --base origin/main --head HEAD --dry-run --explain
+```
+
+[docs/ci.md](docs/ci.md) covers events, trust policy, shallow clones, job
+summaries and JSON output.
+
 ## Correctness
 
 A fast wrong answer is worthless, so Arc executes whenever it is unsure. See
@@ -521,7 +606,10 @@ execution; content-addressed storage with deduplication; output
 capture and restore; execution-family identity; learned dependency sets with
 explicit completeness and structured downgrade reasons; process-tree and write
 observation on Windows; a verified remote cache with a reference server, so one
-machine's result is another machine's hit; the dependency graph; `arc affected` against Git; cache
+machine's result is another machine's hit; shared task knowledge, so a fresh CI
+runner can prove work unnecessary without having run it once; branch-aware CI
+selection with GitHub Actions support, fork-safe cache-write policy and job
+summaries; the dependency graph; `arc affected` against Git; cache
 statistics, LRU pruning, garbage collection, integrity verification; execution
 history and inspection; JSON output for tooling; and safe concurrent use from
 several terminals.

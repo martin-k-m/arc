@@ -15,6 +15,7 @@ pub struct Config {
     pub env: EnvConfig,
     pub trace: TraceConfig,
     pub remote: crate::remote::RemoteConfig,
+    pub ci: CiConfig,
     /// Per-command scoping, written as repeated `[[command]]` tables.
     #[serde(rename = "command")]
     pub commands: Vec<CommandConfig>,
@@ -41,15 +42,54 @@ impl Default for TraceConfig {
 /// Declared inputs are additive with `[inputs] include`, and are always
 /// fingerprinted even if an exclude pattern would have dropped them: an
 /// explicit include is a statement of fact, an exclude is only a hint.
+/// Which CI events may publish to the remote cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteWrite {
+    /// Publish only from events Arc can positively identify as trusted. A fork
+    /// pull request is not one of them.
+    #[default]
+    Trusted,
+    Always,
+    Never,
+}
+
+impl RemoteWrite {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RemoteWrite::Trusted => "trusted",
+            RemoteWrite::Always => "always",
+            RemoteWrite::Never => "never",
+        }
+    }
+}
+
+/// What `arc ci` runs, and what it is allowed to publish.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CiConfig {
+    /// Names of `[[command]]` blocks to consider. Empty means every runnable
+    /// named command.
+    pub tasks: Vec<String>,
+    pub remote_write: RemoteWrite,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommandConfig {
     /// Glob matched against the full command line, e.g. `"cargo test*"`.
+    /// Derived from `command`/`args` when left empty.
     #[serde(rename = "match")]
     pub match_: String,
     /// Human-readable task name, used by `arc graph`, `arc affected` and by
     /// `after`. Never part of execution identity.
     pub name: Option<String>,
+    /// Program to execute, making this block a task `arc ci` can run rather
+    /// than only a scoping rule.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Free-form labels, for selecting subsets in CI.
+    pub tags: Vec<String>,
     /// Task names this command must follow, for dependencies no filesystem
     /// observation can reveal.
     pub after: Vec<String>,
@@ -175,11 +215,28 @@ impl Project {
     }
 }
 
+impl CommandConfig {
+    /// The command line this block runs, when it declares one.
+    pub fn command_line(&self) -> Option<String> {
+        let program = self.command.as_deref()?;
+        Some(crate::record::format_command(program, &self.args))
+    }
+
+    /// Whether this block applies to a command line: by glob, or by being an
+    /// exact declaration of it.
+    pub fn matches(&self, command_line: &str) -> Result<bool> {
+        if self.command_line().as_deref() == Some(command_line) {
+            return Ok(true);
+        }
+        command_matches(&self.match_, command_line)
+    }
+}
+
 impl Config {
     fn resolve(&self, command_line: &str) -> Result<Config> {
         let mut cfg = self.clone();
         for c in &self.commands {
-            if !command_matches(&c.match_, command_line)? {
+            if !c.matches(command_line)? {
                 continue;
             }
             cfg.inputs.include.extend(c.inputs.iter().cloned());
@@ -194,7 +251,7 @@ impl Config {
     pub fn commands_matching(&self, command_line: &str) -> Vec<&CommandConfig> {
         self.commands
             .iter()
-            .filter(|c| command_matches(&c.match_, command_line).unwrap_or(false))
+            .filter(|c| c.matches(command_line).unwrap_or(false))
             .collect()
     }
 }
@@ -289,6 +346,33 @@ mod tests {
         );
         assert!(p
             .config_for("cargo build")
+            .unwrap()
+            .inputs
+            .include
+            .is_empty());
+    }
+
+    #[test]
+    fn a_declared_command_scopes_its_own_command_line_without_a_glob() {
+        let cfg: Config = toml::from_str(
+            "[[command]]\nname = \"test\"\ncommand = \"cargo\"\nargs = [\"test\", \"-p\", \"arc-core\"]\ninputs = [\"crates/**\"]\n",
+        )
+        .unwrap();
+        let p = Project {
+            root: PathBuf::from("."),
+            config: cfg,
+            config_path: None,
+            git: false,
+        };
+        assert_eq!(
+            p.config_for("cargo test -p arc-core")
+                .unwrap()
+                .inputs
+                .include,
+            vec!["crates/**"]
+        );
+        assert!(p
+            .config_for("cargo test")
             .unwrap()
             .inputs
             .include

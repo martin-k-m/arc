@@ -4,6 +4,7 @@
 //! A false miss costs time; a false hit costs trust.
 
 pub mod affected;
+pub mod ci;
 pub mod db;
 pub mod dependency;
 pub mod engine;

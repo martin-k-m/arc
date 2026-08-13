@@ -74,10 +74,11 @@ fn main() -> Result<()> {
         }
         Cmd::Stats { data } => {
             let s = arc_cache::storage::Storage::open(&data)?;
-            let (objects, bytes, records) = s.stats()?;
+            let (objects, bytes, records, tasks) = s.stats()?;
             println!("objects    {objects}");
             println!("bytes      {bytes}");
             println!("executions {records}");
+            println!("tasks      {tasks}");
             Ok(())
         }
     }

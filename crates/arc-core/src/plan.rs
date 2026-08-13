@@ -169,6 +169,9 @@ pub struct TaskResult {
     pub stderr: String,
     /// The prerequisite that blocked this task, when it was blocked.
     pub blocked_by: Option<String>,
+    /// `local` or `remote` for a hit, as the child reported it.
+    #[serde(default)]
+    pub cache_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -198,6 +201,9 @@ pub struct SchedulerOptions {
     /// Pass `--refresh` to each task.
     pub refresh: bool,
     pub trace_backend: crate::trace::Selection,
+    /// Extra environment for every task, used by `arc ci` to impose a policy —
+    /// notably a read-only remote — on work it did not itself perform.
+    pub child_env: Vec<(String, String)>,
 }
 
 impl Default for SchedulerOptions {
@@ -207,6 +213,7 @@ impl Default for SchedulerOptions {
             fail_fast: false,
             refresh: false,
             trace_backend: crate::trace::Selection::Auto,
+            child_env: Vec::new(),
         }
     }
 }
@@ -394,6 +401,7 @@ fn claim(s: &mut Shared) -> Claim {
             stdout: String::new(),
             stderr: String::new(),
             blocked_by: Some(cause),
+            cache_source: None,
         });
         return Claim::Blocked;
     }
@@ -422,6 +430,7 @@ fn drain_cancelled(s: &mut Shared, outcome: TaskOutcome) {
             stdout: String::new(),
             stderr: String::new(),
             blocked_by: None,
+            cache_source: None,
         });
     }
 }
@@ -445,6 +454,7 @@ fn run_task(
             stdout: String::new(),
             stderr: String::new(),
             blocked_by: None,
+            cache_source: None,
         };
     }
 
@@ -469,15 +479,16 @@ fn run_task(
         .div_ceil(opts.jobs.max(1))
         .max(1)
         .to_string();
-    let out = match exec::capture(
-        arc,
-        &args,
-        &cwd,
-        &[
-            ("ARC_HOME", arc_home.as_os_str()),
-            ("ARC_REMOTE_CONCURRENCY", transfers.as_ref()),
-        ],
-    ) {
+    let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("ARC_HOME", arc_home.as_os_str()),
+        ("ARC_REMOTE_CONCURRENCY", transfers.as_ref()),
+    ];
+    env.extend(
+        opts.child_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), std::ffi::OsStr::new(v.as_str()))),
+    );
+    let out = match exec::capture(arc, &args, &cwd, &env) {
         Ok(o) => o,
         Err(e) => {
             return TaskResult {
@@ -489,16 +500,22 @@ fn run_task(
                 stdout: String::new(),
                 stderr: format!("{e:#}"),
                 blocked_by: None,
+                cache_source: None,
             }
         }
     };
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    let outcome = match (out.exit_code, is_hit(&stderr)) {
+    let reported = child_report(&stderr);
+    let outcome = match (
+        out.exit_code,
+        reported.as_ref().map(|r| r.0).unwrap_or(false),
+    ) {
         (0, true) => TaskOutcome::Hit,
         (0, false) => TaskOutcome::Ran,
         _ => TaskOutcome::Failed,
     };
     TaskResult {
+        cache_source: reported.and_then(|r| r.1),
         family_key: task.family_key.clone(),
         label: task.label.clone(),
         outcome,
@@ -511,13 +528,20 @@ fn run_task(
 }
 
 /// The `--json` line is the scheduler's channel back from the child; parsing it
-/// beats scraping the human-facing banner.
-fn is_hit(stderr: &str) -> bool {
-    stderr
+/// beats scraping the human-facing banner. Returns whether it was a hit, and
+/// which cache served it.
+fn child_report(stderr: &str) -> Option<(bool, Option<String>)> {
+    let v = stderr
         .lines()
         .filter(|l| l.trim_start().starts_with('{'))
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .any(|v| v.get("cache_status").and_then(|s| s.as_str()) == Some("HIT"))
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())?;
+    let hit = v.get("cache_status").and_then(|s| s.as_str()) == Some("HIT");
+    let source = v
+        .pointer("/cache/source")
+        .and_then(|s| s.as_str())
+        .filter(|s| *s != "none")
+        .map(str::to_string);
+    Some((hit, source))
 }
 
 fn task_cwd(project_root: &Path, rel_cwd: &str) -> PathBuf {
