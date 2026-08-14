@@ -148,8 +148,8 @@ pub struct Classifier {
 impl Classifier {
     pub fn new(project_root: &Path, arc_home: &Path) -> Classifier {
         Classifier {
-            project: PathKey::of(project_root),
-            arc_home: PathKey::of(arc_home),
+            project: PathKey::of(&canonical_root(project_root)),
+            arc_home: PathKey::of(&canonical_root(arc_home)),
             system: system_roots().iter().map(|p| PathKey::of(p)).collect(),
         }
     }
@@ -183,9 +183,46 @@ impl Classifier {
     }
 }
 
+/// The filesystem's own name for a root Arc compares other paths against.
+///
+/// Only the two roots go through this, never observed paths: those must keep
+/// the name the program actually used, symlinks included. The roots are
+/// different. They arrive from different places — the project root by walking
+/// up from the working directory, the Arc home from `ARC_HOME` or a default —
+/// and two spellings of the same directory make `under` answer no.
+///
+/// That is not cosmetic. An Arc home inside the project that fails to be
+/// recognised as Arc's own is scanned as project content, and on Windows the
+/// scan then tries to hash the database this process has open and locked. The
+/// two spellings that occur in practice are 8.3 short names on Windows
+/// (`RUNNER~1`) and macOS's `/var` symlink to `/private/var`.
+///
+/// The home may not exist yet on a first run, so the deepest ancestor that does
+/// exist is canonicalised and the rest re-joined lexically.
+pub(crate) fn canonical_root(p: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut here = p;
+    loop {
+        if let Ok(real) = here.canonicalize() {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        match (here.file_name(), here.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                here = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
 /// True when `child` is `root` or lies beneath it. Compares whole segments, so
 /// `/repo-old` is not treated as being inside `/repo`.
-fn under(child: &PathKey, root: &PathKey) -> bool {
+pub(crate) fn under(child: &PathKey, root: &PathKey) -> bool {
     let (c, r) = (child.as_str(), root.as_str());
     let r = r.strip_suffix('/').unwrap_or(r);
     c == r || (c.len() > r.len() && c.starts_with(r) && c.as_bytes()[r.len()] == b'/')

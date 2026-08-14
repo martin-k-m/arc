@@ -1,6 +1,7 @@
 //! Input discovery and fingerprinting.
 
 use crate::hash::{hash_bytes, hash_file, Digest, Hasher};
+use crate::paths::{canonical_root, under, PathKey};
 use crate::project::{Config, DEFAULT_EXCLUDES};
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -66,6 +67,29 @@ pub fn scan_inputs(
     let include = build_globs(&cfg.inputs.include)?;
     let use_include = !cfg.inputs.include.is_empty();
 
+    // `skip` arrives from configuration and the environment; the walk produces
+    // paths derived from `root`. Two spellings of one directory — an 8.3 short
+    // name on Windows, macOS's /var symlink to /private/var, or different
+    // capitalisation — make a plain prefix test answer no. That is not a
+    // cosmetic miss: an Arc home that escapes this list is scanned as project
+    // content, and Arc then tries to hash the database it has open.
+    //
+    // Resolved once, into project-relative prefixes, so the test inside the
+    // walk stays a string comparison — canonicalising per entry would cost a
+    // syscall for every file in the project.
+    let skip: Vec<String> = {
+        let root_key = PathKey::of(&canonical_root(root));
+        let root_len = root_key.as_str().len();
+        skip.iter()
+            .filter_map(|s| {
+                let key = PathKey::of(&canonical_root(s));
+                under(&key, &root_key)
+                    .then(|| key.as_str()[root_len..].trim_start_matches('/').to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
     // The real path is carried alongside its display form. On Unix a filename
     // is bytes, not text, so re-deriving the path from a lossy string would make
     // Arc unable to open the very file it just found.
@@ -83,9 +107,6 @@ pub fn scan_inputs(
         let Some(ft) = entry.file_type() else {
             continue;
         };
-        if skip.iter().any(|s| entry.path().starts_with(s)) {
-            continue;
-        }
         if ft.is_dir() {
             continue;
         }
@@ -94,6 +115,14 @@ pub fn scan_inputs(
         };
         let display = rel.to_string_lossy().replace('\\', "/");
         if display.is_empty() || exclude.is_match(&display) {
+            continue;
+        }
+        let folded = PathKey::from_display(&display);
+        let folded = folded.as_str();
+        if skip
+            .iter()
+            .any(|s| folded == s || folded.starts_with(s) && folded[s.len()..].starts_with('/'))
+        {
             continue;
         }
         if use_include && !include.is_match(&display) {

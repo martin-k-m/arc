@@ -225,6 +225,49 @@ fn arc_never_fingerprints_its_own_cache_directory() {
     assert!(stderr(&call(&[])).contains("CACHE HIT"));
 }
 
+/// The same directory, spelled two ways.
+///
+/// `ARC_HOME` and the project root reach Arc from different places, so they can
+/// disagree about how to name one directory: macOS resolves `/var` to
+/// `/private/var`, and Windows hands out 8.3 short names like `RUNNER~1`. When
+/// the home is inside the project and that comparison fails, Arc scans its own
+/// database as project content — a miss at best, and on Windows a hard error,
+/// because the file is locked by the process reading it.
+#[cfg(unix)]
+#[test]
+fn an_arc_home_spelled_differently_is_still_recognised_as_arcs_own() {
+    let sb = Sandbox::new();
+    let real = sb.root.join("home-real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = sb.root.join("home-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // Pinned to the conservative backend on purpose: with complete tracing the
+    // fingerprint is narrowed to what the command read and the home is never
+    // scanned, so the bug cannot appear. This is the path Windows and macOS
+    // take on every run.
+    let cmd = echo("x");
+    let call = || {
+        let mut args: Vec<&str> = vec!["run", "--trace-backend", "snapshot"];
+        args.extend(cmd.iter().map(|s| s.as_str()));
+        Command::new(ARC)
+            .args(&args)
+            .current_dir(&sb.root)
+            .env("ARC_HOME", &link)
+            .output()
+            .unwrap()
+    };
+    let first = call();
+    assert!(first.status.success(), "{}", stderr(&first));
+    let second = call();
+    assert!(
+        stderr(&second).contains("CACHE HIT"),
+        "Arc fingerprinted its own home when the path was spelled differently:
+{}",
+        stderr(&second)
+    );
+}
+
 #[test]
 fn history_inspect_and_stats_report_real_executions() {
     let sb = Sandbox::new();
