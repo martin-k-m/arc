@@ -250,3 +250,44 @@ informs selection only — it never narrows a cache key.
 There is no remote execution, no worker registration, no object enumeration, no
 namespace listing and no deletion. A client learns object digests only from
 records it is allowed to read.
+
+## Environments
+
+v0.8 adds no endpoint. An environment manifest is a CAS object whose digest is
+its `EnvironmentId`, so it is published and fetched through
+`POST /v1/{namespace}/objects/{digest}` and `GET /v1/{namespace}/objects/{digest}`
+like any other object, and verified the same way.
+
+`GET /v1/exec/capabilities` gains two optional fields:
+
+```json
+{
+  "features": ["environment"],
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "libc": "gnu",
+    "sandbox": ["workspace", "home", "tmp", "process-group", "readonly-environment"]
+  }
+}
+```
+
+Both default to absent, so a v0.7 worker parses as a worker with no features and
+no declared host capability — which is exactly what it is.
+
+`POST /v1/exec/{namespace}/jobs` gains one optional field:
+
+```json
+{ "environment": "8ac3…64 hex chars" }
+```
+
+A request carrying it against a worker that does not advertise `environment` is
+refused with `422` and a stated reason, and the client runs the command locally.
+The field is an id and never a description: the worker reads the manifest from
+the shared cache under that digest and verifies it, so a coordinator cannot make
+a worker build an environment of the coordinator's choosing.
+
+Ordering is the same invariant as everywhere else in Arc: objects first, then the
+thing that references them. `arc env capture --publish` uploads every object the
+manifest names and the manifest itself; a manifest is only a promise its objects
+can be fetched once they can be.

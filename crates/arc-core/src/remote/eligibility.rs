@@ -7,6 +7,7 @@
 
 use super::execution::{Capabilities, ToolRequirement};
 use crate::dependency::{Completeness, DependencySet, Narrow};
+use crate::environment::EnvironmentManifest;
 use crate::key::{looks_secret, EnvFingerprint};
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,12 @@ pub struct Candidate<'a> {
     pub env: &'a EnvFingerprint,
     /// Variables the project explicitly allows sending to a worker.
     pub allow_env: &'a [String],
+    /// The Arc environment this command runs inside, when one is configured.
+    ///
+    /// With one, worker eligibility stops being "does this machine already have
+    /// the same compiler" and becomes "can this machine run this environment" —
+    /// which is the entire point of v0.8.
+    pub environment: Option<&'a EnvironmentManifest>,
 }
 
 pub fn can_remote_execute(c: &Candidate<'_>, caps: &Capabilities) -> Eligibility {
@@ -94,6 +101,29 @@ pub fn can_remote_execute(c: &Candidate<'_>, caps: &Capabilities) -> Eligibility
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
+    }
+    if let Some(m) = c.environment {
+        if !caps.has(super::execution::FEATURE_ENVIRONMENT) {
+            return no("this worker cannot materialise Arc environments".into());
+        }
+        // What the client can check here is the coarse claim. Whether the
+        // worker's host really has the loader and system libraries the
+        // environment needs is rechecked there, where the answer is knowable.
+        if let Some(host) = &caps.host {
+            if let Err(e) = crate::environment::host::supports(host, &m.host) {
+                return no(e);
+            }
+        }
+        if m.completeness != crate::environment::Completeness::Complete {
+            return no(format!(
+                "environment is {} ({})",
+                m.completeness.label(),
+                m.gaps
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("unspecified gap")
+            ));
+        }
     }
 
     // An argument naming a path on *this* machine cannot mean the same thing on
@@ -168,7 +198,14 @@ pub fn tool_requirements(
     program_digest: &str,
     deps: &DependencySet,
     complete: bool,
+    environment: bool,
 ) -> Vec<ToolRequirement> {
+    // An environment *is* the tool requirement. Asking a worker to also hold
+    // matching host binaries would defeat the point: the whole reason it can
+    // run this command is that it does not need them.
+    if environment {
+        return Vec::new();
+    }
     let mut out = vec![ToolRequirement {
         program: program.to_string(),
         digest: program_digest.to_string(),
@@ -248,6 +285,8 @@ mod tests {
             queued: 0,
             network: NetworkPolicy::Unrestricted,
             cache_endpoint: None,
+            features: vec![super::super::execution::FEATURE_ENVIRONMENT.into()],
+            host: Some(crate::environment::host_capability()),
         }
     }
 
@@ -296,6 +335,7 @@ mod tests {
                     dep_state: Completeness::Unsupported,
                     env: &self.env,
                     allow_env: &self.allow,
+                    environment: None,
                 },
                 &caps(),
             )
@@ -398,6 +438,7 @@ mod tests {
                     dep_state: Completeness::Unsupported,
                     env: &f.env,
                     allow_env: &[],
+                    environment: None,
                 },
                 &c,
             )
@@ -421,12 +462,15 @@ mod tests {
                 digest: "b".repeat(64),
             },
         ];
-        let tools = tool_requirements("sh", &"c".repeat(64), &deps, true);
+        let tools = tool_requirements("sh", &"c".repeat(64), &deps, true, false);
         assert_eq!(tools.len(), 3);
         assert_eq!(tools[0].program, "sh");
 
         // Without a complete trace Arc only knows about the program itself.
-        let tools = tool_requirements("sh", &"c".repeat(64), &deps, false);
+        let tools = tool_requirements("sh", &"c".repeat(64), &deps, false, false);
         assert_eq!(tools.len(), 1);
+
+        // Inside an environment there are no host tools to match at all.
+        assert!(tool_requirements("sh", &"c".repeat(64), &deps, true, true).is_empty());
     }
 }

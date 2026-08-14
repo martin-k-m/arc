@@ -463,6 +463,10 @@ the command read something outside the project, or when any executable it needs
 is not byte-identical on the worker. Executables are matched by content, never
 by a version string.
 
+A command with an [environment](#giving-a-command-an-environment) is not held to
+that last rule: the worker does not need the toolchain, because the environment
+*is* the toolchain. It needs only a host that can run it.
+
 What crosses the wire is exactly what Arc fingerprinted, referenced by digest,
 fetched by the worker from the shared cache. A second execution over the same
 inputs transfers nothing.
@@ -482,6 +486,94 @@ idempotent on the execution key, and the rest wait for the first.
 [docs/remote-execution.md](docs/remote-execution.md) covers the protocol,
 eligibility, the sandbox, and the failure modes.
 `scripts/remote-exec-demo.sh` runs all of it locally.
+
+## Giving a command an environment
+
+A cache hit means "the same inputs". Without help, "the same toolchain" means
+"the machine happened to have the same compiler installed". An Arc environment
+replaces that coincidence with content.
+
+```toml
+[environment.rust]
+tools = ["cargo", "rustc"]
+env = { RUST_BACKTRACE = "1" }
+
+[[environment.rust.tree]]
+from = "~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu"
+to = "rust"
+exclude = ["**/doc/**"]
+
+[[command]]
+name = "test"
+command = "cargo"
+args = ["test"]
+environment = "rust"
+```
+
+```bash
+arc env capture rust          # captures the bytes, pins the id in arc-env.lock
+arc run cargo test
+```
+
+```text
+◆ ENVIRONMENT  rust · 8ac31f04b2d7
+  hermetic: nothing outside the environment
+```
+
+The environment's id is the digest of a manifest that names every file by
+content, so it does not depend on the alias, the hostname, or the path it was
+captured from. That id enters the execution key: a result built under one
+environment is never served to a run under another.
+
+A command with an environment resolves its program **inside** it, gets a `PATH`
+built only from it, and gets `HOME`, `TMPDIR` and the `XDG_*` directories pointed
+somewhere Arc owns. If the environment does not provide a tool, the run fails —
+there is no silent fallback to the host's copy, because that would put the
+machine back into the answer.
+
+Commit `arc-env.lock` and a worker with no Rust installed can run your Rust
+build: it fetches the environment from the shared cache by digest, verifies every
+object, materialises it once, and reuses it for every job afterwards.
+
+```text
+worker host:            environment 8ac31f04b2d7:
+  no cargo, no rustc      cargo, rustc, the toolchain's own libraries
+  glibc, a loader   ───▶  + a deterministic PATH
+                          = the build runs
+```
+
+**Arc packages userspace, not kernels and not the C library.** A library that
+resolves to a system directory is recorded as a host requirement by soname; one
+that belongs to the toolchain is captured. So an environment needs a host with
+the same OS, architecture and libc flavour, a dynamic loader where the captured
+binaries expect one, and the recorded system libraries present. All of that is
+checked, and a worker that cannot satisfy it sends the work back rather than
+running something else.
+
+Using an environment does not by itself make an execution hermetic, and Arc does
+not pretend otherwise. Under complete tracing it reports per run whether the
+command stayed inside the environment (`hermetic`), read host state it does not
+supply (`host-dependent`, with the paths), or was not fully observed (`unknown`).
+
+A real Rust toolchain, in a `rust:1` container (`scripts/env-bench.sh`, medians
+of 5; 605 MB, 135 files):
+
+| | |
+| --- | --- |
+| Capture | 1.6 s |
+| Capture and publish to the shared cache | 4.0 s |
+| Remote execution, cold worker (fetches all 605 MB) | 2.0 s |
+| **Remote execution, warm worker** | **288 ms** |
+| Remote cache hit | 0 ms |
+| Ten tasks, one cold environment | 24.8 s, one materialisation |
+
+The cold number is the price of portability and is paid once per worker per
+environment. The warm number is the one that decides whether it is worth it.
+
+[docs/environments.md](docs/environments.md) covers capture, the runtime closure
+model, the compatibility contract, worker materialisation, and the limits.
+`scripts/env-demo.sh` runs the whole thing locally, including a worker with no
+Rust on its PATH.
 
 ## Continuous integration
 
@@ -666,7 +758,10 @@ explicit completeness and structured downgrade reasons; process-tree and write
 observation on Windows; a verified remote cache with a reference server, so one
 machine's result is another machine's hit; shared task knowledge, so a fresh CI
 runner can prove work unnecessary without having run it once; remote execution
-of cache misses on compatible workers, with a reference worker; branch-aware CI
+of cache misses on compatible workers, with a reference worker; content-addressed
+execution environments that let a worker with no toolchain installed run the
+build, with deterministic PATH, isolated HOME/TMP, and per-execution hermeticity
+reporting; branch-aware CI
 selection with GitHub Actions support, fork-safe cache-write policy and job
 summaries; the dependency graph; `arc affected` against Git; cache
 statistics, LRU pruning, garbage collection, integrity verification; execution
@@ -674,7 +769,10 @@ history and inspection; JSON output for tooling; and safe concurrent use from
 several terminals.
 
 Not built, and deliberately not stubbed: read-capable tracing on macOS or
-Windows (and therefore automatic narrowing there), hermetic worker environments,
+Windows (and therefore automatic narrowing there), environment portability on
+macOS or Windows (capture and materialisation work; runtime-closure discovery and
+hermeticity reporting do not, so use host mode there), packaging of the kernel or
+the C library, downloading toolchains from anywhere,
 container or VM management for workers, distributed worker scheduling, cloud
 storage backends for the cache server, and any agent protocol. `arc doctor` reports capabilities honestly.
 

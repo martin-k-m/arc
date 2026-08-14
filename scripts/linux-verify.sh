@@ -24,3 +24,7 @@ bash scripts/remote-exec-demo.sh 2>&1 | tail -70
 echo LINUX_DEMO_DONE
 bash scripts/exec-bench.sh 2>&1 | tail -50
 echo LINUX_EXEC_BENCH_DONE
+bash scripts/env-demo.sh 2>&1 | tail -70
+echo LINUX_ENV_DEMO_DONE
+bash scripts/env-bench.sh 2>&1 | tail -60
+echo LINUX_ENV_BENCH_DONE

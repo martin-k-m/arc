@@ -158,6 +158,11 @@ enum Cmd {
         #[command(subcommand)]
         command: CacheCmd,
     },
+    /// Capture and inspect execution environments
+    Env {
+        #[command(subcommand)]
+        command: EnvCmd,
+    },
     /// Inspect the configured remote cache
     Remote {
         #[command(subcommand)]
@@ -204,6 +209,41 @@ enum CacheCmd {
     Verify,
     /// Delete every cache entry and stored object
     Clear,
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// Capture the tools an [environment.<alias>] block names, and pin the id
+    Capture {
+        alias: String,
+        /// Also upload the environment to the remote cache, so a worker or
+        /// another machine can materialise it without this one
+        #[arg(long)]
+        publish: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List environments this machine has materialised
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what an environment contains
+    Inspect {
+        /// Alias from arc-env.lock, or an environment id
+        name: String,
+        /// List every captured file rather than a summary
+        #[arg(long)]
+        files: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-hash every object an environment names and prove it materialises
+    Verify { name: String },
+    /// Compare each pinned alias against what capturing it here would produce
+    Status,
+    /// Remove materialised environments no longer pinned by this project
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +382,7 @@ fn real_main() -> Result<i32> {
         Cmd::History { limit, json } => cmd_history(&home, limit, json).map(|_| 0),
         Cmd::Inspect { id, json } => cmd_inspect(&home, &id, json).map(|_| 0),
         Cmd::Cache { command } => cmd_cache(&home, &cwd, command).map(|_| 0),
+        Cmd::Env { command } => cmd_env(&home, &cwd, command),
         Cmd::Remote { command } => cmd_remote(&cwd, command),
         Cmd::Doctor => cmd_doctor(&home, &cwd).map(|_| 0),
         Cmd::Config { command } => match command {
@@ -488,6 +529,53 @@ fn cmd_run(
         }
     }
 
+    if let Some(env) = &report.environment {
+        eprintln!();
+        eprintln!(
+            "{} {}  {} {} {}",
+            ui::brand(ui::MARK),
+            ui::badge("ENVIRONMENT"),
+            ui::accent(&env.alias),
+            ui::dim("·"),
+            ui::dim(&env.id[..12])
+        );
+        if !env.reused {
+            eprintln!(
+                "  {}",
+                ui::dim(&format!(
+                    "materialised {}",
+                    ui::bytes(env.materialised_bytes)
+                ))
+            );
+        }
+        match env.hermeticity.as_str() {
+            "" => {}
+            "hermetic" => eprintln!(
+                "  {}",
+                ui::green("hermetic: nothing outside the environment")
+            ),
+            "unknown" => eprintln!(
+                "  {}",
+                ui::dim("hermeticity unknown: the execution was not completely observed")
+            ),
+            _ => {
+                eprintln!(
+                    "  {}",
+                    ui::yellow("host-dependent: this run read host state")
+                );
+                for l in env.leaks.iter().take(5) {
+                    eprintln!("    {}", ui::dim(l));
+                }
+                if env.leaks.len() > 5 {
+                    eprintln!(
+                        "    {}",
+                        ui::dim(&format!("and {} more", env.leaks.len() - 5))
+                    );
+                }
+            }
+        }
+    }
+
     // A remote problem is worth one line and no more: the command itself has
     // already been served correctly either way.
     if let Some(e) = report.remote.as_ref().and_then(|r| r.error.as_ref()) {
@@ -520,6 +608,15 @@ fn cmd_run(
                 "queued_ms": report.remote_execution.as_ref().map(|x| x.queued_ms).unwrap_or(0),
                 "timings": report.remote_execution.as_ref().and_then(|x| x.timings.clone()),
             },
+            "environment": report.environment.as_ref().map(|env| serde_json::json!({
+                "alias": env.alias,
+                "id": env.id,
+                "completeness": env.completeness,
+                "hermeticity": env.hermeticity,
+                "leaks": env.leaks,
+                "materialised_bytes": env.materialised_bytes,
+                "reused": env.reused,
+            })),
             "remote": report.remote.as_ref().map(|rr| serde_json::json!({
                 "endpoint": rr.endpoint,
                 "namespace": rr.namespace,
@@ -605,6 +702,16 @@ fn render_explain(project: &Project, home: &Path, report: &engine::RunReport) ->
                 }
             )
         );
+    }
+    if !e.environment.is_empty() {
+        eprintln!("{}", ui::row("environment", &ui::accent(&e.environment)));
+        eprintln!("{}", ui::row("environment id", &ui::dim(&e.environment_id)));
+        if !e.hermeticity.is_empty() {
+            eprintln!(
+                "{}",
+                ui::row("hermeticity", &ui::completeness_color(&e.hermeticity))
+            );
+        }
     }
     if !e.remote_execution.is_empty() && e.remote_execution != "not enabled" {
         eprintln!(
@@ -1674,6 +1781,15 @@ fn cmd_inspect(home: &Path, id: &str, json: bool) -> Result<()> {
             ),
         );
     }
+    if let Some(env) = &rec.environment {
+        ui::field(
+            "Environment",
+            &format!("{} ({})", env.alias, short(&env.id)),
+        );
+        if !env.hermeticity.is_empty() {
+            ui::field("Hermeticity", &env.hermeticity);
+        }
+    }
     if let Some(from) = &rec.replayed_from {
         ui::field("Replayed from", from);
         ui::field("Cache source", rec.cache_source.label());
@@ -2011,6 +2127,348 @@ fn render_execution(cwd: &Path) {
     }
 }
 
+// ------------------------------------------------------------ environments --
+
+fn cmd_env(home: &Path, cwd: &Path, command: EnvCmd) -> Result<i32> {
+    use arc_core::environment as env;
+    let project = Project::discover(cwd)?;
+    let store = Store::open(home)?;
+
+    match command {
+        EnvCmd::Capture {
+            alias,
+            publish,
+            json,
+        } => {
+            let cfg = project.config.environment.get(&alias).with_context(|| {
+                format!(
+                    "no [environment.{alias}] block in {}",
+                    project
+                        .config_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "arc.toml".into())
+                )
+            })?;
+            let mut spinner = ui::Spinner::start("capturing");
+            let captured = env::capture::capture(&env::capture::Spec::from_config(cfg), &store);
+            spinner.stop();
+            let captured = captured?;
+            let id = env::store_manifest(&captured.manifest, &store)?;
+
+            let mut lock = env::lock::Lock::load(&project.root)?;
+            let previous = lock.get(&alias).map(str::to_string);
+            lock.set(&alias, &id)?;
+            let lock_path = lock.save(&project.root)?;
+
+            let published = if publish {
+                let r = Remote::open(&project.config.remote)
+                    .map_err(|d| anyhow::anyhow!("cannot publish: {}", d.reason()))?;
+                let mut digests = captured.manifest.digests();
+                digests.push(id.clone());
+                r.upload(&store, &digests)?;
+                true
+            } else {
+                false
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "alias": alias,
+                        "id": id,
+                        "previous": previous,
+                        "files": captured.files,
+                        "bytes": captured.bytes,
+                        "tools": captured.manifest.tools.len(),
+                        "completeness": captured.manifest.completeness.label(),
+                        "gaps": captured.manifest.gaps,
+                        "capture_ms": captured.elapsed_ms,
+                        "published": published,
+                    }))?
+                );
+                return Ok(0);
+            }
+
+            print!("{}", ui::banner("ENVIRONMENT CAPTURED"));
+            println!("{}", ui::row("alias", &ui::accent(&alias)));
+            println!("{}", ui::row("id", &captured.id));
+            println!("{}", ui::row("files", &captured.files.to_string()));
+            println!("{}", ui::row("bytes", &ui::bytes(captured.bytes)));
+            println!(
+                "{}",
+                ui::row("tools", &captured.manifest.tools.len().to_string())
+            );
+            println!(
+                "{}",
+                ui::row(
+                    "completeness",
+                    &ui::completeness_color(captured.manifest.completeness.label())
+                )
+            );
+            for gap in &captured.manifest.gaps {
+                println!("{}", ui::row("gap", &ui::yellow(gap)));
+            }
+            println!(
+                "{}",
+                ui::row("captured in", &ui::duration(captured.elapsed_ms))
+            );
+            println!("{}", ui::row("pinned in", &lock_path.display().to_string()));
+            if published {
+                println!("{}", ui::row("published", &ui::green("yes")));
+            }
+            if previous.as_deref() == Some(id.as_str()) {
+                println!("\n{}", ui::dim("unchanged: nothing on this machine moved"));
+            } else if previous.is_some() {
+                println!(
+                    "\n{}",
+                    ui::yellow(
+                        "the id changed, so results built under the old one will not be reused"
+                    )
+                );
+            }
+            println!();
+            Ok(0)
+        }
+
+        EnvCmd::List { json } => {
+            let envs = env::Environments::open(home)?;
+            let materialised = envs.list()?;
+            let lock = env::lock::Lock::load(&project.root)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "pinned": lock.environments,
+                        "materialised": materialised
+                            .iter()
+                            .map(|(id, bytes)| serde_json::json!({"id": id, "bytes": bytes}))
+                            .collect::<Vec<_>>(),
+                    }))?
+                );
+                return Ok(0);
+            }
+            print!("{}", ui::banner("ENVIRONMENTS"));
+            if lock.environments.is_empty() {
+                println!(
+                    "{}",
+                    ui::dim("  no environments are pinned by this project")
+                );
+            }
+            for (alias, id) in &lock.environments {
+                let state = if envs.ready(id) {
+                    ui::green("materialised")
+                } else {
+                    ui::dim("not materialised here")
+                };
+                println!("  {}  {}  {}", ui::accent(alias), &id[..12], state);
+            }
+            let unpinned: Vec<&(String, u64)> = materialised
+                .iter()
+                .filter(|(id, _)| !lock.environments.values().any(|v| v == id))
+                .collect();
+            if !unpinned.is_empty() {
+                println!("\n{}", ui::bold("materialised but not pinned here"));
+                for (id, bytes) in unpinned {
+                    println!("  {}  {}", &id[..12], ui::bytes(*bytes));
+                }
+            }
+            println!();
+            Ok(0)
+        }
+
+        EnvCmd::Inspect { name, files, json } => {
+            let id = resolve_env_name(&project, &name)?;
+            let m = env::load_manifest(&id, &store)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "id": id,
+                        "os": m.os,
+                        "arch": m.arch,
+                        "tools": m.tools,
+                        "files": m.files.len(),
+                        "bytes": m.total_bytes(),
+                        "objects": m.digests().len(),
+                        "path": m.path_entries,
+                        "library_path": m.library_path,
+                        "env": m.env,
+                        "host": m.host,
+                        "completeness": m.completeness.label(),
+                        "gaps": m.gaps,
+                    }))?
+                );
+                return Ok(0);
+            }
+            print!("{}", ui::banner("ENVIRONMENT"));
+            println!("{}", ui::row("id", &id));
+            println!("{}", ui::row("platform", &format!("{} / {}", m.os, m.arch)));
+            println!("{}", ui::row("files", &m.files.len().to_string()));
+            println!("{}", ui::row("objects", &m.digests().len().to_string()));
+            println!("{}", ui::row("bytes", &ui::bytes(m.total_bytes())));
+            println!(
+                "{}",
+                ui::row(
+                    "completeness",
+                    &ui::completeness_color(m.completeness.label())
+                )
+            );
+            println!("\n{}\n", ui::bold("tools"));
+            for t in &m.tools {
+                println!("  {}  {}  {}", ui::accent(&t.name), t.rel, &t.digest[..12]);
+            }
+            println!("\n{}\n", ui::bold("execution"));
+            println!("{}", ui::row("PATH", &m.path_entries.join(":")));
+            if !m.library_path.is_empty() {
+                println!("{}", ui::row("library path", &m.library_path.join(":")));
+            }
+            for (k, v) in &m.env {
+                println!("{}", ui::row(k, v));
+            }
+            println!("\n{}\n", ui::bold("host requirements"));
+            println!("{}", ui::row("libc", &m.host.libc));
+            for i in &m.host.interpreters {
+                println!("{}", ui::row("loader", i));
+            }
+            if !m.host.libraries.is_empty() {
+                println!(
+                    "{}",
+                    ui::row("system libraries", &m.host.libraries.join(", "))
+                );
+            }
+            for gap in &m.gaps {
+                println!("{}", ui::row("gap", &ui::yellow(gap)));
+            }
+            if files {
+                println!("\n{}\n", ui::bold("files"));
+                for f in &m.files {
+                    let what = match &f.link {
+                        Some(t) => format!("-> {t}"),
+                        None => format!("{}  {}", &f.digest[..12], ui::bytes(f.size)),
+                    };
+                    println!("  {}  {}", f.path.v, ui::dim(&what));
+                }
+            }
+            println!();
+            Ok(0)
+        }
+
+        EnvCmd::Verify { name } => {
+            let id = resolve_env_name(&project, &name)?;
+            let m = env::load_manifest(&id, &store)?;
+            print!("{}", ui::banner("ENVIRONMENT VERIFY"));
+            println!("{}", ui::row("id", &id));
+            let mut missing = Vec::new();
+            let mut corrupt = Vec::new();
+            for d in m.digests() {
+                let parsed = arc_core::hash::Digest::parse(&d)?;
+                if !store.exists(&parsed) {
+                    missing.push(d);
+                } else if let Ok(Some(actual)) = store.verify(&parsed) {
+                    corrupt.push(format!("{} is {}", &d[..12], actual.short()));
+                }
+            }
+            println!("{}", ui::row("objects", &m.digests().len().to_string()));
+            println!("{}", ui::row("missing", &missing.len().to_string()));
+            println!("{}", ui::row("corrupt", &corrupt.len().to_string()));
+            for c in &corrupt {
+                println!("{}", ui::row("", &ui::red(c)));
+            }
+            if !missing.is_empty() || !corrupt.is_empty() {
+                println!("\n{} environment cannot be trusted\n", ui::red(ui::MARK));
+                return Ok(1);
+            }
+            match env::Environments::open(home)?.materialise(&m, &store) {
+                Ok(e) => {
+                    println!("{}", ui::row("materialises", &ui::green("yes")));
+                    println!("{}", ui::row("root", &e.root.display().to_string()));
+                }
+                Err(e) => {
+                    println!("{}", ui::row("materialises", &ui::red(&format!("{e:#}"))));
+                    return Ok(1);
+                }
+            }
+            println!();
+            Ok(0)
+        }
+
+        EnvCmd::Status => {
+            let lock = env::lock::Lock::load(&project.root)?;
+            print!("{}", ui::banner("ENVIRONMENT STATUS"));
+            if lock.environments.is_empty() {
+                println!("{}\n", ui::dim("  nothing pinned"));
+                return Ok(0);
+            }
+            let mut stale = 0;
+            for (alias, id) in &lock.environments {
+                let Some(cfg) = project.config.environment.get(alias) else {
+                    println!(
+                        "  {}  {}",
+                        ui::accent(alias),
+                        ui::yellow("pinned but no [environment] block defines it")
+                    );
+                    continue;
+                };
+                // Re-capturing is the only honest comparison: an environment is
+                // its content, and nothing cheaper can tell whether this machine
+                // still produces the same content.
+                match env::capture::capture(&env::capture::Spec::from_config(cfg), &store) {
+                    Ok(now) if now.id == *id => {
+                        println!("  {}  {}", ui::accent(alias), ui::green("current"))
+                    }
+                    Ok(now) => {
+                        stale += 1;
+                        println!(
+                            "  {}  {} (this machine would capture {})",
+                            ui::accent(alias),
+                            ui::yellow("differs"),
+                            &now.id[..12]
+                        );
+                    }
+                    Err(e) => println!("  {}  {}", ui::accent(alias), ui::red(&format!("{e:#}"))),
+                }
+            }
+            if stale > 0 {
+                println!(
+                    "\n{}",
+                    ui::dim(
+                        "`arc env capture <alias>` re-pins; results under the old id stay cached"
+                    )
+                );
+            }
+            println!();
+            Ok(0)
+        }
+
+        EnvCmd::Gc => {
+            let lock = env::lock::Lock::load(&project.root)?;
+            let keep: BTreeSet<String> = lock.environments.values().cloned().collect();
+            let removed = env::Environments::open(home)?.gc(&keep)?;
+            print!("{}", ui::banner("ENVIRONMENT GC"));
+            println!("{}", ui::row("kept", &keep.len().to_string()));
+            println!("{}", ui::row("removed", &removed.len().to_string()));
+            for id in &removed {
+                println!("{}", ui::row("", &ui::dim(&id[..12])));
+            }
+            println!();
+            Ok(0)
+        }
+    }
+}
+
+/// An alias from the lock file, or an id given directly.
+fn resolve_env_name(project: &Project, name: &str) -> Result<String> {
+    if arc_core::environment::materialise::valid_id(name) {
+        return Ok(name.to_string());
+    }
+    let lock = arc_core::environment::lock::Lock::load(&project.root)?;
+    lock.get(name).map(str::to_string).with_context(|| {
+        format!("`{name}` is not an environment id and is not pinned in arc-env.lock")
+    })
+}
+
 fn cmd_remote(cwd: &Path, command: RemoteCmd) -> Result<i32> {
     let (cfg, opened) = remote_for(cwd)?;
     match command {
@@ -2171,6 +2629,41 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
             &check(arc_core::key::which("git", cwd).is_some())
         )
     );
+
+    let envs = arc_core::environment::Environments::open(home)
+        .and_then(|e| e.list())
+        .unwrap_or_default();
+    let lock = arc_core::environment::lock::Lock::load(&project.root).unwrap_or_default();
+    println!("\n{}\n", ui::bold("environments"));
+    println!(
+        "{}",
+        ui::row("configured", &project.config.environment.len().to_string())
+    );
+    println!(
+        "{}",
+        ui::row("pinned", &lock.environments.len().to_string())
+    );
+    // Deliberately from stored state: proving an environment is intact means
+    // re-hashing every object in it, which is `arc env verify`, not `doctor`.
+    println!("{}", ui::row("materialised here", &envs.len().to_string()));
+    println!(
+        "{}",
+        ui::row(
+            "on disk",
+            &ui::bytes(envs.iter().map(|(_, b)| b).sum::<u64>())
+        )
+    );
+    let host = arc_core::environment::host_capability();
+    println!("{}", ui::row("host userspace", &host.libc));
+    println!("{}", ui::row("sandbox", &host.sandbox.join(", ")));
+    for (alias, id) in &lock.environments {
+        let state = if envs.iter().any(|(m, _)| m == id) {
+            ui::green("ready")
+        } else {
+            ui::dim("not materialised")
+        };
+        println!("{}", ui::row(alias, &format!("{}  {}", &id[..12], state)));
+    }
 
     println!("\n{}\n", ui::bold("tracing"));
     let probe = arc_core::trace::probe();

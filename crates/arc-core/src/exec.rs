@@ -55,6 +55,18 @@ pub trait Supervisor {
 /// A run with no observation at all.
 impl Supervisor for () {}
 
+/// The environment a child is given, when Arc is supplying one rather than
+/// inheriting this process's.
+///
+/// `clear` is the whole point: an execution environment that merely *adds* to
+/// the ambient environment is not an execution environment, because whatever
+/// the caller happened to export would still reach the command.
+#[derive(Debug, Default, Clone)]
+pub struct ChildEnv {
+    pub clear: bool,
+    pub vars: Vec<(String, String)>,
+}
+
 /// Run `program` with `args` in `cwd`. Output is streamed to this process's
 /// stdout/stderr as it arrives and, when `capture` is set, copied into memory.
 pub fn run(
@@ -63,9 +75,10 @@ pub fn run(
     cwd: &Path,
     capture: bool,
     sup: &mut dyn Supervisor,
+    env: Option<&ChildEnv>,
 ) -> Result<Outcome> {
     let start = Instant::now();
-    let (mut child, traced) = spawn(program, args, cwd, capture, sup)?;
+    let (mut child, traced) = spawn(program, args, cwd, capture, sup, env)?;
     let pid = child.id();
     sup.on_spawn(pid);
 
@@ -121,12 +134,21 @@ fn spawn(
     cwd: &Path,
     capture: bool,
     sup: &mut dyn Supervisor,
+    env: Option<&ChildEnv>,
 ) -> Result<(std::process::Child, bool)> {
     let build = || {
         let mut cmd = Command::new(program);
         cmd.args(args).current_dir(cwd);
         if capture {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        if let Some(e) = env {
+            if e.clear {
+                cmd.env_clear();
+            }
+            for (k, v) in &e.vars {
+                cmd.env(k, v);
+            }
         }
         cmd
     };

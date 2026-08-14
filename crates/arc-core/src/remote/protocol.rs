@@ -51,7 +51,7 @@ pub enum PathEncoding {
 
 /// A project-relative output path. Identity stays bytes; `Utf8` is a
 /// readability convenience, not a promise that all paths are text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WirePath {
     pub enc: PathEncoding,
     pub v: String,

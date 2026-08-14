@@ -54,6 +54,24 @@ pub struct Capabilities {
     /// The shared cache this worker reads inputs from and publishes results to.
     /// A client whose cache differs cannot use this worker.
     pub cache_endpoint: Option<String>,
+    /// Optional protocol extensions this worker implements. Absent means a
+    /// pre-v0.8 worker, which is a reason to fall back and never a reason to
+    /// send it something it will misunderstand.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// What this worker's host can run, as opposed to what it has installed.
+    #[serde(default)]
+    pub host: Option<crate::environment::HostCapability>,
+}
+
+/// Advertised when a worker can materialise an Arc environment and execute
+/// inside it.
+pub const FEATURE_ENVIRONMENT: &str = "environment";
+
+impl Capabilities {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 /// The reference worker isolates the filesystem, the environment and the
@@ -172,6 +190,11 @@ pub struct ExecutionRequest {
     /// Whether a non-zero exit may be published to the shared cache.
     pub cache_failures: bool,
     pub arc_version: String,
+    /// The environment to execute inside, by content id. The worker fetches its
+    /// manifest from the shared cache under this digest, so a coordinator
+    /// cannot describe an environment — only name one.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 impl ExecutionRequest {
@@ -238,6 +261,11 @@ impl ExecutionRequest {
                 return Err("malformed output glob".into());
             }
         }
+        if let Some(id) = &self.environment {
+            if !crate::environment::materialise::valid_id(id) {
+                return Err("malformed environment id".into());
+            }
+        }
         if self.limits.timeout_ms == 0 {
             return Err("timeout must be positive".into());
         }
@@ -265,6 +293,9 @@ impl ExecutionRequest {
                 "worker is {}/{}, this execution needs {}/{}",
                 caps.os, caps.arch, self.os, self.arch
             ));
+        }
+        if self.environment.is_some() && !caps.has(FEATURE_ENVIRONMENT) {
+            return Err("this worker cannot materialise Arc environments".into());
         }
         Ok(())
     }
@@ -494,6 +525,7 @@ mod tests {
             limits: Limits::default(),
             cache_failures: false,
             arc_version: crate::VERSION.into(),
+            environment: None,
         }
     }
 
@@ -512,6 +544,8 @@ mod tests {
             queued: 0,
             network: NetworkPolicy::Unrestricted,
             cache_endpoint: None,
+            features: vec![FEATURE_ENVIRONMENT.into()],
+            host: Some(crate::environment::host_capability()),
         }
     }
 
@@ -568,6 +602,25 @@ mod tests {
     fn a_duplicate_input_entry_is_refused() {
         let mut r = request();
         r.inputs.push(r.inputs[0].clone());
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn an_environment_request_needs_a_worker_that_can_materialise_one() {
+        let mut r = request();
+        r.environment = Some("a".repeat(64));
+        assert!(r.validate().is_ok());
+        assert!(r.compatible_with(&capabilities()).is_ok());
+
+        let mut old = capabilities();
+        old.features.clear();
+        let e = r.compatible_with(&old).unwrap_err();
+        assert!(e.contains("cannot materialise"), "{e}");
+        // A worker without the feature still runs host-mode work.
+        assert!(request().compatible_with(&old).is_ok());
+
+        let mut r = request();
+        r.environment = Some("not-an-id".into());
         assert!(r.validate().is_err());
     }
 

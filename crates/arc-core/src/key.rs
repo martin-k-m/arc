@@ -64,9 +64,22 @@ pub struct EnvFingerprint {
 }
 
 pub fn fingerprint_env(cfg: &Config) -> EnvFingerprint {
+    fingerprint_env_in(cfg, false)
+}
+
+/// `hermetic` means an Arc environment supplies the toolchain.
+///
+/// `PATH` then drops out of the key, because the environment defines it: the
+/// point of v0.8 is that a result built here is reusable on a machine whose
+/// `PATH` looks nothing like this one. Nothing else is removed — a variable the
+/// command genuinely reads still matters wherever it runs.
+pub fn fingerprint_env_in(cfg: &Config, hermetic: bool) -> EnvFingerprint {
     let mut names: Vec<String> = DEFAULT_ENV.iter().map(|s| s.to_string()).collect();
     names.extend(cfg.env.include.iter().cloned());
     names.retain(|n| !cfg.env.exclude.iter().any(|e| e.eq_ignore_ascii_case(n)));
+    if hermetic {
+        names.retain(|n| n != "PATH");
+    }
     names.sort();
     names.dedup();
 
@@ -101,10 +114,23 @@ pub struct Toolchain {
 /// Fingerprint the executable Arc is about to run by hashing its contents,
 /// which is strictly stronger than trusting a `--version` string.
 pub fn fingerprint_toolchain(program: &str, cwd: &Path) -> Result<Toolchain> {
-    let resolved = which(program, cwd);
+    Ok(toolchain_of(program, which(program, cwd).as_deref()))
+}
+
+/// Fingerprint an executable Arc has already resolved — the environment's copy,
+/// when one is in force.
+///
+/// Only the program name, the file name and the *contents* are hashed, never
+/// the directory: an environment materialised under two different Arc homes is
+/// the same toolchain.
+pub fn fingerprint_toolchain_at(program: &str, resolved: &Path) -> Toolchain {
+    toolchain_of(program, Some(resolved))
+}
+
+fn toolchain_of(program: &str, resolved: Option<&Path>) -> Toolchain {
     let mut h = Hasher::new();
     h.field(program);
-    let resolved_path = match &resolved {
+    let resolved_path = match resolved {
         Some(p) => {
             h.field(
                 p.file_name()
@@ -129,11 +155,11 @@ pub fn fingerprint_toolchain(program: &str, cwd: &Path) -> Result<Toolchain> {
             None
         }
     };
-    Ok(Toolchain {
+    Toolchain {
         program: program.to_string(),
         resolved_path,
         digest: h.finish().hex(),
-    })
+    }
 }
 
 /// Resolve a program the way the OS will: relative/absolute paths directly,
@@ -187,6 +213,12 @@ pub struct KeyInputs<'a> {
     /// cause misses.
     pub dependency_digest: &'a Digest,
     pub output_globs: &'a [String],
+    /// The environment this execution runs inside, when Arc supplies one.
+    ///
+    /// Empty means the host's toolchain, and is hashed as nothing at all — so
+    /// every key computed before v0.8 still means what it meant. A result built
+    /// inside an environment can never be served to a run outside it.
+    pub environment_id: &'a str,
 }
 
 pub fn execution_key(k: &KeyInputs<'_>) -> Digest {
@@ -208,6 +240,10 @@ pub fn execution_key(k: &KeyInputs<'_>) -> Digest {
     h.field((k.output_globs.len() as u64).to_le_bytes());
     for g in k.output_globs {
         h.field(g);
+    }
+    if !k.environment_id.is_empty() {
+        h.field(b"environment");
+        h.field(k.environment_id);
     }
     h.finish()
 }
@@ -247,6 +283,7 @@ mod tests {
             toolchain_digest: "t",
             dependency_digest: deps,
             output_globs: &[],
+            environment_id: "",
         })
     }
 
@@ -278,6 +315,42 @@ mod tests {
             key_with(&["test"], &i, &d1, "f1"),
             key_with(&["test"], &i, &d1, "f2")
         );
+    }
+
+    #[test]
+    fn an_environment_participates_in_the_key_and_its_absence_changes_nothing() {
+        let i = hash_bytes(b"1");
+        let d = Digest::default();
+        let base = |env: &str| {
+            execution_key(&KeyInputs {
+                program: "cargo",
+                args: &["test".to_string()],
+                rel_cwd: "",
+                family_key: "f",
+                input_digest: &i,
+                env_digest: "e",
+                toolchain_digest: "t",
+                dependency_digest: &d,
+                output_globs: &[],
+                environment_id: env,
+            })
+        };
+        assert_eq!(base(""), key(&["test"], &i));
+        assert_ne!(base(""), base("8ac"));
+        assert_ne!(base("8ac"), base("9bd"));
+    }
+
+    #[test]
+    fn an_environment_takes_path_out_of_the_key() {
+        let cfg = Config::default();
+        assert!(fingerprint_env_in(&cfg, false)
+            .vars
+            .iter()
+            .any(|v| v.name == "PATH"));
+        assert!(!fingerprint_env_in(&cfg, true)
+            .vars
+            .iter()
+            .any(|v| v.name == "PATH"));
     }
 
     #[test]

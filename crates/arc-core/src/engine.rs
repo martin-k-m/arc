@@ -107,6 +107,17 @@ pub struct Explain {
     /// Why remote execution was or was not used.
     #[serde(default)]
     pub remote_execution: String,
+    /// The alias, if any, of the environment this command ran inside.
+    #[serde(default)]
+    pub environment: String,
+    /// The environment's content identity. Stable across machines, which is the
+    /// whole reason it, rather than the alias, is in the execution key.
+    #[serde(default)]
+    pub environment_id: String,
+    /// What Arc can claim about this *execution*, which is not the same as what
+    /// it can claim about the environment. See `docs/correctness.md`.
+    #[serde(default)]
+    pub hermeticity: String,
     pub inputs_narrowed: bool,
     /// Why narrowing was or was not applied, from the single gate.
     pub narrow_reason: String,
@@ -153,6 +164,23 @@ pub struct RunReport {
     pub dependencies: Option<DependencySet>,
     pub remote: Option<RemoteStatus>,
     pub remote_execution: Option<RemoteExecStatus>,
+    /// Present when this run used an Arc environment.
+    pub environment: Option<EnvironmentStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentStatus {
+    pub alias: String,
+    pub id: String,
+    pub root: String,
+    pub completeness: String,
+    /// Bytes this run had to materialise. Zero once the environment is on the
+    /// machine, which is the case that decides whether v0.8 is worth using.
+    pub materialised_bytes: u64,
+    pub reused: bool,
+    pub hermeticity: String,
+    /// Host paths the command read that the environment does not supply.
+    pub leaks: Vec<String>,
 }
 
 /// What remote execution did, when it was considered at all.
@@ -205,6 +233,18 @@ struct Plan {
     deps: DependencySet,
     dep_state: Completeness,
     narrow: Narrow,
+    /// The Arc environment this command runs inside, when one is configured.
+    /// `None` is the pre-v0.8 behaviour: the host's own toolchain.
+    environment: Option<crate::environment::Selected>,
+}
+
+impl Plan {
+    fn environment_id(&self) -> &str {
+        self.environment
+            .as_ref()
+            .map(|e| e.id.as_str())
+            .unwrap_or("")
+    }
 }
 
 pub fn run(
@@ -219,7 +259,7 @@ pub fn run(
     progress.stage("resolving project");
     let store = Store::open(arc_home)?;
     let db = Db::open(arc_home)?;
-    let plan = plan(project, cwd, program, args, arc_home, &db)?;
+    let plan = plan(project, cwd, program, args, arc_home, &db, &store)?;
 
     let cacheable = !opts.no_cache && plan.cfg.cache.enabled && !opts.no_capture;
     if !cacheable {
@@ -242,8 +282,8 @@ pub fn run(
         plan.narrow.allowed(),
         &mut fps,
     )?;
-    let env = key::fingerprint_env(&plan.cfg);
-    let toolchain = key::fingerprint_toolchain(program, cwd)?;
+    let env = key::fingerprint_env_in(&plan.cfg, plan.environment.is_some());
+    let toolchain = key::fingerprint_toolchain_at(program, &plan.resolved);
     let dep_digest = plan.deps.key_digest();
     let exec_key = key::execution_key(&KeyInputs {
         program,
@@ -255,6 +295,7 @@ pub fn run(
         toolchain_digest: &toolchain.digest,
         dependency_digest: &dep_digest,
         output_globs: &plan.cfg.outputs.include,
+        environment_id: plan.environment_id(),
     });
     let fingerprint_ms = fp_start.elapsed().as_millis() as u64;
     db.save_fingerprints(&plan.project_id, &fps)?;
@@ -280,6 +321,13 @@ pub fn run(
         cache_source: "none".into(),
         execution_source: "none".into(),
         remote_execution: String::new(),
+        environment: plan
+            .environment
+            .as_ref()
+            .map(|e| e.alias.clone())
+            .unwrap_or_default(),
+        environment_id: plan.environment_id().to_string(),
+        hermeticity: String::new(),
         // True whenever Arc has grounds to call some change irrelevant, whether
         // it earned them by observation or was told them in `arc.toml`.
         // `narrow_reason` says which.
@@ -295,6 +343,19 @@ pub fn run(
         .flatten();
     let mut remote_error: Option<String> = None;
     let mut source = CacheSource::Local;
+
+    // A hit reports which environment it was filed under, but claims nothing
+    // about hermeticity: nothing ran, so nothing was observed.
+    let env_status = plan.environment.as_ref().map(|e| EnvironmentStatus {
+        alias: e.alias.clone(),
+        id: e.id.clone(),
+        root: e.materialised.root.to_string_lossy().to_string(),
+        completeness: e.manifest.completeness.label().into(),
+        materialised_bytes: e.materialised.written_bytes,
+        reused: e.materialised.reused,
+        hermeticity: String::new(),
+        leaks: Vec::new(),
+    });
 
     if !opts.refresh {
         let mut local = db.lookup(&exec_key.hex())?;
@@ -366,6 +427,7 @@ pub fn run(
                         dependencies: Some(plan.deps),
                         remote: status(remote.as_ref(), remote_error),
                         remote_execution: None,
+                        environment: env_status,
                     });
                 }
                 // A hit that cannot be safely served is a miss, never a guess.
@@ -439,6 +501,10 @@ pub fn run(
         }
         None => {
             progress.stage("executing");
+            let child_env = match &plan.environment {
+                Some(e) => Some(local_child_env(arc_home, e, &plan.cfg)?),
+                None => None,
+            };
             let tracer = (plan.cfg.trace.enabled || opts.trace)
                 .then(|| trace::start(&project.root, &plan.classifier, opts.backend))
                 .flatten();
@@ -446,7 +512,14 @@ pub fn run(
                 tracer,
                 failures: Vec::new(),
             };
-            let outcome = exec::run(&plan.resolved, args, cwd, true, &mut sup)?;
+            let outcome = exec::run(
+                &plan.resolved,
+                args,
+                cwd,
+                true,
+                &mut sup,
+                child_env.as_ref(),
+            )?;
             let observations = sup.collect();
             explain.execution_source = "local".into();
             progress.stage("capturing outputs");
@@ -467,6 +540,7 @@ pub fn run(
                 *caps,
                 obs,
                 &project.root,
+                &plan.classifier,
                 now,
             );
             let (merged, node) = learn(&db, &plan, fresh, now)?;
@@ -519,12 +593,43 @@ pub fn run(
                 toolchain_digest: &toolchain.digest,
                 dependency_digest: &merged.key_digest(),
                 output_globs: &plan.cfg.outputs.include,
+                environment_id: plan.environment_id(),
             }),
             next_inputs.files.clone(),
             next_inputs.narrowed,
         ),
         None => (exec_key, inputs.files.clone(), inputs.narrowed),
     };
+
+    // Hermeticity is a claim about *this run*, so it can only be made after the
+    // run, and only when the tracer saw all of it.
+    let mut environment_status = plan.environment.as_ref().map(|e| EnvironmentStatus {
+        alias: e.alias.clone(),
+        id: e.id.clone(),
+        root: e.materialised.root.to_string_lossy().to_string(),
+        completeness: e.manifest.completeness.label().into(),
+        materialised_bytes: e.materialised.written_bytes,
+        reused: e.materialised.reused,
+        hermeticity: crate::environment::Hermeticity::Unknown.label().into(),
+        leaks: Vec::new(),
+    });
+    if let (Some(status), Some(env), Some(merged)) =
+        (&mut environment_status, &plan.environment, &learned)
+    {
+        let complete = merged.completeness == Completeness::Complete;
+        let (verdict, leaks) = crate::environment::hermeticity(
+            merged,
+            complete,
+            &env.materialised.root,
+            &env.manifest.host,
+        );
+        status.hermeticity = verdict.label().into();
+        status.leaks = leaks.into_iter().take(20).collect();
+    }
+    explain.hermeticity = environment_status
+        .as_ref()
+        .map(|s| s.hermeticity.clone())
+        .unwrap_or_default();
 
     let store_cacheable = !outcome.truncated
         && !outcome.signaled
@@ -570,6 +675,13 @@ pub fn run(
         arc_version: crate::VERSION.to_string(),
         family_key: plan.family_key.clone(),
         trace: trace_summary,
+        environment: environment_status
+            .as_ref()
+            .map(|e| crate::record::RecordedEnvironment {
+                alias: e.alias.clone(),
+                id: e.id.clone(),
+                hermeticity: e.hermeticity.clone(),
+            }),
     };
 
     let entry = store_cacheable.then(|| CacheEntry {
@@ -602,6 +714,7 @@ pub fn run(
     }
 
     Ok(RunReport {
+        environment: environment_status,
         remote: status(remote.as_ref(), remote_error),
         remote_execution: remote_exec,
         record,
@@ -684,6 +797,7 @@ fn try_remote_execution(
             dep_state: plan.dep_state,
             env,
             allow_env: &cfg.allow_env,
+            environment: plan.environment.as_ref().map(|e| &e.manifest),
         },
         &caps,
     );
@@ -701,8 +815,13 @@ fn try_remote_execution(
         Ok(d) => d.hex(),
         Err(e) => return note(executor.endpoint(), format!("{e}")),
     };
-    let tools =
-        remote::eligibility::tool_requirements(program, &program_digest, &plan.deps, complete);
+    let tools = remote::eligibility::tool_requirements(
+        program,
+        &program_digest,
+        &plan.deps,
+        complete,
+        plan.environment.is_some(),
+    );
     let names = remote::eligibility::transmittable_env(env, &cfg.allow_env);
     let sent_env: Vec<(String, String)> = names
         .iter()
@@ -721,6 +840,7 @@ fn try_remote_execution(
         tools,
         output_globs: &plan.cfg.outputs.include,
         cache_failures: opts.cache_failures || plan.cfg.cache.cache_failures,
+        environment: plan.environment.as_ref().map(|e| &e.manifest),
         limits: remote::execution::Limits {
             timeout_ms: cfg.timeout_ms,
             ..Default::default()
@@ -776,6 +896,41 @@ Run it locally with --no-remote-execution."
         }
         Err(e) => note(&endpoint, format!("running locally: {e:#}")),
     }
+}
+
+/// Where a locally-run environment command keeps the user state it is not
+/// allowed to share with this machine.
+///
+/// Keyed by environment id, so two environments never see each other's caches
+/// and neither ever sees the real `$HOME`.
+fn local_child_env(
+    arc_home: &Path,
+    selected: &crate::environment::Selected,
+    cfg: &Config,
+) -> Result<crate::exec::ChildEnv> {
+    let base = arc_home.join("run").join(&selected.id[..16]);
+    let home = base.join("home");
+    let tmp = base.join("tmp");
+    for d in [&home, &tmp] {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut child = selected.child_env(&home, &tmp);
+    // Variables the *key* covers must reach the command, or the execution would
+    // not be the one the key describes. The environment's own settings win: it
+    // is the definition, and the ambient shell is not.
+    let fingerprinted = key::fingerprint_env_in(cfg, true);
+    let mut prefix: Vec<(String, String)> = Vec::new();
+    for v in fingerprinted.vars.iter().filter(|v| v.present) {
+        if child.vars.iter().any(|(k, _)| k == &v.name) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(&v.name) {
+            prefix.push((v.name.clone(), value));
+        }
+    }
+    prefix.extend(child.vars);
+    child.vars = prefix;
+    Ok(child)
 }
 
 fn status(remote: Option<&Remote>, error: Option<String>) -> Option<RemoteStatus> {
@@ -864,6 +1019,7 @@ fn materialise_remote(
         arc_version: crate::VERSION.to_string(),
         family_key: plan.family_key.clone(),
         trace: None,
+        environment: None,
     };
     let base = remote::to_record(&wire, &template)?;
     for d in base.replay_digests() {
@@ -1034,10 +1190,40 @@ fn plan(
     args: &[String],
     arc_home: &Path,
     db: &Db,
+    store: &Store,
 ) -> Result<Plan> {
     let command_line = format_command(program, args);
     let cfg = project.config_for(&command_line)?;
-    let resolved = key::find_program_or_explain(program, cwd)?;
+    // An environment is resolved before anything else that depends on a
+    // toolchain, because with one in force the host's copy of the program is
+    // not what runs and must not be what the key describes.
+    let environment = match &cfg.selected_environment {
+        Some(alias) => {
+            let remote = Remote::open(&cfg.remote).ok();
+            Some(crate::environment::select(
+                &project.root,
+                arc_home,
+                alias,
+                store,
+                remote.as_ref(),
+            )?)
+        }
+        None => None,
+    };
+    let resolved = match &environment {
+        Some(env) => env.materialised.resolve(program).ok_or_else(|| {
+            anyhow::anyhow!(
+                "environment `{}` does not provide `{program}`.
+
+An Arc environment never falls back to the host's copy: that would make the result depend on the machine.
+
+Add it to [environment.{}] and re-capture.",
+                env.alias,
+                env.alias
+            )
+        })?,
+        None => key::find_program_or_explain(program, cwd)?,
+    };
     let rel_cwd = key::rel_cwd(&project.root, cwd);
     let project_id = crate::project_id(&project.root);
     let family_key = family::family_key(program, args, &rel_cwd, &cfg).hex();
@@ -1076,6 +1262,7 @@ fn plan(
     let narrow = dependency::can_narrow(&deps, &caps, &family_key);
 
     Ok(Plan {
+        environment,
         cfg,
         classifier,
         family,
@@ -1122,7 +1309,7 @@ fn bypass(
 ) -> Result<RunReport> {
     db.release();
     let now = scan::now_millis();
-    let outcome = exec::run(&plan.resolved, args, cwd, !opts.no_capture, &mut ())?;
+    let outcome = exec::run(&plan.resolved, args, cwd, !opts.no_capture, &mut (), None)?;
     let record = ExecutionRecord {
         schema: crate::SCHEMA_VERSION,
         id: new_id(program, now),
@@ -1155,6 +1342,7 @@ fn bypass(
         arc_version: crate::VERSION.to_string(),
         family_key: plan.family_key.clone(),
         trace: None,
+        environment: None,
     };
     db.put_execution(&record, None)?;
     let explain = Explain {
@@ -1178,6 +1366,13 @@ fn bypass(
         cache_source: "none".into(),
         execution_source: "local".into(),
         remote_execution: "not enabled".into(),
+        environment: plan
+            .environment
+            .as_ref()
+            .map(|e| e.alias.clone())
+            .unwrap_or_default(),
+        environment_id: plan.environment_id().to_string(),
+        hermeticity: String::new(),
         inputs_narrowed: false,
         narrow_reason: plan.narrow.reason().into(),
         fingerprint_ms: 0,
@@ -1193,6 +1388,7 @@ fn bypass(
         dependencies: None,
         remote: None,
         remote_execution: None,
+        environment: None,
     })
 }
 

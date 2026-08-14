@@ -369,6 +369,8 @@ fn capabilities(state: &State) -> wire::Capabilities {
         queued: reg.queue.len(),
         network: wire::NetworkPolicy::Unrestricted,
         cache_endpoint: (!state.cache.url.is_empty()).then(|| state.cache.url.clone()),
+        features: vec![wire::FEATURE_ENVIRONMENT.into()],
+        host: Some(arc_core::environment::host_capability()),
     }
 }
 
@@ -655,8 +657,18 @@ fn execute_in(
     sb.materialise(&state.store, &req.inputs)
         .map_err(|e| failure(FailureKind::Sandbox, format!("{e:#}")))?;
 
+    let environment = match &req.environment {
+        Some(id) => Some(materialise_environment(state, id, cache, &slot.log)?),
+        None => None,
+    };
+
     // Resolve every required executable and check its contents. A worker with a
     // different compiler is not a worker that can answer this question.
+    //
+    // Inside an Arc environment there is nothing to match: the program comes
+    // from the environment or the job does not run. Falling back to the
+    // worker's own copy would make the result depend on this machine, which is
+    // exactly what the environment exists to prevent.
     let mut program = None;
     for t in &req.tools {
         let resolved = sandbox::resolve_tool(t, sb.workspace())
@@ -665,9 +677,19 @@ fn execute_in(
             program = Some(resolved);
         }
     }
-    let program = match program {
-        Some(p) => p,
-        None => arc_core::key::which(&req.program, sb.workspace()).ok_or_else(|| {
+    let program = match (&environment, program) {
+        (Some(env), _) => env.resolve(&req.program).ok_or_else(|| {
+            failure(
+                FailureKind::Incompatible,
+                format!(
+                    "environment {} does not provide `{}`",
+                    &env.id[..12],
+                    req.program
+                ),
+            )
+        })?,
+        (None, Some(p)) => p,
+        (None, None) => arc_core::key::which(&req.program, sb.workspace()).ok_or_else(|| {
             failure(
                 FailureKind::Incompatible,
                 format!("`{}` is not available on this worker", req.program),
@@ -680,7 +702,14 @@ fn execute_in(
     }
 
     let completion = sb
-        .run(req, &program, &req.limits, &slot.log, &slot.cancel)
+        .run(
+            req,
+            &program,
+            &req.limits,
+            &slot.log,
+            &slot.cancel,
+            environment.as_ref(),
+        )
         .map_err(|e| failure(FailureKind::Sandbox, format!("{e:#}")))?;
 
     if completion.timed_out {
@@ -742,6 +771,79 @@ fn execute_in(
     Ok(result)
 }
 
+/// Fetch, verify and materialise an environment, once per worker.
+///
+/// Nothing about the request describes the environment: it names one by
+/// content id, and the manifest is read back out of the shared cache under that
+/// digest. A coordinator therefore cannot make a worker build an environment;
+/// it can only ask for one that already exists and hashes to what it said.
+fn materialise_environment(
+    state: &Arc<State>,
+    id: &str,
+    cache: Option<&Remote>,
+    log: &LogSink,
+) -> std::result::Result<arc_core::environment::Materialised, Failure> {
+    let fetch = |digests: &[String]| -> std::result::Result<(), Failure> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let c = cache.ok_or_else(|| {
+            failure(
+                FailureKind::InputUnavailable,
+                "an environment was requested and this worker has no cache to fetch it from",
+            )
+        })?;
+        c.download(&state.store, digests)
+            .map_err(|e| failure(FailureKind::InputUnavailable, format!("{e:#}")))
+    };
+
+    let d = Digest::parse(id).map_err(|e| failure(FailureKind::Incompatible, e))?;
+    if !state.store.exists(&d) {
+        fetch(std::slice::from_ref(&id.to_string()))?;
+    }
+    let manifest = arc_core::environment::load_manifest(id, &state.store)
+        .map_err(|e| failure(FailureKind::Incompatible, format!("{e:#}")))?;
+
+    // Whether this host can run it is knowable here and nowhere else: the
+    // loader and system libraries the environment needs are on this machine or
+    // they are not.
+    arc_core::environment::host::supports(
+        &arc_core::environment::host_capability(),
+        &manifest.host,
+    )
+    .map_err(|e| failure(FailureKind::Incompatible, e))?;
+
+    let envs = arc_core::environment::Environments::open(
+        state.store.root.parent().unwrap_or(&state.store.root),
+    )
+    .map_err(|e| failure(FailureKind::Sandbox, format!("{e:#}")))?;
+    if !envs.ready(id) {
+        let missing: Vec<String> = manifest
+            .digests()
+            .into_iter()
+            .filter(|x| {
+                Digest::parse(x)
+                    .map(|p| !state.store.exists(&p))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if !missing.is_empty() {
+            log.append(
+                format!(
+                    "[arc: fetching environment {} ({} objects)]
+",
+                    &id[..12],
+                    missing.len()
+                )
+                .as_bytes(),
+            );
+        }
+        fetch(&missing)?;
+    }
+    envs.materialise(&manifest, &state.store)
+        .map_err(|e| failure(FailureKind::Sandbox, format!("{e:#}")))
+}
+
 fn cacheable(c: &sandbox::Completion, req: &ExecutionRequest) -> bool {
     !c.truncated && !c.signaled && !c.timed_out && (c.exit_code == 0 || req.cache_failures)
 }
@@ -789,6 +891,7 @@ fn record_for(
         arc_version: arc_core::VERSION.into(),
         family_key: req.family_key.clone(),
         trace: None,
+        environment: None,
     };
     arc_core::remote::from_record(&local)
 }
