@@ -26,7 +26,10 @@ jobs:
       # Several tests exercise `arc affected`, which needs a real repository.
       - run: git config --global user.email ci@example.com
       - run: git config --global user.name ci
-      - run: cargo test --workspace
+      # --no-fail-fast so one failing test binary does not hide the others.
+      # Twice now a real cross-platform bug has sat behind an unrelated
+      # failure, invisible until that one was fixed.
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo build --release
       - run: cargo run --release -q -p arc-core --example graph_bench
       - run: cargo run --release -q -p arc-core --example ci_bench
