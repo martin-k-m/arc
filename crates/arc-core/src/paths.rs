@@ -142,14 +142,23 @@ pub fn absolute(p: &Path, base: &Path) -> PathBuf {
 pub struct Classifier {
     project: PathKey,
     arc_home: PathKey,
+    /// The filesystem's own name for the Arc home, when it differs from the one
+    /// Arc was given — macOS resolving `/var` to `/private/var`, or Windows
+    /// handing out an 8.3 short name. Checked *in addition to* `arc_home`,
+    /// never instead of it: observed paths keep whatever spelling the program
+    /// used, so replacing the root would stop matching them entirely.
+    arc_home_real: Option<PathKey>,
     system: Vec<PathKey>,
 }
 
 impl Classifier {
     pub fn new(project_root: &Path, arc_home: &Path) -> Classifier {
+        let home = PathKey::of(arc_home);
+        let real = PathKey::of(&canonical_root(arc_home));
         Classifier {
-            project: PathKey::of(&canonical_root(project_root)),
-            arc_home: PathKey::of(&canonical_root(arc_home)),
+            project: PathKey::of(project_root),
+            arc_home_real: (real != home).then_some(real),
+            arc_home: home,
             system: system_roots().iter().map(|p| PathKey::of(p)).collect(),
         }
     }
@@ -159,6 +168,9 @@ impl Classifier {
         // Arc home is checked first: it is frequently placed inside a project
         // during testing, and it must win there.
         if under(&key, &self.arc_home) {
+            return Scope::ArcInternal;
+        }
+        if self.arc_home_real.as_ref().is_some_and(|r| under(&key, r)) {
             return Scope::ArcInternal;
         }
         if under(&key, &self.project) {

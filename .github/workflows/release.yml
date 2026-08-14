@@ -53,7 +53,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: git config --global user.email ci@example.com
       - run: git config --global user.name ci
-      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --all-features --no-fail-fast
       - run: cargo build --workspace --release --locked
 
   build:
