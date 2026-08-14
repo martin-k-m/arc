@@ -68,8 +68,11 @@ jobs:
             os: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+          # Intel macOS. `macos-13` is retired: a job asking for it is queued
+          # forever rather than failing, which held a release run for six hours
+          # without ever reporting anything.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
