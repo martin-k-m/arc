@@ -189,6 +189,7 @@ impl DependencySet {
         caps: Capabilities,
         obs: &Observations,
         root: &Path,
+        classifier: &crate::paths::Classifier,
         now: i64,
     ) -> DependencySet {
         let mut set = DependencySet::empty(family_key, now);
@@ -275,6 +276,15 @@ impl DependencySet {
 
         for p in &obs.processes {
             let Some(image) = &p.image else { continue };
+            // An executable Arc itself materialised is Arc's own state, not the
+            // machine's. Its identity is already covered — precisely, and
+            // portably — by the environment id in the execution key, whereas its
+            // *path* is a directory name that changes with every capture. Left
+            // in, it would bind the key to this machine, which is the opposite
+            // of what an environment is for.
+            if classifier.classify(Path::new(image)) == crate::paths::Scope::ArcInternal {
+                continue;
+            }
             if set.executables.len() >= MAX_EXTERNAL {
                 overflow = true;
                 break;
@@ -838,7 +848,15 @@ mod tests {
     }
 
     fn learn(o: &Observations) -> DependencySet {
-        DependencySet::from_observations("f", "test", caps(true), o, Path::new("/repo"), 0)
+        DependencySet::from_observations(
+            "f",
+            "test",
+            caps(true),
+            o,
+            Path::new("/repo"),
+            &crate::paths::Classifier::new(Path::new("/repo"), Path::new("/arc-home")),
+            0,
+        )
     }
 
     #[test]
@@ -936,6 +954,7 @@ mod tests {
                 ..Default::default()
             },
             Path::new("/repo"),
+            &crate::paths::Classifier::new(Path::new("/repo"), Path::new("/arc-home")),
             0,
         );
         let mut merged = a.clone();

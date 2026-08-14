@@ -9,8 +9,8 @@ favour of executing.
 **I1 — Reuse requires equivalence.** Two executions share a result only when the
 command, arguments, relative working directory, family identity, input digest,
 environment digest, toolchain digest, learned-dependency digest, declared output
-globs, platform, and Arc schema version are all identical.
-`crates/arc-core/src/key.rs`.
+globs, platform, Arc schema version, and — when one is in force — the execution
+environment's content id are all identical. `crates/arc-core/src/key.rs`.
 
 **I2 — Objects are atomic.** A blob only appears at its content-addressed path
 with complete contents: writes go to a temporary file, are flushed, then renamed.
@@ -807,6 +807,138 @@ escaped for its destination. Workflow-command values additionally encode `%`,
 carriage return and newline, so no provider-controlled string can begin a
 `::error::`. Identity remains bytes; only presentation is sanitised.
 
+## Execution environments
+
+Full detail is in `docs/environments.md`; this section states only what bears on
+correctness.
+
+### Identity
+
+`EnvironmentId` is the digest of the environment manifest's canonical bytes, and
+the manifest names every file by content digest. So the id is a function of the
+environment's content and of nothing else: not the alias, not the hostname, not
+the absolute path it was captured from. The manifest's bytes are themselves a CAS
+object under that digest, so verifying an environment is the object verification
+Arc already performs — and a server that serves different bytes for an id fails
+the hash check rather than producing a toolchain nobody asked for.
+
+Canonical form is checked on read. A manifest that hashes to the requested id but
+was serialised differently is refused, so the id cannot drift from being a
+function of the content.
+
+### Environment participation in the key
+
+When a command declares an environment, its id enters the execution key. A result
+built under environment A is never served to a run under environment B. Arc makes
+no attempt to prove two environments equivalent; that is deliberate.
+
+When no environment is declared, nothing is hashed at all, so every key computed
+before v0.8 still means exactly what it meant.
+
+`PATH` leaves the environment fingerprint when an environment is in force,
+because the environment defines `PATH`. Nothing else is removed: a variable a
+command genuinely reads still matters wherever it runs.
+
+### Host versus environment
+
+Arc packages userspace, not kernels and not the C library.
+
+A library a captured binary needs that resolves to a system directory is recorded
+as a **host requirement** by soname. One that resolves elsewhere — a toolchain's
+own `lib/` reached through `$ORIGIN` — is captured. Mixing a captured `libc.so.6`
+with the host's `ld.so` is the failure mode that makes naive `.so` copying
+unreliable, and glibc's loader and C library are one unit.
+
+An environment therefore requires: same OS and architecture, same libc flavour, a
+dynamic loader at each recorded `PT_INTERP` path, and each recorded system soname
+resolvable. The first four are checked — coarsely by the client against the
+worker's advertised host capability, and definitively by the worker itself, where
+the answer is actually knowable. A worker that cannot satisfy them fails
+`Incompatible`, which is safe to run locally.
+
+The kernel is not packaged and not version-gated. Running a userspace newer than
+the host kernel fails the way it always does.
+
+### Structural completeness is not hermeticity
+
+`Complete` means every declared tool resolved and every library a captured binary
+names was accounted for. It says nothing about whether a *particular* command has
+everything it needs. `Partial` lists what was unresolved, and those gaps are part
+of identity — two captures that missed different things are different
+environments. A `Partial` environment is refused for remote execution.
+
+Hermeticity is a property of one execution, reported per run:
+
+* `hermetic` — a complete trace observed nothing outside the environment, the
+  project, the kernel surfaces, and the declared host loader and libraries.
+* `host-dependent` — the command read host state the environment does not supply.
+  The paths are named. The result is correct here and is not portable, and such a
+  command is not remote-eligible, because Arc already refuses to send a command
+  whose complete trace reads outside the project.
+* `unknown` — the execution was not completely observed, so Arc claims nothing.
+  In practice most real compilers land here on Linux, because reading a volatile
+  path downgrades the trace below `Complete`. Hermeticity is only ever claimed
+  from an execution Arc watched in full.
+
+An environment-backed execution is not called hermetic merely for having used an
+environment.
+
+### No silent fallback to the host
+
+A command with an environment resolves its program inside that environment. If
+the environment does not provide it, the run fails — locally with an error naming
+the environment, and on a worker with `Incompatible`. A fallback to the host's
+copy would make the result depend on the machine, which is the one thing the
+environment exists to prevent. The same holds for child tools: they resolve
+through the environment's `PATH`, which contains environment directories and
+nothing else.
+
+### Immutability
+
+A materialised environment is a shared read-only template. Files are written
+read-only and directories left traversable but not writable, so a command that
+tries to rewrite a compiler gets an error rather than corrupting every future job
+that reuses it. Copying a toolchain per execution would cost more than the
+executions save.
+
+The mechanism is file permissions. A process running as root, or as the same
+user with `chmod`, can defeat them; Arc says so rather than claiming otherwise,
+and `arc env verify` re-hashes every object.
+
+Readiness is a sibling marker written last. A directory without one is wreckage
+from an interrupted build and is removed rather than used, so a partially
+materialised environment can never execute. Concurrent requests for one id
+materialise once; across processes the atomic rename decides and the loser
+discards its work. Collection never removes an environment with a live lease.
+
+### Environment paths are Arc's own state
+
+An executable Arc materialised is Arc's own state, not the machine's. It is
+excluded from learned dependencies, because its *path* is a directory name that
+changes with every capture while its *content* is already covered — precisely and
+portably — by the environment id in the execution key. Leaving it in would bind
+the key to one machine's Arc home, which is the opposite of what an environment
+is for.
+
+### Untrusted manifests
+
+An environment manifest arriving from a cache is data from an untrusted server
+and is validated before a byte is written: schema version, entry count, duplicate
+paths, malformed digests, path traversal, absolute or escaping symlink targets,
+symlinks that are also files, and secret-shaped variable names are all refused.
+Paths are checked again at the point that writes, so validation and use cannot
+drift apart.
+
+An execution request names an environment **by id only**. A coordinator can ask a
+worker for an environment that already exists and hashes to what it said; it
+cannot describe one.
+
+### What v0.8 does not change
+
+Host-mode remote execution is untouched: a worker with no environment support
+advertises no feature, an environment-backed request is refused with a stated
+reason, and everything that worked in v0.7 still works. Environments are additive.
+
 ## Remote execution
 
 A worker is an execution backend, not a second Arc. It runs a command Arc has
@@ -847,9 +979,12 @@ sends less than the fingerprint covers in order to make a transfer cheaper.
 
 ### What compatibility does not establish
 
-The `environment_id` a worker advertises covers the platform, the architecture,
-Arc's semantics version and the libc flavour. Matched executables cover the
-programs Arc knows the command runs.
+Without an Arc environment, the `environment_id` a worker advertises covers the
+platform, the architecture, Arc's semantics version and the libc flavour, and
+matched executables cover the programs Arc knows the command runs. With one,
+eligibility stops asking whether the worker already has the same compiler and
+starts asking whether it can run the environment — but the paragraph below still
+applies to everything the environment does not contain.
 
 **Neither covers the shared libraries those executables load, the kernel, the
 locale data, the CPU's instruction set extensions, or anything else the host

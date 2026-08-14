@@ -1,5 +1,6 @@
 # Architecture
 
+
 Arc is two crates. `arc-core` holds every decision; `arc-cli` is a thin
 presentation layer over it. Nothing in `arc-core` prints to a terminal or reads
 `argv`, so the same logic serves the CLI, tests, and any future programmatic
@@ -421,6 +422,42 @@ ARC_DOCKER_ARGS=--security-opt=seccomp=unconfined scripts/linux-check.sh test --
 A container is not just convenient — it is also the environment most likely to
 *refuse* ptrace, so the same run exercises both the backend and its unavailable
 path. `scripts/bench.sh` and `scripts/demo.sh` are meant to be run the same way.
+
+## Execution environments
+
+```text
+   [environment.rust]              arc env capture rust
+     tools / trees   ───────────────────▶  environment::capture
+                                                  │  ELF closure, tree walk
+                                                  ▼
+                                        EnvironmentManifest
+                                                  │  digest of canonical bytes
+                                                  ▼
+                                            EnvironmentId ──▶ arc-env.lock
+                                                  │
+                                             Arc CAS blobs
+                                                  │
+                                       ┌──────────┴──────────┐
+                                       ▼                     ▼
+                             environment::materialise   same code, in the worker
+                                       └──────────┬──────────┘
+                                                  ▼
+                                             Sandbox / exec
+                                        deterministic PATH,
+                                       isolated HOME and TMP
+```
+
+| Module | Responsibility |
+| --- | --- |
+| `environment::manifest` | What an environment is, and what its identity covers |
+| `environment::elf` | `PT_INTERP`, `DT_NEEDED`, `DT_RUNPATH` from bytes, never by running `ldd` |
+| `environment::capture` | Tools, trees, runtime closure → manifest + CAS objects |
+| `environment::host` | Host capability, and whether it can run an environment |
+| `environment::materialise` | Atomic, singleflighted, read-only materialisation and GC |
+| `environment::lock` | `arc-env.lock`: alias → id, committed and diffable |
+
+The local engine and the worker use the same materialiser. There is no second
+implementation and therefore no second set of guarantees.
 
 ## The remote cache
 

@@ -24,4 +24,9 @@ serde_json.workspace = true
 # without a second binary or a fixed port.
 arc-cache = { path = "../arc-cache" }
 arc-worker = { path = "../arc-worker" }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Only to ask whether the test is running as root, where file permissions stop
+# meaning anything.
+libc.workspace = true
 arc-core.workspace = true

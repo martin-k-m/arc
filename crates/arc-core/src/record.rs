@@ -93,6 +93,17 @@ pub struct OutputFile {
     pub exec: bool,
 }
 
+/// What an execution's environment was, for `arc inspect`. The id is the part
+/// that matters — the alias is a name this project happened to use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordedEnvironment {
+    pub alias: String,
+    pub id: String,
+    /// `hermetic`, `host-dependent` or `unknown`, per this execution.
+    #[serde(default)]
+    pub hermeticity: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
     pub schema: u32,
@@ -126,6 +137,10 @@ pub struct ExecutionRecord {
     pub family_key: String,
     #[serde(default)]
     pub trace: Option<TraceSummary>,
+    /// The execution environment this ran inside, when one was in force.
+    /// `default` so records written before v0.8 still read.
+    #[serde(default)]
+    pub environment: Option<RecordedEnvironment>,
 }
 
 impl ExecutionRecord {

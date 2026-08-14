@@ -1,6 +1,6 @@
 //! Project discovery and configuration (`arc.toml`).
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -16,9 +16,47 @@ pub struct Config {
     pub trace: TraceConfig,
     pub remote: crate::remote::RemoteConfig,
     pub ci: CiConfig,
+    /// Named execution environments, written as `[environment.<alias>]`. The
+    /// alias is configuration; the identity is the captured content.
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, EnvironmentConfig>,
     /// Per-command scoping, written as repeated `[[command]]` tables.
     #[serde(rename = "command")]
     pub commands: Vec<CommandConfig>,
+    /// The environment alias in force for one command line, filled in by
+    /// [`Config::resolve`]. Not configuration in its own right.
+    #[serde(skip)]
+    pub selected_environment: Option<String>,
+}
+
+/// What `arc env capture <alias>` will take from this machine.
+///
+/// Deliberately not a package manager: every entry names something that already
+/// exists here. Arc captures bytes, it does not fetch them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EnvironmentConfig {
+    /// Programs resolved on this machine's PATH and captured into `bin/`.
+    pub tools: Vec<String>,
+    /// Directories taken wholesale, at a destination the project chooses.
+    #[serde(rename = "tree")]
+    pub trees: Vec<TreeConfig>,
+    /// Variables every command in this environment gets. Secret-shaped names
+    /// are refused: a manifest is published to other machines.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Extra `PATH` entries inside the environment root.
+    pub path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TreeConfig {
+    /// Source on the capturing machine. A leading `~` is this machine's home.
+    /// Never part of the environment's identity.
+    pub from: String,
+    /// Destination inside the environment root, which *is* part of identity.
+    pub to: String,
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +156,9 @@ pub struct CommandConfig {
     /// change its identity, or a result produced locally could never be reused
     /// remotely and vice versa.
     pub remote: Option<RemotePolicy>,
+    /// The `[environment.<alias>]` this command runs inside. Absent means the
+    /// host's own toolchain, exactly as before v0.8.
+    pub environment: Option<String>,
     /// Task names this command must follow, for dependencies no filesystem
     /// observation can reveal.
     pub after: Vec<String>,
@@ -277,6 +318,22 @@ impl Config {
             if c.remote == Some(RemotePolicy::Never) {
                 cfg.remote.execution.enabled = false;
             }
+            // Two blocks naming different environments is a contradiction, not
+            // a merge: one command runs in one environment.
+            if let Some(alias) = &c.environment {
+                match &cfg.selected_environment {
+                    Some(existing) if existing != alias => bail!(
+                        "`{command_line}` matches [[command]] blocks naming both environment `{existing}` and `{alias}`"
+                    ),
+                    _ => cfg.selected_environment = Some(alias.clone()),
+                }
+            }
+        }
+        if let Some(alias) = &cfg.selected_environment {
+            anyhow::ensure!(
+                self.environment.contains_key(alias),
+                "`{command_line}` names environment `{alias}`, which no [environment.{alias}] block defines"
+            );
         }
         Ok(cfg)
     }
@@ -411,6 +468,64 @@ mod tests {
             .inputs
             .include
             .is_empty());
+    }
+
+    fn project(toml: &str) -> Project {
+        Project {
+            root: PathBuf::from("."),
+            config: toml::from_str(toml).unwrap(),
+            config_path: None,
+            git: false,
+        }
+    }
+
+    #[test]
+    fn a_command_selects_the_environment_its_block_names() {
+        let p = project(
+            "[environment.rust]\ntools = [\"cargo\"]\n\n[[command]]\nmatch = \"cargo*\"\nenvironment = \"rust\"\n",
+        );
+        assert_eq!(
+            p.config_for("cargo test").unwrap().selected_environment,
+            Some("rust".into())
+        );
+        // A command no block matches keeps the pre-v0.8 behaviour.
+        assert_eq!(p.config_for("npm test").unwrap().selected_environment, None);
+    }
+
+    #[test]
+    fn two_blocks_naming_different_environments_is_a_contradiction() {
+        let p = project(
+            "[environment.a]\ntools = [\"cargo\"]\n\n[environment.b]\ntools = [\"cargo\"]\n\n\
+             [[command]]\nmatch = \"cargo*\"\nenvironment = \"a\"\n\n\
+             [[command]]\nmatch = \"*test*\"\nenvironment = \"b\"\n",
+        );
+        let e = p.config_for("cargo test").unwrap_err().to_string();
+        assert!(e.contains('a') && e.contains('b'), "{e}");
+        // Blocks that agree are not a contradiction.
+        assert!(p.config_for("cargo build").is_ok());
+    }
+
+    #[test]
+    fn naming_an_environment_no_block_defines_is_an_error() {
+        let p = project("[[command]]\nmatch = \"cargo*\"\nenvironment = \"ghost\"\n");
+        let e = p.config_for("cargo test").unwrap_err().to_string();
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn an_environment_block_parses_tools_trees_and_env() {
+        let cfg: Config = toml::from_str(
+            "[environment.rust]\ntools = [\"cargo\", \"rustc\"]\npath = [\"rust/libexec\"]\n\
+             env = { RUST_BACKTRACE = \"1\" }\n\n\
+             [[environment.rust.tree]]\nfrom = \"~/.rustup\"\nto = \"rust\"\nexclude = [\"**/doc/**\"]\n",
+        )
+        .unwrap();
+        let e = &cfg.environment["rust"];
+        assert_eq!(e.tools, vec!["cargo", "rustc"]);
+        assert_eq!(e.trees.len(), 1);
+        assert_eq!(e.trees[0].to, "rust");
+        assert_eq!(e.env["RUST_BACKTRACE"], "1");
+        assert_eq!(e.path, vec!["rust/libexec"]);
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub struct Request<'a> {
     pub output_globs: &'a [String],
     pub cache_failures: bool,
     pub limits: Limits,
+    /// The environment the worker must materialise, by content id.
+    pub environment: Option<&'a crate::environment::EnvironmentManifest>,
 }
 
 /// Execute `req` on `executor`, publishing inputs through `cache`.
@@ -108,6 +110,13 @@ pub fn execute(
     let upload = Instant::now();
     let digests: Vec<String> = {
         let mut v: Vec<String> = manifest.iter().map(|m| m.digest.clone()).collect();
+        // The environment travels the same way inputs do: as content-addressed
+        // objects, with the manifest itself one of them. No new transport, and
+        // the worker verifies it the way it verifies everything else.
+        if let Some(env) = req.environment {
+            v.extend(env.digests());
+            v.push(crate::environment::store_manifest(env, store)?);
+        }
         v.sort();
         v.dedup();
         v
@@ -134,6 +143,7 @@ pub fn execute(
         limits: req.limits,
         cache_failures: req.cache_failures,
         arc_version: crate::VERSION.into(),
+        environment: req.environment.map(|e| e.id()),
     };
 
     progress("submitting");

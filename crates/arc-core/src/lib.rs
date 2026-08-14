@@ -8,6 +8,7 @@ pub mod ci;
 pub mod db;
 pub mod dependency;
 pub mod engine;
+pub mod environment;
 pub mod exec;
 pub mod family;
 pub mod git;

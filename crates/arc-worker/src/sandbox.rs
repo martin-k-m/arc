@@ -10,6 +10,7 @@
 //! as the worker's user with the worker's network. See `docs/remote-execution.md`.
 
 use anyhow::{bail, Context, Result};
+use arc_core::environment::Materialised;
 use arc_core::hash::Digest;
 use arc_core::record::OutputFile;
 use arc_core::remote::execution::{ExecutionRequest, Limits, ManifestEntry, ToolRequirement};
@@ -83,22 +84,36 @@ impl Sandbox {
 
     /// The environment the command sees. Built from nothing: the worker's own
     /// environment — which holds its service credentials — is never inherited.
-    fn environment(&self, req: &ExecutionRequest, program: &Path) -> Vec<(String, String)> {
-        let mut env: Vec<(String, String)> = req.env.clone();
+    ///
+    /// With an Arc environment the request's variables come first and the
+    /// environment's definition overrides them, because the environment is what
+    /// the execution key describes and a coordinator's `PATH` is not.
+    fn environment(
+        &self,
+        req: &ExecutionRequest,
+        program: &Path,
+        env: Option<&Materialised>,
+    ) -> Vec<(String, String)> {
+        let mut vars: Vec<(String, String)> = req.env.clone();
+        if let Some(m) = env {
+            let defined = m.child_env(&self.home, &self.temp);
+            vars.retain(|(k, _)| !defined.vars.iter().any(|(d, _)| d == k));
+            vars.extend(defined.vars);
+            return vars;
+        }
         let has = |env: &[(String, String)], k: &str| env.iter().any(|(n, _)| n == k);
-
-        if !has(&env, "PATH") {
+        if !has(&vars, "PATH") {
             if let Some(dir) = program.parent() {
-                env.push(("PATH".into(), dir.to_string_lossy().to_string()));
+                vars.push(("PATH".into(), dir.to_string_lossy().to_string()));
             }
         }
         // Sandbox-local locations, so a command cannot read or pollute the
         // worker's real user state.
-        env.push(("HOME".into(), self.home.to_string_lossy().to_string()));
+        vars.push(("HOME".into(), self.home.to_string_lossy().to_string()));
         for k in ["TMPDIR", "TEMP", "TMP"] {
-            env.push((k.into(), self.temp.to_string_lossy().to_string()));
+            vars.push((k.into(), self.temp.to_string_lossy().to_string()));
         }
-        env
+        vars
     }
 
     /// Run the command, capturing output and enforcing the timeout.
@@ -109,6 +124,7 @@ impl Sandbox {
         limits: &Limits,
         log: &LogSink,
         cancelled: &Arc<AtomicBool>,
+        env: Option<&Materialised>,
     ) -> Result<Completion> {
         let cwd = if req.rel_cwd.is_empty() {
             self.workspace.clone()
@@ -124,7 +140,7 @@ impl Sandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (k, v) in self.environment(req, program) {
+        for (k, v) in self.environment(req, program, env) {
             cmd.env(k, v);
         }
         new_process_group(&mut cmd);

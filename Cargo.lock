@@ -75,7 +75,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-cache"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-core",
@@ -90,13 +90,14 @@ dependencies = [
 
 [[package]]
 name = "arc-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-cache",
  "arc-core",
  "arc-worker",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -105,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "arc-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -126,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "arc-worker"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-cache",
