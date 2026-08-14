@@ -524,7 +524,13 @@ mod tests {
         std::fs::create_dir_all(src.join("bin")).unwrap();
         std::fs::write(src.join("bin/real"), b"real").unwrap();
         std::os::unix::fs::symlink("real", src.join("bin/alias")).unwrap();
-        std::os::unix::fs::symlink("/etc/hostname", src.join("bin/escape")).unwrap();
+        // The escape target has to exist, and has to exist everywhere: a
+        // dangling link is skipped rather than followed, which would make this
+        // test silently prove nothing. `/etc/hostname` is absent on macOS, so
+        // the target is one this test creates, outside the captured tree.
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("bin/escape")).unwrap();
 
         let spec = Spec {
             trees: vec![Tree {
