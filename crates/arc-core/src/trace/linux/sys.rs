@@ -253,6 +253,15 @@ pub fn read_sa_family(pid: i32, addr: u64, len: u64) -> Option<u16> {
     (read_into(pid, addr, &mut buf) == 2).then(|| u16::from_ne_bytes(buf))
 }
 
+/// Read a fixed number of bytes out of a tracee, or nothing.
+pub fn read_bytes(pid: i32, addr: u64, len: usize) -> Option<Vec<u8>> {
+    if addr == 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    (read_into(pid, addr, &mut buf) == len).then_some(buf)
+}
+
 /// Bytes actually read; 0 on any failure. The only place `process_vm_readv` is
 /// called.
 fn read_into(pid: i32, addr: u64, buf: &mut [u8]) -> usize {

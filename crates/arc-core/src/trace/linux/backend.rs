@@ -1,15 +1,13 @@
 //! The ptrace event loop and the rules that turn syscalls into dependencies.
 
+use super::recorder::Recorder;
 use super::state::{exe_of, Base, Fd, Pending, Proc, Table};
 use super::sys::{self, Stop, SyscallStop};
 use super::syscalls::{self, Dir, Sc};
-use super::{policy, Verdict};
 use crate::exec::Wait;
-use crate::paths::{display_form, Classifier, Scope};
-use crate::trace::model::{
-    Downgrade, FileObservation, FileOp, Observations, ProcessObservation, TRACE_SEMANTICS_VERSION,
-};
-use crate::trace::{Capabilities, Launch, Tracer};
+use crate::paths::{display_form, Classifier};
+use crate::trace::model::{Downgrade, FileOp, Observations};
+use crate::trace::{Capabilities, Launch, PreExec, Tracer};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -30,85 +28,23 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     network_detection: true,
 };
 
-/// Distinct `(operation, path)` pairs one execution may produce. A pathological
-/// program can issue tens of millions of syscalls; past this point Arc stops
-/// recording, reports an overflow, and refuses to call the trace complete
-/// rather than growing without bound.
-const MAX_OBSERVATIONS: usize = 250_000;
-
-/// Processes one execution may spawn before Arc stops tracking their images.
-const MAX_PROCESSES: usize = 20_000;
-
 pub struct LinuxTracer {
-    classifier: Classifier,
-    cwd: PathBuf,
-    obs: Observations,
-    /// First-seen deduplication. Order is preserved in `obs.files`, because it
-    /// is what separates a generated intermediate from a genuine input.
-    seen: HashSet<(FileOp, Rc<str>)>,
-    processes: HashMap<i32, Option<String>>,
-    root: i32,
+    rec: Recorder,
 }
 
 impl LinuxTracer {
     pub fn new(cwd: &Path, classifier: &Classifier) -> LinuxTracer {
         LinuxTracer {
-            classifier: classifier.clone(),
-            cwd: cwd.to_path_buf(),
-            obs: Observations::default(),
-            seen: HashSet::new(),
-            processes: HashMap::new(),
-            root: 0,
+            rec: Recorder::new(cwd, classifier),
         }
     }
 
-    /// Record one observation, applying scope and volatility policy.
-    ///
-    /// Everything Arc writes itself is dropped here, before it can reach a
-    /// dependency set: the cache database sits inside `$ARC_HOME`, which is
-    /// frequently inside the project during testing, and an execution that
-    /// learned Arc's own files as inputs would invalidate itself on every run.
     fn record(&mut self, path: &Path, op: FileOp) {
-        let scope = self.classifier.classify(path);
-        if scope == Scope::ArcInternal {
-            return;
-        }
-        let display = display_form(path);
-        match policy::verdict(&display) {
-            // Process-private introspection: its contents are a function of this
-            // execution, not of any prior state, so it is not a dependency.
-            Verdict::Ignore => return,
-            Verdict::Volatile => {
-                if op.is_input() {
-                    self.obs.downgrade(Downgrade::VolatileRead(display));
-                }
-                return;
-            }
-            Verdict::Normal => {}
-        }
-
-        if self.obs.files.len() >= MAX_OBSERVATIONS {
-            self.obs.lossy = true;
-            self.obs.downgrade(Downgrade::EventOverflow);
-            return;
-        }
-        let key: Rc<str> = Rc::from(display.as_str());
-        if !self.seen.insert((op, key)) {
-            return;
-        }
-        self.obs.files.push(FileObservation {
-            rel: self.classifier.relative(path),
-            path: display,
-            op,
-            scope,
-            existed_before: None,
-        });
+        self.rec.record(path, op)
     }
 
     fn fail(&mut self, what: &str, e: &dyn std::fmt::Display) {
-        self.obs.lossy = true;
-        self.obs
-            .downgrade(Downgrade::BackendError(format!("{what}: {e}")));
+        self.rec.fail(what, e)
     }
 }
 
@@ -125,27 +61,22 @@ impl Tracer for LinuxTracer {
         Launch::Traced
     }
 
+    fn pre_exec(&self) -> Option<PreExec> {
+        Some(Box::new(|| {
+            // SAFETY: run between `fork` and `exec` in the child. `traceme`
+            // issues one `ptrace` syscall and does nothing else — no
+            // allocation, no locking, no libc state.
+            unsafe { sys::traceme() }
+        }))
+    }
+
     fn supervise(&mut self, pid: u32) -> Option<Result<Wait>> {
-        self.root = pid as i32;
+        self.rec.root = pid as i32;
         Some(Ok(run_loop(self)))
     }
 
     fn finish(self: Box<Self>) -> Observations {
-        let me = *self;
-        let mut obs = me.obs;
-        for (pid, image) in me.processes {
-            let scope = image.as_ref().map(|p| me.classifier.classify(Path::new(p)));
-            obs.processes.push(ProcessObservation {
-                pid: pid as u32,
-                image,
-                scope,
-                descendant: pid != me.root,
-            });
-        }
-        obs.processes.sort_by_key(|p| p.pid);
-        obs.notes
-            .push(format!("linux-ptrace semantics v{TRACE_SEMANTICS_VERSION}"));
-        obs
+        self.rec.finish(NAME)
     }
 }
 
@@ -178,10 +109,10 @@ fn run_loop(t: &mut LinuxTracer) -> Wait {
         },
         seen_root_exit: false,
     };
-    let root = t.root;
-    l.table.insert(root, Proc::root(&t.cwd));
-    t.processes
-        .insert(root, exe_of(root).map(|p| display_form(&p)));
+    let root = t.rec.root;
+    l.table.insert(root, Proc::root(&t.rec.cwd));
+    t.rec
+        .note_process(root, exe_of(root).map(|p| display_form(&p)));
 
     loop {
         let (pid, stop) = match sys::wait_any() {
@@ -289,7 +220,7 @@ fn on_signal(t: &mut LinuxTracer, l: &mut Loop, pid: i32, sig: i32) -> Option<i3
         return Some(sig);
     }
 
-    if pid == t.root {
+    if pid == t.rec.root {
         // The root's first stop is the SIGTRAP the kernel raises when a
         // `PTRACE_TRACEME` child reaches `exec`. Options can only be set on a
         // stopped tracee, so this is the moment.
@@ -308,11 +239,10 @@ fn on_signal(t: &mut LinuxTracer, l: &mut Loop, pid: i32, sig: i32) -> Option<i3
         Some(mut proc) => {
             proc.configured = true;
             l.table.insert(pid, proc);
-            if t.processes.len() < MAX_PROCESSES {
-                t.processes
-                    .insert(pid, exe_of(pid).map(|p| display_form(&p)));
+            if !t.rec.at_process_limit() {
+                t.rec.set_image(pid, exe_of(pid).map(|p| display_form(&p)));
             } else {
-                t.obs.downgrade(Downgrade::EventOverflow);
+                t.rec.obs.downgrade(Downgrade::EventOverflow);
             }
             Some(0)
         }
@@ -333,17 +263,17 @@ fn on_event(t: &mut LinuxTracer, l: &mut Loop, pid: i32, ev: u32) -> Result<()> 
             let child = sys::event_message(pid)? as i32;
             let flags = l.table.get(pid).map(|p| p.clone_flags).unwrap_or(0);
             let Some(proc) = l.table.get(pid).map(|p| p.child(flags)) else {
-                t.obs.lossy = true;
-                t.obs.downgrade(Downgrade::ChildEscape);
+                t.rec.obs.lossy = true;
+                t.rec.obs.downgrade(Downgrade::ChildEscape);
                 return Ok(());
             };
             if l.orphans.remove(&child) {
                 let mut proc = proc;
                 proc.configured = true;
                 l.table.insert(child, proc);
-                if t.processes.len() < MAX_PROCESSES {
-                    t.processes
-                        .insert(child, exe_of(child).map(|p| display_form(&p)));
+                if !t.rec.at_process_limit() {
+                    t.rec
+                        .set_image(child, exe_of(child).map(|p| display_form(&p)));
                 }
                 resume(t, child, 0);
             } else {
@@ -362,7 +292,7 @@ fn on_event(t: &mut LinuxTracer, l: &mut Loop, pid: i32, ev: u32) -> Result<()> 
             // than the script. Recording both is what makes a shebang script's
             // dependency set correct.
             if let Some(exe) = exe_of(pid) {
-                t.processes.insert(pid, Some(display_form(&exe)));
+                t.rec.set_image(pid, Some(display_form(&exe)));
             }
         }
         _ => {}
@@ -387,7 +317,7 @@ fn on_syscall(t: &mut LinuxTracer, l: &mut Loop, pid: i32) {
                 // A syscall this backend does not model may have done anything,
                 // including reading a file through an interface Arc cannot see.
                 // Refusing to call the trace complete is the only safe answer.
-                t.obs.downgrade(Downgrade::UnsupportedSyscall(nr));
+                t.rec.obs.downgrade(Downgrade::UnsupportedSyscall(nr));
             }
             if let Some(p) = l.table.get_mut(pid) {
                 p.pending = Some(Pending { nr, args });
@@ -583,7 +513,7 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
                 }
                 // The working directory is now something Arc cannot name, so
                 // every later relative path in this process is unresolvable.
-                None => t.obs.downgrade(Downgrade::PathResolutionFailure),
+                None => t.rec.obs.downgrade(Downgrade::PathResolutionFailure),
             }
         }
 
@@ -707,7 +637,7 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
                 },
             );
             let _ = family;
-            t.obs.downgrade(Downgrade::NetworkAccess);
+            t.rec.obs.downgrade(Downgrade::NetworkAccess);
         }
 
         Sc::Anonymous => {
@@ -745,7 +675,7 @@ fn resolve(
     let raw = match sys::read_cstr(pid, args[idx]) {
         Some(r) => r,
         None => {
-            t.obs.downgrade(Downgrade::PathResolutionFailure);
+            t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
             return None;
         }
     };
@@ -756,7 +686,7 @@ fn resolve(
     // cannot name, the trace stops claiming completeness and the conservative
     // project scan takes over, which handles arbitrary bytes correctly.
     if std::str::from_utf8(&raw).is_err() {
-        t.obs.downgrade(Downgrade::PathResolutionFailure);
+        t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
         return None;
     }
     let raw = Path::new(OsStr::from_bytes(&raw));
@@ -768,7 +698,7 @@ fn resolve(
     match proc.resolve(&base, raw) {
         Some(p) => Some(p),
         None => {
-            t.obs.downgrade(Downgrade::PathResolutionFailure);
+            t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
             None
         }
     }

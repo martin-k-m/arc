@@ -40,6 +40,11 @@ pub trait Supervisor {
     fn traced(&self) -> bool {
         false
     }
+    /// A hook the child runs between `fork` and `exec`, supplied by whichever
+    /// tracing backend is in use.
+    fn pre_exec(&self) -> Option<crate::trace::PreExec> {
+        None
+    }
     /// Called with the child's pid as soon as it exists and before any of its
     /// output is read.
     fn on_spawn(&mut self, _pid: u32) {}
@@ -152,11 +157,11 @@ fn spawn(
         }
         cmd
     };
-    if sup.traced() {
+    if let Some(hook) = sup.pre_exec() {
         let mut cmd = build();
-        install_traceme(&mut cmd);
+        install_hook(&mut cmd, hook);
         match cmd.spawn() {
-            Ok(c) => return Ok((c, true)),
+            Ok(c) => return Ok((c, sup.traced())),
             Err(e) => sup.disable(format!("tracing could not be started: {e}")),
         }
     }
@@ -166,20 +171,20 @@ fn spawn(
     Ok((child, false))
 }
 
-#[cfg(target_os = "linux")]
-fn install_traceme(cmd: &mut Command) {
+#[cfg(unix)]
+fn install_hook(cmd: &mut Command, hook: crate::trace::PreExec) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `pre_exec` requires the closure to be async-signal-safe, because
     // it runs in the forked child before `exec` while the parent's threads and
-    // locks are still notionally present. `traceme` issues one `ptrace` syscall
-    // and does nothing else — no allocation, no locking, no libc state.
+    // locks are still notionally present. Every backend that supplies a hook
+    // documents that its own is — see `trace::PreExec`.
     unsafe {
-        cmd.pre_exec(|| crate::trace::traceme());
+        cmd.pre_exec(hook);
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn install_traceme(_cmd: &mut Command) {}
+#[cfg(not(unix))]
+fn install_hook(_cmd: &mut Command, _hook: crate::trace::PreExec) {}
 
 fn wait_normally(child: &mut std::process::Child) -> Result<Wait> {
     let status = child.wait().context("waiting for child process")?;

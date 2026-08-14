@@ -219,17 +219,21 @@ executes, observes again, and folds the result in.
 
 ## Modelled and observed by platform
 
-| | `linux-ptrace` | `snapshot+jobobject` | `snapshot` |
-| --- | --- | --- | --- |
-| File reads | yes | no | no |
-| Existence and metadata checks | yes | no | no |
-| Directory enumeration | yes | no | no |
-| Writes, creates, deletes | yes | yes | yes |
-| Process tree | yes | yes | no |
-| Executables | yes | yes | no |
-| Paths outside the project | yes | no | no |
-| Network detection | yes | no | no |
-| **Automatic narrowing** | **yes** | no | no |
+| | `linux-seccomp` | `linux-ptrace` | `snapshot+jobobject` | `snapshot` |
+| --- | --- | --- | --- | --- |
+| File reads | yes | yes | no | no |
+| Existence and metadata checks | yes | yes | no | no |
+| Directory enumeration | yes | yes | no | no |
+| Writes, creates, deletes | yes | yes | yes | yes |
+| Process tree | yes | yes | yes | no |
+| Executables | yes | yes | yes | no |
+| Paths outside the project | yes | yes | no | no |
+| Network detection | yes | yes | no | no |
+| **Automatic narrowing** | **yes** | **yes** | no | no |
+
+The two Linux backends record through one shared `Recorder`, so everything in
+this section applies to both. Where the mechanisms differ — how paths are
+resolved, why neither can lose an event — see [tracing.md](tracing.md).
 
 Environment reads are modelled by nobody. Reading `getenv` touches memory the
 process already holds, so no syscall tracer can see it; Arc keeps its

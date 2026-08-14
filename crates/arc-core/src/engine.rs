@@ -1055,6 +1055,10 @@ impl Supervisor for TraceSupervisor {
             .is_some_and(|t| t.launch() == trace::Launch::Traced)
     }
 
+    fn pre_exec(&self) -> Option<trace::PreExec> {
+        self.tracer.as_ref()?.pre_exec()
+    }
+
     fn on_spawn(&mut self, pid: u32) {
         if let Some(t) = self.tracer.as_mut() {
             if let Err(e) = t.attach(pid) {
