@@ -81,9 +81,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --target ${{ matrix.target }} -p arc-cli -p arc-cache -p arc-worker
 
-      # Every archive holds the three binaries, the licence and the readme, at
-      # the archive root — so extracting one gives a usable install with no
-      # nested directory to guess at.
+      # Every archive holds the three binaries, the licence and the readme,
+      # inside a single `arc-v<version>-<target>/` directory — so extracting two
+      # of them side by side cannot have one overwrite the other. Both install
+      # scripts and the smoke test below expect exactly that shape.
       - name: package
         shell: bash
         run: |
@@ -101,7 +102,7 @@ jobs:
           cp LICENSE README.md CHANGELOG.md "$stage/"
           mkdir -p dist
           if [ -f "$stage/arc.exe" ]; then
-            7z a -tzip "dist/$stage.zip" "./$stage/*" >/dev/null
+            7z a -tzip "dist/$stage.zip" "$stage" >/dev/null
           else
             tar -czf "dist/$stage.tar.gz" "$stage"
           fi
@@ -123,14 +124,23 @@ jobs:
           fi
           # A cross-built binary cannot run on the builder. Everything here is
           # native, so if that ever changes this guard is the thing to revisit.
+          arc_abs="$PWD/${arc#./}"
           "$arc" --version
           "$arc" --help >/dev/null
           "$arc" doctor
+          # `arc.toml` is what stops project discovery here. Without it Arc walks
+          # up and adopts the repository checkout as the project, whose contents
+          # change between the two runs — so the second one correctly misses and
+          # the smoke test blames the binary for working properly.
           mkdir -p project && cd project
+          : > arc.toml
           echo one > input.txt
-          "../$arc" run -- ${{ runner.os == 'Windows' && 'cmd /c type input.txt' || 'cat input.txt' }}
-          "../$arc" run -- ${{ runner.os == 'Windows' && 'cmd /c type input.txt' || 'cat input.txt' }} 2>&1 | tee out.txt
-          grep -qi 'hit' out.txt || { echo "the second run did not hit" >&2; exit 1; }
+          run_cmd() { "$arc_abs" run -- ${{ runner.os == 'Windows' && 'cmd /c type input.txt' || 'cat input.txt' }}; }
+          run_cmd
+          # Written outside the project, for the same reason.
+          run_cmd > ../second.log 2>&1
+          cat ../second.log
+          grep -qi 'hit' ../second.log || { echo "the second run did not hit" >&2; exit 1; }
 
       - name: checksum
         shell: bash
