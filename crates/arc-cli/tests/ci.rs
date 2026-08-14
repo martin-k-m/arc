@@ -137,6 +137,17 @@ out/
             .current_dir(&self.root)
             .env("ARC_HOME", &self.home)
             .env("ARC_NO_ANIM", "1");
+        // These tests build a throwaway repository and then ask Arc what it
+        // would compare. Run inside a real CI job, the ambient provider
+        // variables describe a *different* repository — `GITHUB_SHA` names a
+        // commit this fixture has never heard of — and Arc correctly refuses to
+        // guess, which turns a passing test into a failing one depending only
+        // on where it ran. Each test states the provider environment it wants.
+        for (k, _) in std::env::vars() {
+            if k == "CI" || k.starts_with("GITHUB_") || k.starts_with("ARC_CI_") {
+                c.env_remove(&k);
+            }
+        }
         for (k, v) in &self.env {
             c.env(k, v);
         }
