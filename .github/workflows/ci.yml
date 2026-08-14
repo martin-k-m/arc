@@ -69,9 +69,28 @@ jobs:
           ./target/release/arc doctor | grep -q 'linux-seccomp *available' ||
             { echo "the fast backend is unavailable on this runner" >&2; exit 1; }
           cargo test -p arc-cli --test trace_differential
+      # Each denial should cost exactly one backend, and the command must run
+      # either way. With ptrace gone Arc still traces completely through
+      # seccomp; with both gone it degrades to snapshot and stops claiming to
+      # see reads, which is the honest answer rather than a broken one.
       - name: ptrace forbidden
         run: |
-          docker run --rm \
-            --security-opt seccomp=<(echo '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["ptrace"],"action":"SCMP_ACT_ERRNO"}]}') \
+          echo '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["ptrace"],"action":"SCMP_ACT_ERRNO"}]}' > /tmp/no-ptrace.json
+          out=$(docker run --rm --security-opt seccomp=/tmp/no-ptrace.json \
             -v "$PWD:/w" -w /w ubuntu:24.04 \
-            sh -c './target/release/arc doctor | grep -A2 "backend" && ./target/release/arc run sh -c "echo fallback works"'
+            sh -c './target/release/arc doctor && ./target/release/arc run -- echo ok')
+          echo "$out"
+          grep -q 'preferred *linux-seccomp' <<<"$out"
+          grep -q 'linux-ptrace *ptrace denied' <<<"$out"
+          grep -q 'best completeness *complete' <<<"$out"
+
+      - name: both Linux backends forbidden
+        run: |
+          echo '{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["ptrace","seccomp"],"action":"SCMP_ACT_ERRNO"}]}' > /tmp/no-trace.json
+          out=$(docker run --rm --security-opt seccomp=/tmp/no-trace.json \
+            -v "$PWD:/w" -w /w ubuntu:24.04 \
+            sh -c './target/release/arc doctor && ./target/release/arc run -- echo ok')
+          echo "$out"
+          grep -q 'preferred *snapshot' <<<"$out"
+          grep -q 'file reads *unsupported' <<<"$out"
+          grep -q 'best completeness *partial' <<<"$out"
