@@ -38,6 +38,8 @@
 //! [`Downgrade`](crate::trace::Downgrade).
 
 mod backend;
+mod recorder;
+pub mod seccomp;
 mod state;
 mod sys;
 mod syscalls;
@@ -45,7 +47,7 @@ mod syscalls;
 pub use backend::{CAPABILITIES, NAME};
 
 use crate::paths::Classifier;
-use crate::trace::Tracer;
+use crate::trace::{BackendStatus, Selection, Tracer};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -61,17 +63,43 @@ pub fn availability() -> (bool, Option<String>) {
     }
 }
 
-/// # Safety
-///
-/// Between `fork` and `exec` in the child only. See [`sys::traceme`].
-pub(crate) unsafe fn traceme() -> std::io::Result<()> {
-    sys::traceme()
+/// Every Linux backend, strongest first, and why each unavailable one is.
+pub fn backends() -> Vec<BackendStatus> {
+    let (fast, fast_why) = seccomp::availability();
+    let (ptrace, ptrace_why) = availability();
+    vec![
+        BackendStatus {
+            name: seccomp::NAME,
+            available: fast,
+            reason: fast_why,
+            complete: true,
+        },
+        BackendStatus {
+            name: NAME,
+            available: ptrace,
+            reason: ptrace_why,
+            complete: true,
+        },
+    ]
 }
 
-pub fn start(cwd: &Path, classifier: &Classifier) -> Option<Box<dyn Tracer>> {
-    availability()
-        .0
-        .then(|| Box::new(backend::LinuxTracer::new(cwd, classifier)) as Box<dyn Tracer>)
+/// Start the backend `sel` asks for, or the strongest available one.
+///
+/// A pinned backend that cannot run falls through to the next rather than
+/// failing: the point of pinning is to compare behaviour, and refusing to run
+/// would make `--trace-backend` a way to break a build. `arc doctor` and
+/// `--trace` both report which one actually ran.
+pub fn start(cwd: &Path, classifier: &Classifier, sel: Selection) -> Option<Box<dyn Tracer>> {
+    let ptrace = || {
+        availability()
+            .0
+            .then(|| Box::new(backend::LinuxTracer::new(cwd, classifier)) as Box<dyn Tracer>)
+    };
+    match sel {
+        Selection::Auto | Selection::Fast => seccomp::start(cwd, classifier).or_else(ptrace),
+        Selection::Ptrace => ptrace(),
+        Selection::Snapshot | Selection::Off => None,
+    }
 }
 
 /// What Arc does with a path, before anything else looks at it.

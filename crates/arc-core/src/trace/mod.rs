@@ -11,6 +11,7 @@
 //!
 //! | Backend | Platform | Reads | Dirs | Absences | Tree | Narrows |
 //! | --- | --- | --- | --- | --- | --- | --- |
+//! | `linux-seccomp` | Linux x86-64 / aarch64, kernel ≥ 5.5 | yes | yes | yes | yes | yes |
 //! | `linux-ptrace` | Linux x86-64 / aarch64 | yes | yes | yes | yes | yes |
 //! | `snapshot+jobobject` | Windows | no | no | no | yes | no |
 //! | `snapshot` | anywhere | no | no | no | no | no |
@@ -98,6 +99,17 @@ impl Capabilities {
     }
 }
 
+/// A hook the child runs between `fork` and `exec`.
+///
+/// The two Linux backends need one and need different ones — `PTRACE_TRACEME`
+/// for the first, installing a seccomp filter for the second — so the backend
+/// supplies it rather than `exec` knowing which is in use.
+///
+/// It must be async-signal-safe, and it must not return an error for anything
+/// short of catastrophe: an error here aborts the spawn, and a tracer that
+/// cannot start must never stop the user's command from running.
+pub type PreExec = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 /// How a child must be started for a backend to observe it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launch {
@@ -120,6 +132,11 @@ pub trait Tracer {
     /// How `crate::exec` must start the child for this backend.
     fn launch(&self) -> Launch {
         Launch::Normal
+    }
+
+    /// Run in the child, after `fork` and before `exec`.
+    fn pre_exec(&self) -> Option<PreExec> {
+        None
     }
 
     /// Called after the child is spawned, with its pid, so backends that follow
@@ -147,6 +164,11 @@ pub trait Tracer {
 pub enum Selection {
     #[default]
     Auto,
+    /// The lowest-overhead complete backend. Falls back rather than failing,
+    /// because a pinned backend that is unavailable is a reason to be slower,
+    /// not a reason to refuse to run.
+    Fast,
+    Ptrace,
     Snapshot,
     Off,
 }
@@ -155,15 +177,21 @@ impl Selection {
     pub fn parse(s: &str) -> Option<Selection> {
         match s {
             "auto" => Some(Selection::Auto),
+            "fast" | "seccomp" => Some(Selection::Fast),
+            "ptrace" => Some(Selection::Ptrace),
             "snapshot" => Some(Selection::Snapshot),
             "off" | "none" => Some(Selection::Off),
             _ => None,
         }
     }
 
+    pub const NAMES: &'static str = "auto, fast, ptrace, snapshot or off";
+
     pub fn name(&self) -> &'static str {
         match self {
             Selection::Auto => "auto",
+            Selection::Fast => "fast",
+            Selection::Ptrace => "ptrace",
             Selection::Snapshot => "snapshot",
             Selection::Off => "off",
         }
@@ -191,22 +219,40 @@ pub struct Probe {
     pub reason: Option<String>,
     /// The backend that will be used instead when `available` is false.
     pub fallback: &'static str,
+    /// Every backend this platform has, strongest first, with the reason each
+    /// unavailable one is unavailable. `arc doctor` renders it verbatim.
+    pub backends: Vec<BackendStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendStatus {
+    pub name: &'static str,
+    pub available: bool,
+    pub reason: Option<String>,
+    pub complete: bool,
 }
 
 pub fn probe() -> Probe {
     #[cfg(target_os = "linux")]
     {
-        let (available, reason) = linux::availability();
+        let backends = linux::backends();
+        let best = backends.iter().find(|b| b.available);
+        let available = best.map(|b| b.complete).unwrap_or(false);
         Probe {
-            name: linux::NAME,
+            name: best.map(|b| b.name).unwrap_or("snapshot"),
             capabilities: if available {
                 linux::CAPABILITIES
             } else {
                 snapshot::CAPABILITIES
             },
             available,
-            reason,
+            reason: backends
+                .iter()
+                .find(|b| !b.available)
+                .filter(|_| !available)
+                .and_then(|b| b.reason.clone()),
             fallback: "snapshot",
+            backends,
         }
     }
     #[cfg(windows)]
@@ -217,6 +263,7 @@ pub fn probe() -> Probe {
             available: true,
             reason: None,
             fallback: "snapshot",
+            backends: Vec::new(),
         }
     }
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -227,6 +274,7 @@ pub fn probe() -> Probe {
             available: true,
             reason: None,
             fallback: "snapshot",
+            backends: Vec::new(),
         }
     }
 }
@@ -240,10 +288,8 @@ pub fn start(root: &Path, classifier: &Classifier, sel: Selection) -> Option<Box
         return None;
     }
     #[cfg(target_os = "linux")]
-    if sel == Selection::Auto {
-        if let Some(t) = linux::start(root, classifier) {
-            return Some(t);
-        }
+    if let Some(t) = linux::start(root, classifier, sel) {
+        return Some(t);
     }
     let snap = snapshot::SnapshotTracer::start(root, classifier);
     #[cfg(windows)]
@@ -261,18 +307,6 @@ pub fn start(root: &Path, classifier: &Classifier, sel: Selection) -> Option<Box
 /// and by capability gating before a run.
 pub fn platform_capabilities() -> Capabilities {
     probe().capabilities
-}
-
-/// Place the calling process under its parent's control, immediately before
-/// `exec`. Called from `crate::exec`'s `pre_exec` hook and nowhere else.
-///
-/// # Safety
-///
-/// Must only be called between `fork` and `exec` in the child. The one syscall
-/// it makes is async-signal-safe.
-#[cfg(target_os = "linux")]
-pub(crate) unsafe fn traceme() -> std::io::Result<()> {
-    linux::traceme()
 }
 
 pub fn platform_backend_name() -> &'static str {

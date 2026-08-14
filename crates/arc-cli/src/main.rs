@@ -55,7 +55,7 @@ enum Cmd {
         /// Never send this command to a remote worker
         #[arg(long)]
         no_remote_execution: bool,
-        /// Pin the tracing backend: auto, snapshot, or off
+        /// Pin the tracing backend: auto, fast, ptrace, snapshot, or off
         #[arg(long, value_name = "NAME", default_value = "auto")]
         trace_backend: String,
         /// Show observed paths and processes individually, not just counts
@@ -322,7 +322,10 @@ fn real_main() -> Result<i32> {
                     _ => None,
                 },
                 backend: arc_core::trace::Selection::parse(&trace_backend).with_context(|| {
-                    format!("unknown --trace-backend `{trace_backend}`; use auto, snapshot or off")
+                    format!(
+                        "unknown --trace-backend `{trace_backend}`; use {}",
+                        arc_core::trace::Selection::NAMES
+                    )
                 })?,
             },
             Display {
@@ -783,9 +786,19 @@ fn render_trace(report: &engine::RunReport, verbose: bool) {
     eprintln!("{}", ui::row("command", &report.record.command_line()));
     eprintln!(
         "{}",
+        // What actually ran, not what this platform prefers: `--trace-backend`
+        // and a fallback both make those differ.
         ui::row(
             "backend",
-            &ui::accent(arc_core::trace::platform_backend_name())
+            &ui::accent(
+                report
+                    .record
+                    .trace
+                    .as_ref()
+                    .map(|t| t.backend.clone())
+                    .unwrap_or_else(|| arc_core::trace::platform_backend_name().to_string())
+                    .as_str()
+            )
         )
     );
     eprintln!("{}", ui::row("processes", &obs.processes.len().to_string()));
@@ -2667,8 +2680,19 @@ fn cmd_doctor(home: &Path, cwd: &Path) -> Result<()> {
 
     println!("\n{}\n", ui::bold("tracing"));
     let probe = arc_core::trace::probe();
-    println!("{}", ui::row("backend", &ui::accent(probe.name)));
+    println!("{}", ui::row("preferred", &ui::accent(probe.name)));
     println!("{}", ui::row("available", &check(probe.available)));
+    for b in &probe.backends {
+        let state = match (&b.available, &b.reason) {
+            (true, _) => ui::green("available"),
+            (false, Some(r)) => ui::dim(r),
+            (false, None) => ui::dim("unavailable"),
+        };
+        println!("{}", ui::row(b.name, &state));
+    }
+    if !probe.backends.is_empty() {
+        println!("{}", ui::row("snapshot", &ui::green("available")));
+    }
     if let Some(reason) = &probe.reason {
         // Naming the actual obstacle is the difference between a message a user
         // can act on and one they can only shrug at.
