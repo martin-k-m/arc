@@ -248,10 +248,71 @@ pub fn execution_key(k: &KeyInputs<'_>) -> Digest {
     h.finish()
 }
 
+/// Where the command runs, named relative to the project.
+///
+/// This is what makes an execution key portable: two checkouts of the same
+/// repository at different absolute paths produce the same family. The
+/// fallback — the absolute path, for a working directory genuinely outside the
+/// project — is machine-specific by nature, so reaching it by accident quietly
+/// destroys cross-machine reuse.
+///
+/// It was reachable by accident. The project root arrives resolved and the
+/// working directory arrives as the process was handed it, so on a machine
+/// where those are spelled differently — a Windows 8.3 short name, macOS's
+/// `/var` symlink to `/private/var` — a plain `strip_prefix` failed and every
+/// key silently became local to one machine. Both sides are resolved first.
 pub fn rel_cwd(root: &Path, cwd: &Path) -> String {
-    cwd.strip_prefix(root)
+    let root = crate::paths::canonical_root(root);
+    let cwd = crate::paths::canonical_root(cwd);
+    cwd.strip_prefix(&root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| cwd.to_string_lossy().replace('\\', "/"))
+}
+
+/// Two spellings of one root must not change a command's identity.
+///
+/// When this regressed, every execution key on the affected machine became
+/// local to it: `strip_prefix` failed, the absolute working directory went into
+/// the family key, and no two checkouts ever agreed. Nothing failed loudly —
+/// cross-machine reuse simply stopped happening.
+#[cfg(test)]
+mod rel_cwd_tests {
+    use std::path::Path;
+
+    #[test]
+    fn a_working_directory_inside_the_project_is_named_relative_to_it() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("repo");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert_eq!(super::rel_cwd(&root, &root), "");
+        assert_eq!(super::rel_cwd(&root, &root.join("sub")), "sub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_reached_through_a_symlink_still_yields_a_relative_path() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The project root resolved one way, the working directory the other:
+        // exactly the shape macOS produces with /var and /private/var.
+        assert_eq!(super::rel_cwd(&real, &link.join("sub")), "sub");
+        assert_eq!(super::rel_cwd(&link, &real.join("sub")), "sub");
+    }
+
+    #[test]
+    fn a_working_directory_outside_the_project_keeps_its_absolute_name() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("repo");
+        let other = t.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let got = super::rel_cwd(&root, &other);
+        assert!(Path::new(&got).is_absolute(), "{got}");
+    }
 }
 
 pub fn find_program_or_explain(program: &str, cwd: &Path) -> Result<PathBuf> {
