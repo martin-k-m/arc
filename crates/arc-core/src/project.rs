@@ -66,11 +66,18 @@ pub struct TraceConfig {
     /// of the project per run; turn it off for very large trees where the walk
     /// outweighs the command.
     pub enabled: bool,
+    /// Which backend to prefer: `auto`, `fast`, `ptrace`, `snapshot` or `off`.
+    /// A backend that cannot run here falls back rather than failing, so this
+    /// is a preference and not an assertion about the machine.
+    pub backend: crate::trace::Selection,
 }
 
 impl Default for TraceConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            backend: crate::trace::Selection::Auto,
+        }
     }
 }
 

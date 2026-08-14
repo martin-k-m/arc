@@ -37,6 +37,29 @@ Arc is language-agnostic. It caches `cargo test`, `npm test`, `pytest`,
 
 ## Install
 
+Linux and macOS:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/martin-k-m/arc/main/scripts/install.sh
+sh install.sh
+```
+
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/martin-k-m/arc/main/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1
+```
+
+Both download the release archive for your platform, **verify its SHA-256
+against the published checksum file**, and install into a user directory —
+no root, no administrator. Read the script before running it; neither needs to
+be piped into a shell.
+
+You can also take an archive directly from the
+[releases page](https://github.com/martin-k-m/arc/releases), or build from
+source:
+
 ```bash
 cargo install --path crates/arc-cli
 ```
@@ -131,13 +154,14 @@ Once several commands are known, those same facts become a graph: see
 
 ```console
 $ arc doctor
-
-◆ DOCTOR  0.3.0
-  platform            linux / x86_64
-  ...
+...
 tracing
-  backend             linux-ptrace
+
+  preferred           linux-seccomp
   available           yes
+  linux-seccomp       available
+  linux-ptrace        available
+  snapshot            available
   file reads          supported
   file writes         supported
   directory reads     supported
@@ -150,18 +174,29 @@ tracing
   automatic narrowing supported
 ```
 
-The backend needs no privileges: the child places *itself* under observation
-before `exec`, so it works under `kernel.yama.ptrace_scope = 1` and in ordinary
-containers. Where a seccomp profile forbids `ptrace`, `arc doctor` says so and
-names the reason, and Arc falls back rather than failing:
+Neither Linux backend needs privileges — no `sudo`, no capability, no daemon, no
+kernel module. The child places *itself* under observation before `exec`, so
+tracing works under `kernel.yama.ptrace_scope = 1` and in ordinary containers.
+
+Arc prefers `linux-seccomp`, which uses seccomp user notification and is three
+to six times cheaper than ptrace on syscall-heavy work. Where a sandbox forbids
+one of them — Docker's default profile denies the `seccomp` syscall — `arc
+doctor` names the reason and Arc falls back rather than failing:
 
 ```console
 tracing
-  backend             linux-ptrace
-  available           no
-  reason              ptrace denied, most likely by a container seccomp profile
-  fallback            snapshot
+
+  preferred           linux-ptrace
+  available           yes
+  linux-seccomp       unavailable: seccomp denied, most likely by a container profile
+  linux-ptrace        available
+  snapshot            available
 ```
+
+Availability is proved rather than assumed: Arc forks a child, installs a
+one-syscall filter, receives a real notification and checks the answer took
+effect. [docs/tracing.md](docs/tracing.md) covers both backends, how they are
+selected, and the differential suite that holds them to the same meaning.
 
 **A trace only counts as complete if it really was.** Any of these makes it
 partial, and a partial trace never narrows:
@@ -313,6 +348,7 @@ cache_failures = false     # cache non-zero exits too
 
 [trace]
 enabled = true             # observe executions to learn their dependencies
+backend = "auto"           # auto, fast, ptrace, snapshot or off
 
 [inputs]
 include = ["src/**", "Cargo.toml", "Cargo.lock"]   # empty = whole project
@@ -735,11 +771,21 @@ independent 200 ms tasks, each a full `arc run` with its own cache lookup:
 | 4 | 809 ms |
 | 8 | 572 ms |
 
-Read the tracing numbers honestly: **ptrace tracing is expensive.** It stops the traced process
-twice per syscall, so syscall-dense work slows by roughly 40× — the same
-workload under `strace -f` takes 243 ms against Arc's 269 ms, so essentially all
-of that cost is ptrace itself, not Arc's bookkeeping. On a compile, where the
-work is CPU rather than syscalls, it is closer to 7×.
+Read the tracing numbers honestly: **learning dependencies is expensive.** How
+expensive depends on the backend. `scripts/trace-bench.sh`, median of 5 on Linux
+x86-64, where `snapshot` is Arc doing everything *except* watching syscalls:
+
+| Workload | Direct | snapshot | ptrace | **seccomp** |
+| --- | --- | --- | --- | --- |
+| Read 300 files | 107 ms | 156 ms | 1316 ms | **484 ms** |
+| 200 short-lived children | 69 ms | 127 ms | 740 ms | **228 ms** |
+| 200 directory enumerations | 132 ms | 172 ms | 1524 ms | **509 ms** |
+| Produce 200 outputs | 6 ms | 391 ms | 526 ms | **428 ms** |
+
+Subtracting `snapshot` isolates what tracing itself costs: seccomp is 3.5×, 6.1×
+and 4.0× cheaper than ptrace on the first three. On the fourth the time goes on
+capturing 200 output files, which both backends pay equally — tracing is not the
+expensive part of that workload.
 
 What makes the trade worth it is the last column. **A cache hit never starts the
 tracer**: it fingerprints the learned dependency set and replays. That is why a
@@ -749,8 +795,12 @@ anything.
 
 ## Status
 
-Working today: local execution caching; complete dependency tracing on Linux with
-automatic input narrowing; a task graph inferred from observed output-to-input
+Arc is 1.0. The command line, `arc.toml`, `--json` output, the remote protocols
+and the stored formats are stable surfaces from here on — see
+[CHANGELOG.md](CHANGELOG.md) for exactly what that covers and what it does not.
+
+Working today: local execution caching; complete dependency tracing on Linux
+through two rootless backends, with automatic input narrowing; a task graph inferred from observed output-to-input
 relationships, with transitive affected analysis and bounded-parallel selective
 execution; content-addressed storage with deduplication; output
 capture and restore; execution-family identity; learned dependency sets with
@@ -775,6 +825,36 @@ hermeticity reporting do not, so use host mode there), packaging of the kernel o
 the C library, downloading toolchains from anywhere,
 container or VM management for workers, distributed worker scheduling, cloud
 storage backends for the cache server, and any agent protocol. `arc doctor` reports capabilities honestly.
+
+### Platform support
+
+| | tracing | automatic narrowing | cache | shared cache | remote execution | environments |
+| --- | --- | --- | --- | --- | --- | --- |
+| Linux x86-64 | seccomp / ptrace | yes | yes | yes | yes | yes |
+| Linux aarch64 | seccomp / ptrace | yes | yes | yes | yes | yes |
+| Windows x86-64 | snapshot + job object | no | yes | yes | yes | host mode |
+| macOS x86-64 / arm64 | snapshot | no | yes | yes | yes | host mode |
+
+Only what CI exercises is listed as supported. Where a platform cannot observe
+reads, Arc does not narrow — it falls back to the conservative project scan,
+which is slower and always correct.
+
+## Documentation
+
+| | |
+| --- | --- |
+| [correctness.md](docs/correctness.md) | what authorizes a cache hit, and what Arc does not guarantee |
+| [architecture.md](docs/architecture.md) | how the pieces fit together |
+| [tracing.md](docs/tracing.md) | the tracing backends, their limits and their cost |
+| [environments.md](docs/environments.md) | content-addressed toolchains |
+| [remote-execution.md](docs/remote-execution.md) | workers, eligibility, the sandbox |
+| [remote-protocol.md](docs/remote-protocol.md) | the shared-cache wire format |
+| [ci.md](docs/ci.md) | `arc ci`, trust policy, GitHub Actions |
+| [security.md](docs/security.md) | threat model, what leaves your machine |
+| [troubleshooting.md](docs/troubleshooting.md) | why did this miss, why is my trace partial |
+
+[CHANGELOG.md](CHANGELOG.md) records what is stable and what compatibility
+means. [CONTRIBUTING.md](CONTRIBUTING.md) covers building and testing.
 
 ## License
 

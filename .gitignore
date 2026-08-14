@@ -1,2 +1,8 @@
 /target
 **/*.rs.bk
+
+# Arc's own state, and anything a benchmark or demo script leaves behind.
+/.arc
+arc-cache-data/
+arc-worker-data/
+/dist

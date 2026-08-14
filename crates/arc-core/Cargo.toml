@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Core engine for Arc: dependency tracing, cache keys, CAS and scheduling"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true

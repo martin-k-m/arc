@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Reference remote cache server for Arc"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "arc-cache"
