@@ -60,6 +60,15 @@ jobs:
         run: ./target/release/arc doctor
       - name: default sandbox
         run: cargo test --workspace --test linux_trace
+      # The runner is a VM, not a container, so both Linux backends are really
+      # available here and the differential suite actually compares them rather
+      # than skipping. If it starts skipping, that is a regression in
+      # availability detection and worth failing on.
+      - name: ptrace against seccomp
+        run: |
+          ./target/release/arc doctor | grep -q 'linux-seccomp *available' ||
+            { echo "the fast backend is unavailable on this runner" >&2; exit 1; }
+          cargo test -p arc-cli --test trace_differential
       - name: ptrace forbidden
         run: |
           docker run --rm \

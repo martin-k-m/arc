@@ -126,6 +126,13 @@ fn probe() -> Result<(), String> {
     drop(child);
 
     let outcome = probe_round_trip(parent_fd);
+    // Closing this end before waiting is load-bearing. The child blocks in
+    // `read`, waiting for the acknowledgement that Arc holds its listener; if
+    // the round trip failed that acknowledgement is never coming, and the only
+    // thing that unblocks the child is end-of-file. Waiting first would hang
+    // here forever — which is exactly what a sandbox permitting `seccomp` but
+    // denying `pidfd_getfd` produces.
+    drop(parent);
     let mut status: libc::c_int = 0;
     // SAFETY: `status` is a live local and `pid` is this process's own child.
     unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -138,7 +145,13 @@ fn probe() -> Result<(), String> {
     }
     match libc::WEXITSTATUS(status) {
         0 => outcome,
-        EXIT_NO_SEND => Err("the probe child could not hand over its listener".into()),
+        // The child reports this whenever the handover did not complete, which
+        // includes the case where *Arc* was the side that failed. Arc's own
+        // error is the specific one, so it wins where there is one.
+        EXIT_NO_SEND => match outcome {
+            Err(e) => Err(e),
+            Ok(()) => Err("the probe child could not hand over its listener".into()),
+        },
         EXIT_WRONG_RESULT => {
             Err("this kernel does not support SECCOMP_USER_NOTIF_FLAG_CONTINUE".into())
         }
@@ -150,7 +163,7 @@ fn probe() -> Result<(), String> {
 fn probe_round_trip(parent: std::os::unix::io::RawFd) -> Result<(), String> {
     let listener = match sys::acquire(parent) {
         Ok(fd) => fd,
-        Err(e) => return Err(format!("no listener arrived: {e}")),
+        Err(e) => return Err(e.to_string()),
     };
     // SAFETY: the descriptor came from `pidfd_getfd` and is owned here.
     let listener = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(listener) };
@@ -203,5 +216,21 @@ mod tests {
         if let Some(r) = reason {
             assert!(!r.is_empty());
         }
+    }
+
+    /// The probe blocks a child on a socket while it copies a descriptor out.
+    /// A sandbox that permits `seccomp` but denies `pidfd_getfd` used to leave
+    /// both sides waiting for each other, which turned `arc doctor` into a
+    /// hang. Whatever the answer is, it has to arrive.
+    #[test]
+    fn deciding_availability_terminates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::availability().0);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(),
+            "the seccomp probe did not finish"
+        );
     }
 }

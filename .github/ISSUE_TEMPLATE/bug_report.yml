@@ -1,0 +1,55 @@
+name: Bug report
+description: Something Arc did that it should not have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this is a **false cache hit** — Arc reused a result it should not
+        have — say so first. Those are treated as release blockers.
+
+        Please do not paste credentials. `arc doctor` is designed to be safe to
+        include; if you think it printed something sensitive, that is itself a
+        bug worth reporting privately through the Security tab.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what Arc did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest sequence of commands that shows it.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: arc --version
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: arc doctor
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and architecture
+      placeholder: Ubuntu 24.04 x86_64 / Windows 11 / macOS 15 arm64
+    validations:
+      required: true
+  - type: dropdown
+    id: remote
+    attributes:
+      label: Is a shared cache or a remote worker involved?
+      options: ["No, local only", "Shared cache", "Remote execution"]
+    validations:
+      required: true

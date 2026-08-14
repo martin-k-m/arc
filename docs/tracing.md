@@ -34,6 +34,15 @@ arc run --trace-backend auto|fast|ptrace|snapshot|off -- <command>
 ARC_TRACE_BACKEND=fast arc run -- <command>
 ```
 
+```toml
+[trace]
+backend = "auto"
+```
+
+The command line wins, then `ARC_TRACE_BACKEND`, then `arc.toml`, then the
+default — so a CI job can pin a backend without editing the project, and a
+single run can override even that.
+
 `auto` — the default — takes the lowest-overhead backend that is actually
 available. A pinned backend that cannot run **falls back rather than failing**:
 pinning is a preference, not an assertion about the machine. `arc doctor` reports

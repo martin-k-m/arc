@@ -1,0 +1,23 @@
+name: Feature request
+description: Something Arc should be able to do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Arc makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: Optional. The problem matters more than the proposed shape.
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness
+      description: >
+        If this would let Arc skip more work, what makes that safe? Arc will
+        take a false miss over a false hit every time.

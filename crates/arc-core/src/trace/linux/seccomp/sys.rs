@@ -244,9 +244,19 @@ pub unsafe fn announce(sock: RawFd, listener: RawFd) -> io::Result<()> {
     msg[..4].copy_from_slice(&(libc::getpid() as u32).to_ne_bytes());
     msg[4..].copy_from_slice(&(listener as u32).to_ne_bytes());
     write_all(sock, &msg)?;
-    // Block until Arc confirms it holds its own reference. Without this the
+    // Wait for Arc to confirm it holds its own reference. Without this the
     // listener could close at `exec` first, and every filtered syscall in the
     // tree would then fail with ENOSYS.
+    //
+    // Bounded, because this runs between `fork` and `exec` in the process the
+    // user actually wants to run: an Arc that dies, or that cannot copy the
+    // descriptor out, must not leave the command blocked here forever.
+    if !wait_readable(sock, HANDOVER_TIMEOUT_MS) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Arc never acknowledged the seccomp listener",
+        ));
+    }
     let mut ack = [0u8; 1];
     read_exact(sock, &mut ack)
 }
@@ -281,7 +291,11 @@ pub fn acquire(sock: RawFd) -> io::Result<RawFd> {
         );
         libc::close(pidfd as RawFd);
         if got < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("pidfd_getfd was refused ({e}); a container profile that allows seccomp but not pidfd_getfd is the usual cause"),
+            ));
         }
         got as RawFd
     };

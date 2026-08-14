@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             };
             let server = arc_cache::Server::start(arc_cache::Options {
                 data: data.clone(),
-                addr: listen,
+                addr: listen.clone(),
                 token,
                 threads,
                 faults: Default::default(),
@@ -67,6 +67,14 @@ fn main() -> Result<()> {
                     "open"
                 }
             );
+            if token_env.is_none() && !is_loopback(&listen) {
+                eprintln!(
+                    "  warning: this is an open cache on a non-loopback address.\n\
+                     \x20          Anyone who can reach it can read and write cached results,\n\
+                     \x20          which are executable outputs. Use --token-env, or keep it\n\
+                     \x20          behind a trusted network boundary."
+                );
+            }
             wait_for_signal();
             println!("\nshutting down");
             server.shutdown();
@@ -81,6 +89,16 @@ fn main() -> Result<()> {
             println!("tasks      {tasks}");
             Ok(())
         }
+    }
+}
+
+/// A bind address that only the local machine can reach. An unparseable or
+/// name-based address is treated as reachable, because it might be.
+fn is_loopback(listen: &str) -> bool {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    match listen.to_socket_addrs() {
+        Ok(mut it) => it.all(|a: SocketAddr| a.ip().is_loopback()),
+        Err(_) => false,
     }
 }
 

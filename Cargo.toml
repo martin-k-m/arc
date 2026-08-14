@@ -3,10 +3,15 @@ resolver = "2"
 members = ["crates/arc-core", "crates/arc-cli", "crates/arc-cache", "crates/arc-worker"]
 
 [workspace.package]
-version = "0.8.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
+repository = "https://github.com/martin-k-m/arc"
+homepage = "https://github.com/martin-k-m/arc"
+readme = "README.md"
+keywords = ["cache", "build", "ci", "incremental", "task-runner"]
+categories = ["development-tools", "development-tools::build-utils", "caching"]
 
 [workspace.dependencies]
 arc-core = { path = "crates/arc-core" }

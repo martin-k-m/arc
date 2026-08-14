@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             };
             let worker = Worker::start(Options {
                 data: data.clone(),
-                addr: listen,
+                addr: listen.clone(),
                 execute_token,
                 read_token,
                 max_jobs,
@@ -103,6 +103,14 @@ fn main() -> Result<()> {
                 }
             );
             println!("  network    unrestricted (commands reach what this host reaches)");
+            if token_env.is_none() && !is_loopback(&listen) {
+                eprintln!(
+                    "  warning: this is an open worker on a non-loopback address.
+                                Anyone who can reach it can run arbitrary commands on this
+                                host as this user. Use --token-env, or keep it behind a
+                                trusted network boundary."
+                );
+            }
             wait_for_signal();
             println!("\nstopping");
             drop(worker);
@@ -128,6 +136,16 @@ fn token(var: Option<&str>) -> Result<Option<String>> {
         .with_context(|| format!("{name} is not set, so no token could be read"))?;
     anyhow::ensure!(!value.trim().is_empty(), "{name} is empty");
     Ok(Some(value.trim().to_string()))
+}
+
+/// A bind address that only the local machine can reach. An unparseable or
+/// name-based address is treated as reachable, because it might be.
+fn is_loopback(listen: &str) -> bool {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    match listen.to_socket_addrs() {
+        Ok(mut it) => it.all(|a: SocketAddr| a.ip().is_loopback()),
+        Err(_) => false,
+    }
 }
 
 static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

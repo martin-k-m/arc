@@ -1,0 +1,172 @@
+name: release
+
+# Only a version tag publishes. Nothing here runs off a branch push, so a
+# release cannot happen by accident.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run; nothing is published)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # The tag and the workspace version must agree before anything is built.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          tag="${GITHUB_REF_NAME#refs/tags/}"
+          [ "${{ github.event_name }}" = workflow_dispatch ] && tag="${{ inputs.tag }}"
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "v$version" ]; then
+            echo "tag $tag does not match workspace version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: git config --global user.email ci@example.com
+      - run: git config --global user.name ci
+      - run: cargo test --workspace --all-features
+      - run: cargo build --workspace --release --locked
+
+  build:
+    needs: [verify, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p arc-cli -p arc-cache -p arc-worker
+
+      # Every archive holds the three binaries, the licence and the readme, at
+      # the archive root — so extracting one gives a usable install with no
+      # nested directory to guess at.
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.verify.outputs.version }}"
+          t="${{ matrix.target }}"
+          stage="arc-v$v-$t"
+          mkdir -p "$stage"
+          bin="target/$t/release"
+          if [ -f "$bin/arc.exe" ]; then
+            cp "$bin/arc.exe" "$bin/arc-cache.exe" "$bin/arc-worker.exe" "$stage/"
+          else
+            cp "$bin/arc" "$bin/arc-cache" "$bin/arc-worker" "$stage/"
+          fi
+          cp LICENSE README.md CHANGELOG.md "$stage/"
+          mkdir -p dist
+          if [ -f "$stage/arc.exe" ]; then
+            7z a -tzip "dist/$stage.zip" "./$stage/*" >/dev/null
+          else
+            tar -czf "dist/$stage.tar.gz" "$stage"
+          fi
+
+      # An archive that has not been extracted and run is not known to work.
+      - name: smoke test the packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.verify.outputs.version }}"
+          t="${{ matrix.target }}"
+          mkdir -p smoke && cd smoke
+          if [ -f "../dist/arc-v$v-$t.zip" ]; then
+            7z x "../dist/arc-v$v-$t.zip" >/dev/null
+            arc="./arc-v$v-$t/arc.exe"
+          else
+            tar -xzf "../dist/arc-v$v-$t.tar.gz"
+            arc="./arc-v$v-$t/arc"
+          fi
+          # A cross-built binary cannot run on the builder. Everything here is
+          # native, so if that ever changes this guard is the thing to revisit.
+          "$arc" --version
+          "$arc" --help >/dev/null
+          "$arc" doctor
+          mkdir -p project && cd project
+          echo one > input.txt
+          "../$arc" run -- ${{ runner.os == 'Windows' && 'cmd /c type input.txt' || 'cat input.txt' }}
+          "../$arc" run -- ${{ runner.os == 'Windows' && 'cmd /c type input.txt' || 'cat input.txt' }} 2>&1 | tee out.txt
+          grep -qi 'hit' out.txt || { echo "the second run did not hit" >&2; exit 1; }
+
+      - name: checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *; do
+            if command -v sha256sum >/dev/null; then sha256sum "$f" > "$f.sha256";
+            else shasum -a 256 "$f" > "$f.sha256"; fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arc-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: [verify, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -exec mv {} dist/ \;
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+          sha256sum -c SHA256SUMS
+          ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: CHANGELOG.md
+          fail_on_unmatched_files: true

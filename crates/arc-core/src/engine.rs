@@ -506,7 +506,10 @@ pub fn run(
                 None => None,
             };
             let tracer = (plan.cfg.trace.enabled || opts.trace)
-                .then(|| trace::start(&project.root, &plan.classifier, opts.backend))
+                .then(|| {
+                    let sel = Selection::resolve(opts.backend, plan.cfg.trace.backend);
+                    trace::start(&project.root, &plan.classifier, sel)
+                })
                 .flatten();
             let mut sup = TraceSupervisor {
                 tracer,

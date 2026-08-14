@@ -160,16 +160,19 @@ pub trait Tracer {
 /// Which backend to use. `Auto` picks the strongest available one; the rest
 /// exist so a user, a test, or `arc doctor` can pin behaviour and see the
 /// fallback path work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Selection {
     #[default]
     Auto,
     /// The lowest-overhead complete backend. Falls back rather than failing,
     /// because a pinned backend that is unavailable is a reason to be slower,
     /// not a reason to refuse to run.
+    #[serde(alias = "seccomp")]
     Fast,
     Ptrace,
     Snapshot,
+    #[serde(alias = "none")]
     Off,
 }
 
@@ -197,13 +200,22 @@ impl Selection {
         }
     }
 
-    /// `ARC_TRACE_BACKEND` overrides the default, so a container or CI job can
-    /// pin the conservative backend without editing `arc.toml`.
-    pub fn from_env() -> Selection {
-        std::env::var("ARC_TRACE_BACKEND")
+    /// Command line, then `ARC_TRACE_BACKEND`, then `arc.toml`, then the
+    /// default. The first one that is not `auto` wins, so a CI job can pin a
+    /// backend without editing the project's configuration and a single run can
+    /// override even that.
+    pub fn resolve(cli: Selection, configured: Selection) -> Selection {
+        if cli != Selection::Auto {
+            return cli;
+        }
+        let env = std::env::var("ARC_TRACE_BACKEND")
             .ok()
-            .and_then(|v| Selection::parse(&v))
-            .unwrap_or_default()
+            .and_then(|v| Selection::parse(v.trim()))
+            .unwrap_or_default();
+        if env != Selection::Auto {
+            return env;
+        }
+        configured
     }
 }
 
@@ -315,5 +327,59 @@ pub fn platform_backend_name() -> &'static str {
         p.name
     } else {
         p.fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pinned_backend_beats_the_configured_one() {
+        assert_eq!(
+            Selection::resolve(Selection::Ptrace, Selection::Snapshot),
+            Selection::Ptrace
+        );
+    }
+
+    #[test]
+    fn the_configured_backend_is_used_when_nothing_else_pins_one() {
+        assert_eq!(
+            Selection::resolve(Selection::Auto, Selection::Snapshot),
+            Selection::Snapshot
+        );
+        assert_eq!(
+            Selection::resolve(Selection::Auto, Selection::Auto),
+            Selection::Auto
+        );
+    }
+
+    #[test]
+    fn every_name_the_cli_accepts_round_trips() {
+        for s in ["auto", "fast", "ptrace", "snapshot", "off"] {
+            assert_eq!(Selection::parse(s).expect(s).name(), s);
+        }
+        assert_eq!(Selection::parse("seccomp"), Some(Selection::Fast));
+        assert_eq!(Selection::parse("none"), Some(Selection::Off));
+        assert_eq!(Selection::parse("nonsense"), None);
+    }
+
+    /// The config key and the command line must name backends the same way, so
+    /// a value learned from `--help` works in `arc.toml` too.
+    #[test]
+    fn the_config_key_accepts_the_same_names_as_the_cli() {
+        for s in [
+            "auto", "fast", "seccomp", "ptrace", "snapshot", "off", "none",
+        ] {
+            let parsed: Selection = toml::from_str(&format!("backend = \"{s}\"\n"))
+                .map(|t: Wrap| t.backend)
+                .expect(s);
+            assert_eq!(parsed, Selection::parse(s).expect(s), "{s}");
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        backend: Selection,
     }
 }
