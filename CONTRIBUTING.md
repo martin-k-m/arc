@@ -52,6 +52,7 @@ Most end-to-end tests live in `crates/arc-cli/tests/` and drive the real binary.
 
 ```bash
 scripts/trace-bench.sh      # tracing backends
+scripts/scale-bench.sh      # 1k / 10k / 100k files — watch the per-1k column
 scripts/bench.sh            # cache hits and misses
 scripts/sched-bench.sh      # the scheduler
 scripts/exec-bench.sh       # remote execution

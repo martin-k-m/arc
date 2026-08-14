@@ -724,6 +724,26 @@ Measured in a `rust:1-slim` container on Linux x86-64, median of 7
 | Read 400 files | 6 ms | 269 ms | 249 ms | **19 ms** |
 | `rustc`, 120 modules | 67 ms | 471 ms | 384 ms | **26 ms** |
 
+Arc has to stay usable as a repository gets large. `scripts/scale-bench.sh`,
+median of 3 on Linux x86-64, at 1k / 10k / 100k files:
+
+| | 1k | 10k | 100k | peak RSS at 100k |
+| --- | --- | --- | --- | --- |
+| Cold run (scan, trace, learn, store) | 63 ms | 101 ms | 590 ms | 68 MB |
+| **Warm hit** | **18 ms** | **26 ms** | **133 ms** | 47 MB |
+| Miss on an unrelated change | 17 ms | 29 ms | 131 ms | — |
+| Conservative path (whole-project scan) | 29 ms | 79 ms | 595 ms | 75 MB |
+| `arc affected` | 16 ms | 24 ms | 121 ms | — |
+| `arc graph` / `history` / `cache stats` | 11 ms | 14 ms | 12 ms | — |
+
+The column that matters is *cost per thousand files*, and it falls at every
+step — 63 → 10.1 → 5.9 ms per 1k on the cold run — because roughly 12 ms of
+each number is process start and database open, which does not scale with the
+project. Ten times the files costs about 7.5× the time on the conservative
+whole-project scan, the path every platform without a read-observing backend
+takes on every run. Nothing here is quadratic, and memory is bounded at well
+under a megabyte per thousand files.
+
 Graph operations are not where the time goes (x86-64, release,
 `cargo run -p arc-core --example graph_bench`):
 
