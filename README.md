@@ -45,9 +45,12 @@ On real projects, not that toy one:
 
 And the number that decides whether any of that matters: replaying **60
 commits of click's real history** with three per-file test tasks and no
-configuration at all, **23.3% of runs hit** — roughly one in four did no
-work, because Arc had learned that the commit changed nothing that task
-reads.
+configuration at all, **23.3% of runs hit** on the two tasks that pass.
+Roughly one in four did no work, because Arc had learned that the commit
+changed nothing that task reads. The third task exits non-zero at every
+commit for reasons unrelated to Arc, and a failing command is never cached,
+so across all 180 runs the rate is 15.6%. Both numbers, and why the task
+fails, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 Learning is not free, and a hit is not free either. The medians above are
 from a four-core container that was not idle, the maxima are two to five
@@ -774,9 +777,12 @@ because the default captures stdout, stderr and the exit code rather than
 build products.
 
 The hit rate, which is the number that decides whether the rest matters:
-**23.3%** over 60 commits of click's real history, three per-file test tasks,
-zero configuration, one run per commit and task
-(`bench/hit-rate-click.sh`). All 180 traces were complete and 177 narrowed,
+**23.3%** over 60 commits of click's real history, zero configuration, one
+run per commit and task (`bench/hit-rate-click.sh`). That rate covers the two
+of the three per-file test tasks that pass. The third, `test_basic.py`, exits
+non-zero at all 60 commits for reasons unrelated to Arc, and Arc never caches
+a non-zero exit, so those runs could only ever miss. Counting all three tasks,
+the rate over 180 runs is 15.6%. All 180 traces were complete and 177 narrowed,
 so every hit was decided by the learned dependency set rather than by hashing
 the project.
 
