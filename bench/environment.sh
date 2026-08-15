@@ -31,4 +31,10 @@ command -v strace >/dev/null && echo "  strace              $(strace --version 2
 echo
 echo "arc"
 echo "  version             $("$ARC" --version)"
-"$ARC" doctor 2>/dev/null | sed -n '/^tracing/,/^$/p' | sed 's/^/  /'
+# doctor puts a blank line immediately after the section heading, so a
+# /^tracing/,/^$/ range prints the heading and nothing else.
+"$ARC" doctor 2>/dev/null | awk '
+  /^tracing/ { on = 1 }
+  on && /^[a-z]/ && !/^tracing/ { exit }
+  on { print "  " $0 }
+'
