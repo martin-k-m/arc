@@ -137,6 +137,31 @@ fn a_file_that_was_read_is_a_dependency_and_one_that_was_not_is_free() {
 }
 
 #[test]
+fn asking_about_a_descriptor_does_not_cost_the_trace_its_completeness() {
+    needs_tracer!();
+    // glibc has implemented `fstat(fd)` as `newfstatat(fd, "", …,
+    // AT_EMPTY_PATH)` since 2.33, so a stdio program asks this about its own
+    // stdout on nearly every run. Arc models `newfstatat` as a path syscall; if
+    // it treats the empty path as a name it failed to resolve, every trace of
+    // every stdio program is partial and nothing ever narrows.
+    //
+    // `cat` is the smallest command that does it. The assertion is on the
+    // headline claim rather than on a hit, because a conservative whole-project
+    // scan hits too when nothing changed -- which is exactly how this hid.
+    let sb = Sandbox::new();
+    sb.write("input.txt", "one");
+    let log = stderr(&sb.arc(&["run", "--trace", "cat", "input.txt"]));
+    assert!(
+        log.contains("TRACE COMPLETE"),
+        "reading a file with cat must produce a complete trace:\n{log}"
+    );
+    assert!(
+        !log.contains("a path argument could not be read back"),
+        "an empty path argument is a descriptor question, not a failure:\n{log}"
+    );
+}
+
+#[test]
 fn writing_a_file_does_not_make_it_an_input() {
     needs_tracer!();
     let sb = Sandbox::new();

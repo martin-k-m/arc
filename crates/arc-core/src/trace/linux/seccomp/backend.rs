@@ -357,7 +357,20 @@ impl Session {
                 });
             }
             Sc::Stat { dir, path } => {
-                let Some(p) = self.resolve(n, dir, args[path]) else {
+                // An empty path names no file. `fstat(fd)` reaches the kernel
+                // as `newfstatat(fd, "", …, AT_EMPTY_PATH)` on every glibc
+                // since 2.33, and `fstat` is already dismissed as descriptor
+                // I/O. Dismissing it here too keeps the two backends agreeing,
+                // and keeps the trace complete: almost every program that uses
+                // stdio asks this about its own stdout, whose descriptor links
+                // to `pipe:[…]` and can never be named.
+                let Some(raw) = self.read_path(n, args[path]) else {
+                    return self.unresolved(shared);
+                };
+                if raw.is_empty() {
+                    return;
+                }
+                let Some(p) = self.join(n, dir, &raw) else {
                     return self.unresolved(shared);
                 };
                 let op = if exists(&p) {
@@ -486,7 +499,12 @@ impl Session {
     /// a dead pid could be reused and the bytes read from a stranger.
     fn resolve(&mut self, n: &seccomp_notif, dir: Dir, ptr: u64) -> Option<PathBuf> {
         let raw = self.read_path(n, ptr)?;
-        let path = Path::new(OsStr::from_bytes(&raw));
+        self.join(n, dir, &raw)
+    }
+
+    /// Join an already-read path argument onto its base.
+    fn join(&mut self, n: &seccomp_notif, dir: Dir, raw: &[u8]) -> Option<PathBuf> {
+        let path = Path::new(OsStr::from_bytes(raw));
         if path.is_absolute() {
             return Some(PathBuf::from(display_form(path)));
         }
