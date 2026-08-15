@@ -1,0 +1,28 @@
+# The configured arm of the hit-rate experiment.
+#
+# click's pytest run does not trace completely -- it reads /sys/fs/selinux
+# and /proc/mounts through the interpreter's startup -- so Arc never narrows
+# it automatically and falls back to hashing the whole project. That means
+# any commit touching any file misses every task.
+#
+# This is the configuration a user would actually write in that situation,
+# and the README names it as the supported answer: declare what each command
+# depends on. The point of measuring both arms is to separate "Arc's cache
+# does not hit" from "Arc's cache does not hit without being told anything".
+#
+# Copied into the click checkout by bench/hit-rate-click.sh.
+
+[trace]
+enabled = true
+
+[[command]]
+match = "*tests/test_basic.py*"
+inputs = ["src/click/**", "tests/test_basic.py", "pyproject.toml"]
+
+[[command]]
+match = "*tests/test_options.py*"
+inputs = ["src/click/**", "tests/test_options.py", "pyproject.toml"]
+
+[[command]]
+match = "*tests/test_arguments.py*"
+inputs = ["src/click/**", "tests/test_arguments.py", "pyproject.toml"]
