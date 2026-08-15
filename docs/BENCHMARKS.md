@@ -247,8 +247,9 @@ learned by watching.
 | `pytest tests/test_basic.py` | 60 | 0 | see below |
 | **total, excluding the failing task** | **120** | **28** | **23.3%** |
 
-**23.3%.** Roughly one run in four of a real test task, across two months of
-a real project's history, did no work.
+**23.3%.** Roughly one run in four of a real test task did no work. The 60
+commits span 2026-05-22 to 2026-06-23, one month of click's history
+(`af54674f` to `b2e30a17`).
 
 `test_basic.py` returned a non-zero exit at every one of the 60 commits, and
 it is not Arc's doing: pytest 9.1.1 removed support for passing an iterator
@@ -263,7 +264,7 @@ Two things about the quality of those hits:
 - **All 180 traces were complete, and 177 of 180 narrowed.** Every hit above
   is a narrowed hit: Arc decided the commit was irrelevant by checking the
   dependency set it had learned, not by hashing the project and finding it
-  unchanged. Before the fix in [BUGS.md](BUGS.md#1) none of them narrowed,
+  unchanged. Before the fix in [BUGS.md](BUGS.md) none of them narrowed,
   because pytest calls `fstat` on its own stdout.
 - The three non-narrowed runs are the first run of each task, which has
   nothing learned yet.
@@ -286,7 +287,7 @@ Arc's central feature works on them at all.**
 ### What a partial trace does to the same question
 
 The three whole-project workloads in the tables above all trace partial, for
-reasons listed in [LIMITATIONS.md](../LIMITATIONS.md#3). They still hit — the
+reasons listed in [LIMITATIONS.md](../LIMITATIONS.md). They still hit — the
 104× and 141× warm numbers are real — but they hit by hashing the project and
 finding nothing changed, which means any commit touching any file misses.
 Replayed over history their hit rate would be the fraction of commits that
