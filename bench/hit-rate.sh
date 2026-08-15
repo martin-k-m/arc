@@ -48,7 +48,7 @@ echo "  oldest ${commits[0]}" >&2
 echo >&2
 
 rows=()
-declare -A hits total
+declare -A hits total failed
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
@@ -58,7 +58,10 @@ for c in "${commits[@]}"; do
   # replay; the rest are build state that does not belong to any commit.
   git clean -qfd -e arc.toml -e target -e config.mak -e config.h -e '*.egg-info' 2>/dev/null || true
   short=${c:0:8}
-  changed=$(git diff-tree --no-commit-id --name-only -r "$c" | wc -l)
+  # Against the first parent, so a merge commit reports the tree change it
+  # actually introduced rather than nothing. `diff-tree` on a merge prints
+  # no names at all, which quietly reports every merge as a zero-file commit.
+  changed=$(git diff --name-only "$c^" "$c" 2>/dev/null | wc -l)
   line="  $short ($changed files)"
   for spec in "$@"; do
     task=${spec%%=*}
@@ -67,14 +70,23 @@ for c in "${commits[@]}"; do
     # JSON record is on stderr. Reading stdout here silently returns nothing,
     # which scores every run as an error -- a mistake worth naming, because
     # nothing about the output looks wrong when it happens.
-    $ARC run --json sh -c "$cmd" >/dev/null 2>"$tmp"
+    # `|| true` matters: arc returns the child's exit code, and an old commit
+    # whose tests fail under a current pytest would otherwise kill the replay.
+    # A failing run is recorded rather than dropped -- Arc never caches a
+    # non-zero exit, so those runs can only ever be misses and hiding them
+    # would flatter the rate.
+    $ARC run --json sh -c "$cmd" >/dev/null 2>"$tmp" || true
+    rc=$(grep -o '"exit_code":-\?[0-9]*' "$tmp" | head -1 | cut -d: -f2)
+    rc=${rc:-unknown}
     st=$(grep -o '"cache_status":"[A-Z_]*"' "$tmp" | head -1 | cut -d'"' -f4)
     comp=$(grep -o '"completeness":"[a-z]*"' "$tmp" | head -1 | cut -d'"' -f4)
     nar=$(grep -o '"inputs_narrowed":[a-z]*' "$tmp" | head -1 | cut -d: -f2)
     st=${st:-ERROR}; comp=${comp:-none}; nar=${nar:-false}
     total[$task]=$(( ${total[$task]:-0} + 1 ))
     [ "$st" = "HIT" ] && hits[$task]=$(( ${hits[$task]:-0} + 1 ))
-    rows+=("{\"commit\":\"$c\",\"task\":\"$task\",\"status\":\"$st\",\"completeness\":\"$comp\",\"narrowed\":$nar,\"files_changed\":$changed}")
+    [ "$rc" != "0" ] && failed[$task]=$(( ${failed[$task]:-0} + 1 ))
+    rows+=("{\"commit\":\"$c\",\"task\":\"$task\",\"status\":\"$st\",\"exit_code\":\"$rc\",\"completeness\":\"$comp\",\"narrowed\":$nar,\"files_changed\":$changed}")
+    [ "$rc" = "0" ] || st="$st!"
     line="$line  $task=$st"
   done
   echo "$line" >&2
@@ -87,7 +99,7 @@ per=()
 for task in "${!total[@]}"; do
   h=${hits[$task]:-0}; t=${total[$task]}
   th=$((th + h)); tt=$((tt + t))
-  per+=("{\"task\":\"$task\",\"runs\":$t,\"hits\":$h,\"rate\":$(awk -v h="$h" -v t="$t" 'BEGIN{printf "%.4f", h/t}')}")
+  per+=("{\"task\":\"$task\",\"runs\":$t,\"hits\":$h,\"failed_runs\":${failed[$task]:-0},\"rate\":$(awk -v h="$h" -v t="$t" 'BEGIN{printf "%.4f", h/t}')}")
 done
 
 {

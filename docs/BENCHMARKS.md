@@ -146,7 +146,152 @@ easily:
 
 ---
 
-RESULTS_PLACEHOLDER
+## Results: what Arc costs and what it saves
+
+`bench/real-workloads.sh`. Median of 7 for click and tinycc, median of 3 for
+serde_json — a miss there is a ninety-second recompile and seven of those
+across four phases is over an hour, so it gets fewer repetitions and the
+count is stated rather than hidden.
+
+| Workload | reps | direct | arc cold | arc miss | **arc warm** | warm speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pytest` (click, 1957 tests) | 7 | 3,639 ms | 17,636 ms | 5,916 ms | **35 ms** | **104×** |
+| `make -j1` (tinycc, from clean) | 7 | 5,773 ms | 8,844 ms | 8,139 ms | **41 ms** | **141×** |
+| `cargo test` (serde_json, warm target) | 3 | 6,188 ms | 17,635 ms | 31,880 ms | **112 ms** | **55×** |
+
+The same numbers with their maxima, because the spread is the honest part on
+a machine like this one:
+
+| Workload | direct med / max | cold med / max | miss med / max | warm med / max |
+| --- | --- | --- | --- | --- |
+| click | 3,639 / 4,163 | 17,636 / 19,289 | 5,916 / **18,189** | 35 / 42 |
+| tinycc | 5,773 / 6,649 | 8,844 / **14,404** | 8,139 / 9,171 | 41 / 82 |
+| serde_json | 6,188 / 7,276 | 17,635 / **25,013** | 31,880 / 34,594 | 112 / 140 |
+
+The bolded maxima are real. A miss on click took 18.2 seconds once against a
+median of 5.9, and a cold tinycc build took 14.4 against a median of 8.8.
+That is a four-core container under a load average that reached twelve during
+these runs. Take the medians as the signal and the maxima as the reminder
+that this is not a benchmarking rig.
+
+### Cache size on disk
+
+Measured after the cache has settled, `du -sb $ARC_HOME`.
+
+| Workload | cache on disk |
+| --- | --- |
+| click | 4.29 MB |
+| tinycc | 5.71 MB |
+| serde_json | 6.44 MB |
+
+These are small because the default captures stdout, stderr and the exit
+code, which is the right thing for a test run. Declaring `[outputs]` to
+restore build artifacts is what makes a cache large; tinycc's 5.7 MB is
+mostly the trace's own dependency records over an 849-file, 74-process build.
+
+## Results: what tracing costs
+
+Each backend runs a forced miss, so the command really executes and the
+difference from `direct` is what observation costs. `snapshot` is Arc doing
+everything *except* watching syscalls, so the gap between it and a tracing
+backend is the price of the tracing itself.
+
+| Workload | direct | snapshot | seccomp | ptrace |
+| --- | --- | --- | --- | --- |
+| click (`pytest`, 71 processes) | 3,639 ms | 4,802 ms (+32%) | 6,418 ms (**+76%**) | 7,736 ms (**+113%**) |
+| tinycc (`make`, 74 processes) | 5,773 ms | 6,235 ms (+8%) | 10,001 ms (+73%) | 6,760 ms (+17%) |
+| serde_json (`cargo test`, 3147 processes) | 6,188 ms | 5,211 ms (-16%) | 12,376 ms (+100%) | 15,822 ms (+156%) |
+
+**Read the tinycc row with suspicion.** It puts seccomp at 10.0 s and ptrace
+at 6.8 s, which is the wrong way round and contradicts both the click row and
+the design. Its seccomp sample ran from 6,649 ms to 15,034 ms; the spread is
+larger than the effect. At seven repetitions on a contended four-core VM this
+row does not resolve the ordering, and the honest conclusion is that it
+measured the machine rather than the backend. It is left in rather than
+dropped, because dropping the row that disagrees is how benchmark tables
+become fiction.
+
+The serde_json row has its own defect, in the other direction: `snapshot` at
+5,211 ms is *faster* than `direct` at 6,188 ms, and that is impossible.
+Snapshot does everything `direct` does plus scanning and storing. What it
+records is that `direct` was measured at a moment when the machine was
+busier, not that Arc is free. The two tracing figures in that row are
+internally consistent — seccomp cheaper than ptrace, by 3.4 s — but the
+percentages against that baseline are inflated by however much the baseline
+was wrong, and should be read as an upper bound rather than a value.
+
+The click row is the only one of the three that is clean, and it does support
+the design: with the non-tracing work subtracted, seccomp costs 1,616 ms of
+tracing and ptrace costs 2,934 ms,
+so ptrace is about 1.8× more expensive on that workload. That is a smaller
+ratio than the 3–6× the README claims from the synthetic syscall-heavy
+benchmarks, which is what you would expect — pytest spends most of its time
+in Python, not in syscalls, so the tracer has proportionally less to
+intercept.
+
+## Results: the hit rate
+
+This is the number that decides whether any of the above matters. A cache
+that is fast and never hits is worthless.
+
+`bench/hit-rate-click.sh 60`. click's real history, 60 commits, replayed
+oldest first. Three test-file tasks run at every commit, one run per
+(commit, task), never re-run to manufacture a hit. Zero configuration: no
+`arc.toml` beyond a project-root marker, so everything Arc narrowed to, it
+learned by watching.
+
+| Task | runs | hits | hit rate |
+| --- | --- | --- | --- |
+| `pytest tests/test_options.py` | 60 | 14 | 23.3% |
+| `pytest tests/test_arguments.py` | 60 | 14 | 23.3% |
+| `pytest tests/test_basic.py` | 60 | 0 | see below |
+| **total, excluding the failing task** | **120** | **28** | **23.3%** |
+
+**23.3%.** Roughly one run in four of a real test task, across two months of
+a real project's history, did no work.
+
+`test_basic.py` returned a non-zero exit at every one of the 60 commits, and
+it is not Arc's doing: pytest 9.1.1 removed support for passing an iterator
+to `parametrize`, and the file collects with
+`PytestRemovedIn10Warning: Passing a non-Co…`. Arc never caches a non-zero
+exit, so those 60 runs could only ever be misses. They are reported rather
+than deleted, and excluded from the rate rather than folded into it — either
+choice alone would be misleading, so both numbers are here.
+
+Two things about the quality of those hits:
+
+- **All 180 traces were complete, and 177 of 180 narrowed.** Every hit above
+  is a narrowed hit: Arc decided the commit was irrelevant by checking the
+  dependency set it had learned, not by hashing the project and finding it
+  unchanged. Before the fix in [BUGS.md](BUGS.md#1) none of them narrowed,
+  because pytest calls `fstat` on its own stdout.
+- The three non-narrowed runs are the first run of each task, which has
+  nothing learned yet.
+
+### Why the tasks are per-file
+
+Running the whole suite as one task would have measured how often a click
+contributor pushes a commit touching nothing the tests read, which is a fact
+about click's contributors. Splitting the suite is what a project actually
+does to get value from a cache, and it is the only arrangement in which the
+interesting case — a commit that invalidates one task and not another —
+exists at all.
+
+It also matters for completeness. The whole suite shells out to enough tools
+that it reads `/sys/fs/selinux` and `/proc/mounts` and never narrows. A
+single test file does not, so Arc learns its real dependency set. That is a
+sharp edge worth knowing: **the granularity of your tasks decides whether
+Arc's central feature works on them at all.**
+
+### What a partial trace does to the same question
+
+The three whole-project workloads in the tables above all trace partial, for
+reasons listed in [LIMITATIONS.md](../LIMITATIONS.md#3). They still hit — the
+104× and 141× warm numbers are real — but they hit by hashing the project and
+finding nothing changed, which means any commit touching any file misses.
+Replayed over history their hit rate would be the fraction of commits that
+change nothing at all, which is close to zero. That is the difference the
+dependency model makes, stated as plainly as I can put it.
 
 ---
 

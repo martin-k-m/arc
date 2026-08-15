@@ -28,6 +28,8 @@ BENCH=${BENCH:-/work/bench}
 export ARC_NO_ANIM=1
 export ARC_HOME
 
+DEFAULT_REPS=$REPS
+
 json_out=${JSON_OUT:-$here/results/real-workloads.json}
 mkdir -p "$(dirname "$json_out")"
 
@@ -39,6 +41,13 @@ mkdir -p "$(dirname "$json_out")"
 project_serde_json() {
   NAME="serde_json"
   DIR=$BENCH/serde_json
+  # A miss here means cargo recompiles the crate and every test binary and
+  # then runs the doc tests: about ninety seconds on four cores. Seven
+  # repetitions of that across four phases is over an hour, so this project
+  # runs fewer. The count travels with the numbers rather than being hidden,
+  # because a median of three is a weaker claim than a median of seven and
+  # the reader should be able to see which one they have.
+  REPS=${SERDE_REPS:-3}
   CMD=(cargo test)
   TOUCH=$DIR/src/lib.rs
   COMMENT="//"
@@ -93,6 +102,9 @@ warm_prep()  { $PREP; }
 
 run_project() {
   local setup=$1
+  # A project may lower REPS for itself; restore the default first so one
+  # project's override cannot leak into the next.
+  REPS=$DEFAULT_REPS
   $setup
   cd "$DIR"
 
@@ -131,22 +143,30 @@ run_project() {
 
   # What the trace actually concluded.
   local completeness
-  completeness=$("$ARC" run --trace "${CMD[@]}" 2>&1 | awk '/dependency model/ {print $3; exit}')
+  # The trace report is aligned with a variable number of spaces, so match on
+  # the label and take the last field rather than counting columns.
+  completeness=$("$ARC" run --trace "${CMD[@]}" 2>&1 \
+    | awk '/dependency model/ { print $NF; exit }')
   [ -n "$completeness" ] || completeness=unknown
 
-  cat >> "$json_out.parts" <<EOF
-{"project":"$NAME","command":"${CMD[*]}","commit":"$(git -C "$DIR" rev-parse HEAD)",
- "reps":$REPS,
- "direct_ms":{"median":$d_med,"max":$d_max},
- "cold_ms":{"median":$c_med,"max":$c_max},
- "warm_ms":{"median":$w_med,"max":$w_max},
- "miss_ms":{"median":$m_med,"max":$m_max},
- "backend_miss_ms":{"seccomp":$ov_seccomp,"ptrace":$ov_ptrace,"snapshot":$ov_snapshot},
- "overhead_pct":{"seccomp":"$(pct "$ov_seccomp" "$d_med")","ptrace":"$(pct "$ov_ptrace" "$d_med")","snapshot":"$(pct "$ov_snapshot" "$d_med")"},
- "speedup_warm":"$(ratio "$d_med" "$w_med")",
- "cache_bytes":$size,
- "dependency_model":"$completeness"}
-EOF
+  # One record per line. A multi-line record here produces a stray comma per
+  # line when the parts are joined, and the result is not valid JSON -- which
+  # is exactly what the first version of this script wrote.
+  {
+    printf '{"project":"%s","command":"%s","commit":"%s","reps":%s,' \
+      "$NAME" "${CMD[*]}" "$(git -C "$DIR" rev-parse HEAD)" "$REPS"
+    printf '"direct_ms":{"median":%s,"max":%s},' "$d_med" "$d_max"
+    printf '"cold_ms":{"median":%s,"max":%s},' "$c_med" "$c_max"
+    printf '"warm_ms":{"median":%s,"max":%s},' "$w_med" "$w_max"
+    printf '"miss_ms":{"median":%s,"max":%s},' "$m_med" "$m_max"
+    printf '"backend_miss_ms":{"seccomp":%s,"ptrace":%s,"snapshot":%s},' \
+      "$ov_seccomp" "$ov_ptrace" "$ov_snapshot"
+    printf '"overhead_pct":{"seccomp":"%s","ptrace":"%s","snapshot":"%s"},' \
+      "$(pct "$ov_seccomp" "$d_med")" "$(pct "$ov_ptrace" "$d_med")" \
+      "$(pct "$ov_snapshot" "$d_med")"
+    printf '"speedup_warm":"%s","cache_bytes":%s,"dependency_model":"%s"}\n' \
+      "$(ratio "$d_med" "$w_med")" "$size" "$completeness"
+  } >> "$json_out.parts"
 
   # The miss phases appended a line to an input on every iteration. Put the
   # tree back, or the next script to run here measures a modified checkout.

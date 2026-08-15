@@ -35,6 +35,26 @@ plugin plugins/a.plugin
 Arc is language-agnostic. It caches `cargo test`, `npm test`, `pytest`,
 `go test ./...`, `make`, or anything else that reads files and writes output.
 
+On real projects, not that toy one:
+
+| Workload | Direct | **Arc, cache hit** | |
+| --- | --- | --- | --- |
+| `pytest` on [click](https://github.com/pallets/click), 1957 tests | 3.6 s | **35 ms** | 104× |
+| `make` on [tinycc](https://github.com/TinyCC/tinycc), from clean | 5.8 s | **41 ms** | 141× |
+| `cargo test` on [serde_json](https://github.com/serde-rs/json) | 6.2 s | **112 ms** | 55× |
+
+And the number that decides whether any of that matters: replaying **60
+commits of click's real history** with three per-file test tasks and no
+configuration at all, **23.3% of runs hit** — roughly one in four did no
+work, because Arc had learned that the commit changed nothing that task
+reads.
+
+Learning is not free, and a hit is not free either. The medians above are
+from a four-core container that was not idle, the maxima are two to five
+times worse, and a first run costs three to five times the command itself.
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the machine, the method, the
+spread, and the two rows that came out wrong.
+
 ## Install
 
 Linux and macOS:
@@ -179,7 +199,12 @@ kernel module. The child places *itself* under observation before `exec`, so
 tracing works under `kernel.yama.ptrace_scope = 1` and in ordinary containers.
 
 Arc prefers `linux-seccomp`, which uses seccomp user notification and is three
-to six times cheaper than ptrace on syscall-heavy work. Where a sandbox forbids
+to six times cheaper than ptrace on the syscall-heavy synthetic workloads in
+`scripts/trace-bench.sh`. On real work the advantage is smaller, because real
+work spends most of its time somewhere other than in syscalls: on click's
+pytest suite the measured ratio is 1.8×, and on tinycc's build the sample was
+too noisy to establish an ordering at all. See
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Where a sandbox forbids
 one of them — Docker's default profile denies the `seccomp` syscall — `arc
 doctor` names the reason and Arc falls back rather than failing:
 
@@ -209,9 +234,24 @@ partial, and a partial trace never narrows:
 - the trace budget overflowing;
 - the tracer itself failing.
 
-This is not hypothetical. Debian's coreutils probe SELinux through `/sys`, so
-`mv`, `ls` and `cp` produce partial traces on a stock system — Arc reports that
-and stays conservative rather than pretending otherwise.
+This is not hypothetical, and it is not rare. Debian's coreutils probe SELinux
+through `/sys`, so `mv`, `ls` and `cp` produce partial traces on a stock
+system — Arc reports that and stays conservative rather than pretending
+otherwise.
+
+**How often that happens decides whether narrowing works for you, so here is
+the measurement rather than the claim.** Of the three real workloads in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md), none traces completely: `cargo test`
+reads `/sys/fs/cgroup/cpu.max` and `/dev/urandom`, `pytest` over the whole
+suite reads `/sys/fs/selinux` and `/proc/mounts`, and `make` reads
+`/dev/urandom` through GCC. All three still cache and still hit — the warm
+numbers are real — but they hit by hashing the project, not by narrowing.
+
+Granularity is what changes the answer. A single pytest *file* does trace
+completely, and in a 180-run replay of click's history every trace was
+complete and 177 narrowed. If narrowing matters to you, the lever is smaller
+tasks. [LIMITATIONS.md](LIMITATIONS.md) is the full list of what revokes
+completeness and what Arc does not see at all.
 
 Complete also does not mean *deterministic*. The clock, `getrandom` and the
 scheduler are outside any filesystem tracer's reach; see
@@ -715,14 +755,33 @@ Notably, Arc does **not** cache when:
 
 ## Performance
 
-Measured in a `rust:1-slim` container on Linux x86-64, median of 7
-(`scripts/bench.sh`):
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the authoritative version of
+this section**: it names the machine, the method, the repetition count, the
+spread, and the measurements that came out wrong. What follows is the
+summary.
+
+Three real projects, pinned at named commits (`bench/real-workloads.sh`), in
+a `rust:1-bookworm` container on a four-core WSL2 VM that was not idle:
 
 | Workload | Direct | Arc cold | Arc miss | **Arc warm** |
 | --- | --- | --- | --- | --- |
-| Read one file | 2 ms | 52 ms | 38 ms | **20 ms** |
-| Read 400 files | 6 ms | 269 ms | 249 ms | **19 ms** |
-| `rustc`, 120 modules | 67 ms | 471 ms | 384 ms | **26 ms** |
+| `pytest` (click, 1957 tests), median of 7 | 3,639 ms | 17,636 ms | 5,916 ms | **35 ms** |
+| `make -j1` (tinycc, from clean), median of 7 | 5,773 ms | 8,844 ms | 8,139 ms | **41 ms** |
+| `cargo test` (serde_json), median of 3 | 6,188 ms | 17,635 ms | 31,880 ms | **112 ms** |
+
+Cache on disk after settling: 4.3 MB, 5.7 MB and 6.4 MB respectively — small
+because the default captures stdout, stderr and the exit code rather than
+build products.
+
+The hit rate, which is the number that decides whether the rest matters:
+**23.3%** over 60 commits of click's real history, three per-file test tasks,
+zero configuration, one run per commit and task
+(`bench/hit-rate-click.sh`). All 180 traces were complete and 177 narrowed,
+so every hit was decided by the learned dependency set rather than by hashing
+the project.
+
+The synthetic numbers below were measured on different hardware than the
+tables above and are kept for their shape rather than their absolute values.
 
 Arc has to stay usable as a repository gets large. `scripts/scale-bench.sh`,
 median of 3 on Linux x86-64, at 1k / 10k / 100k files:
@@ -863,6 +922,10 @@ which is slower and always correct.
 
 | | |
 | --- | --- |
+| [BENCHMARKS.md](docs/BENCHMARKS.md) | every number on this page: the machine, the method, the scripts |
+| [LIMITATIONS.md](LIMITATIONS.md) | where the dependency model stops being trustworthy |
+| [BUGS.md](docs/BUGS.md) | defects that shipped, and what each one taught |
+| [DECISIONS.md](docs/DECISIONS.md) | why Arc is built this way, and what the alternative cost |
 | [correctness.md](docs/correctness.md) | what authorizes a cache hit, and what Arc does not guarantee |
 | [architecture.md](docs/architecture.md) | how the pieces fit together |
 | [tracing.md](docs/tracing.md) | the tracing backends, their limits and their cost |

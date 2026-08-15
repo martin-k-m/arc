@@ -1,0 +1,38 @@
+host
+  uname               Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+  kernel              6.18.33.2-microsoft-standard-WSL2
+  cpu model           Intel(R) Core(TM) Ultra 9 285H
+  cpus visible        4
+  memtotal            5.79 GiB
+  container           Debian GNU/Linux 12 (bookworm)
+  filesystem (/work)  overlayfs
+
+toolchains
+  rustc               rustc 1.97.1 (8bab26f4f 2026-07-14)
+  cargo               cargo 1.97.1 (c980f4866 2026-06-30)
+  gcc                 gcc (Debian 12.2.0-14+deb12u1) 12.2.0
+  make                GNU Make 4.3
+  python3             Python 3.11.2
+  git                 git version 2.39.5
+  strace              strace -- version 6.1
+
+arc
+  version             arc 1.0.0
+  tracing
+  
+    preferred           linux-seccomp
+    available           yes
+    linux-seccomp       available
+    linux-ptrace        available
+    snapshot            available
+    file reads          supported
+    file writes         supported
+    directory reads     supported
+    existence checks    supported
+    process tree        supported
+    executables         supported
+    outside project     supported
+    network detection   supported
+    best completeness   complete
+    automatic narrowing supported
+  
