@@ -70,7 +70,7 @@ asserts on `TRACE COMPLETE` rather than on a cache hit, deliberately —
 asserting on a hit is what let the original bug survive.
 
 **Compromise.** The dismissal keys on the path being empty rather than on
-`AT_EMPTY_PATH` being set. [DECISIONS.md](DECISIONS.md#8) records why that is
+`AT_EMPTY_PATH` being set. [DECISIONS.md](DECISIONS.md) records why that is
 safe and what it costs.
 
 ---
