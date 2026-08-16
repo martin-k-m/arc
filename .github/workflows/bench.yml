@@ -1,0 +1,82 @@
+name: bench
+
+# The real-workload benchmarks clone three upstream projects, build them, and
+# run each command eight times per phase. That is tens of minutes, which is
+# too slow for every push and too network-dependent to be a merge gate. It
+# runs nightly instead, and on demand.
+#
+# Nothing here gates a merge. A regression shows up as a failed run to look
+# at, not as a blocked pull request, because the numbers move with the
+# runner and a benchmark that fails the build on noise gets disabled within
+# a week.
+
+on:
+  schedule:
+    # 04:00 UTC, when the shared runners are least contended.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "timed runs per phase"
+        default: "7"
+      commits:
+        description: "commits to replay in the hit-rate experiment"
+        default: "50"
+
+jobs:
+  # The synthetic benchmarks: cheap, self-contained, no network.
+  micro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: sudo apt-get update && sudo apt-get install -y strace
+      - name: environment
+        run: bash bench/environment.sh
+      - name: micro benchmarks
+        run: bash scripts/bench.sh
+      - name: tracing backends
+        run: bash scripts/trace-bench.sh
+      - name: repository scale
+        run: bash scripts/scale-bench.sh
+      - name: graph and remote
+        run: |
+          cargo run --release -q -p arc-core --example graph_bench
+          cargo run --release -q -p arc-cache --example remote_bench
+
+  # The real-workload benchmarks and the hit-rate replay. These clone from
+  # GitHub, so they are the ones that fail for reasons that have nothing to
+  # do with Arc.
+  real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc python3-venv strace less
+      - name: fetch the pinned projects
+        run: BENCH=$PWD/../bench bash bench/fetch-projects.sh
+      - name: environment
+        run: ARC=$PWD/target/release/arc bash bench/environment.sh
+      - name: real workloads
+        run: |
+          ARC=$PWD/target/release/arc BENCH=$PWD/../bench \
+          REPS=${{ github.event.inputs.reps || 7 }} \
+            bash bench/real-workloads.sh
+      - name: hit rate
+        run: |
+          ARC=$PWD/target/release/arc BENCH=$PWD/../bench \
+            bash bench/hit-rate-click.sh ${{ github.event.inputs.commits || 50 }}
+      - name: limits probe
+        run: ARC=$PWD/target/release/arc bash bench/limits-probe.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench/results/
