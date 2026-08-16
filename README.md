@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/martin-k-m/arc/main/assets/arc-mark.png" width="132" alt="Arc" />
+</p>
+
 # Arc
 
 **Never repeat work that is already done.**
