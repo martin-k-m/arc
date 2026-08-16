@@ -447,8 +447,13 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
         }
 
         Sc::Stat { dir, path } => {
-            let Some(resolved) = resolve(t, l, pid, dir, args, path) else {
-                return;
+            let resolved = match resolve_arg(t, l, pid, dir, args, path) {
+                PathArg::Resolved(p) => p,
+                // `fstat` in another syscall's clothing. Descriptor metadata is
+                // not a dependency on a name, and it must not cost the trace
+                // its completeness: almost every program that uses stdio asks
+                // this about its own stdout.
+                PathArg::Empty | PathArg::Unresolved => return,
             };
             t.record(
                 &resolved,
@@ -661,6 +666,39 @@ fn missing(ret: i64) -> bool {
     err == libc::ENOENT as i64 || err == libc::ENOTDIR as i64
 }
 
+/// What a path argument turned out to be.
+pub(crate) enum PathArg {
+    /// A path Arc can name.
+    Resolved(PathBuf),
+    /// The empty string, which names no file. Only ever legal with
+    /// `AT_EMPTY_PATH`, where the question is about the descriptor rather than
+    /// about a name.
+    Empty,
+    /// Unreadable, not valid UTF-8, or relative to a base Arc cannot name.
+    Unresolved,
+}
+
+/// Read a path argument out of the tracee and resolve it the way the kernel
+/// will: against that process's working directory or the directory a descriptor
+/// names, never against Arc's own.
+///
+/// The caller decides what an empty path means, because it is not the same
+/// question in every syscall.
+fn resolve_arg(
+    t: &mut LinuxTracer,
+    l: &mut Loop,
+    pid: i32,
+    dir: Dir,
+    args: &[u64; 6],
+    idx: usize,
+) -> PathArg {
+    match resolve(t, l, pid, dir, args, idx) {
+        Some(p) => PathArg::Resolved(p),
+        None if t.rec.empty_path_arg => PathArg::Empty,
+        None => PathArg::Unresolved,
+    }
+}
+
 /// Read a path argument out of the tracee and resolve it the way the kernel
 /// will: against that process's working directory or the directory a descriptor
 /// names, never against Arc's own.
@@ -672,6 +710,7 @@ fn resolve(
     args: &[u64; 6],
     idx: usize,
 ) -> Option<PathBuf> {
+    t.rec.empty_path_arg = false;
     let raw = match sys::read_cstr(pid, args[idx]) {
         Some(r) => r,
         None => {
@@ -679,6 +718,16 @@ fn resolve(
             return None;
         }
     };
+    // An empty path names no file. `fstat(fd)` reaches the kernel as
+    // `newfstatat(fd, "", …, AT_EMPTY_PATH)` on every glibc since 2.33, so this
+    // is overwhelmingly a question about a descriptor, and `fstat` is already
+    // dismissed as descriptor I/O. Report it as such rather than resolving the
+    // empty string against a base and inventing a dependency on a directory
+    // nothing looked at.
+    if raw.is_empty() {
+        t.rec.empty_path_arg = true;
+        return None;
+    }
     // Linux paths are bytes; Arc's stored path identity is text. A filename that
     // is not valid UTF-8 cannot make that round trip — the stored name would
     // refer to a file that does not exist, which fingerprints identically

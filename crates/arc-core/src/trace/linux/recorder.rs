@@ -35,6 +35,12 @@ pub struct Recorder {
     seen: HashSet<(FileOp, Arc<str>)>,
     processes: HashMap<i32, Option<String>>,
     pub root: i32,
+    /// Set by the last path-argument read when the argument was the empty
+    /// string rather than something unreadable. It lets the caller tell
+    /// `fstat(fd)` — which arrives as an empty path plus `AT_EMPTY_PATH` — from
+    /// a path Arc genuinely failed to resolve, without reading the tracee's
+    /// memory twice.
+    pub empty_path_arg: bool,
 }
 
 impl Recorder {
@@ -46,6 +52,7 @@ impl Recorder {
             seen: HashSet::new(),
             processes: HashMap::new(),
             root: 0,
+            empty_path_arg: false,
         }
     }
 

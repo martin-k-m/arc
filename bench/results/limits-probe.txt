@@ -1,0 +1,65 @@
+arc limits probe ? arc 1.0.0 ? Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+glibc: 2.36
+
+### clock
+    ? TRACE COMPLETE
+
+### urandom
+    ? TRACE PARTIAL
+      not complete        read volatile path /dev/urandom
+
+### getrandom
+    ? TRACE COMPLETE
+
+### pid
+    ? TRACE COMPLETE
+
+### proc
+    ? TRACE PARTIAL
+      not complete        read volatile path /proc/uptime
+
+### proc_self
+    ? TRACE COMPLETE
+
+### sysfs
+    ? TRACE PARTIAL
+      not complete        read volatile path /sys/devices/system/cpu/online
+
+### devnull
+    ? TRACE COMPLETE
+
+### network_tcp
+    ? TRACE PARTIAL
+      not complete        the execution used the network
+
+### network_unix
+    ? TRACE COMPLETE
+
+### child
+    ? TRACE COMPLETE
+
+### detached_child
+    ? TRACE COMPLETE
+
+### mmap_read
+    ? TRACE COMPLETE
+
+### mmap_write
+    MISS  -- Arc noticed the change
+
+### symlink_target
+    MISS  -- Arc noticed the change
+
+### symlink_retarget
+    MISS  -- Arc noticed the change
+
+### dangling_symlink
+    HIT   -- Arc did not notice the change
+
+### dirlist
+    MISS  -- Arc noticed the change
+
+### absent
+    MISS  -- Arc noticed the change
+
+done

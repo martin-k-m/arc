@@ -1,0 +1,107 @@
+[
+  {
+    "project": "click",
+    "command": "/work/bench/venv-click/bin/python -m pytest -q -p no:cacheprovider",
+    "commit": "8b44edfff7d9a6c895fa804148c16b3a0bc9efb5",
+    "reps": 7,
+    "direct_ms": {
+      "median": 3639,
+      "max": 4163
+    },
+    "cold_ms": {
+      "median": 17636,
+      "max": 19289
+    },
+    "warm_ms": {
+      "median": 35,
+      "max": 42
+    },
+    "miss_ms": {
+      "median": 5916,
+      "max": 18189
+    },
+    "backend_miss_ms": {
+      "seccomp": 6418,
+      "ptrace": 7736,
+      "snapshot": 4802
+    },
+    "overhead_pct": {
+      "seccomp": "+76.4%",
+      "ptrace": "+112.6%",
+      "snapshot": "+32.0%"
+    },
+    "speedup_warm": "103.97",
+    "cache_bytes": 4495283,
+    "dependency_model": "unknown"
+  },
+  {
+    "project": "tinycc",
+    "command": "make -j1",
+    "commit": "2ba12e83b3599ca8f5d50c179fe5138fe956f0c9",
+    "reps": 7,
+    "direct_ms": {
+      "median": 5773,
+      "max": 6649
+    },
+    "cold_ms": {
+      "median": 8844,
+      "max": 14404
+    },
+    "warm_ms": {
+      "median": 41,
+      "max": 82
+    },
+    "miss_ms": {
+      "median": 8139,
+      "max": 9171
+    },
+    "backend_miss_ms": {
+      "seccomp": 10001,
+      "ptrace": 6760,
+      "snapshot": 6235
+    },
+    "overhead_pct": {
+      "seccomp": "+73.2%",
+      "ptrace": "+17.1%",
+      "snapshot": "+8.0%"
+    },
+    "speedup_warm": "140.80",
+    "cache_bytes": 5988992,
+    "dependency_model": "unknown"
+  },
+  {
+    "project": "serde_json",
+    "command": "cargo test",
+    "commit": "afdf6fc67247dd7fa4fcde1381e6ecc6bcc7a30e",
+    "reps": 3,
+    "direct_ms": {
+      "median": 6188,
+      "max": 7276
+    },
+    "cold_ms": {
+      "median": 17635,
+      "max": 25013
+    },
+    "warm_ms": {
+      "median": 112,
+      "max": 140
+    },
+    "miss_ms": {
+      "median": 31880,
+      "max": 34594
+    },
+    "backend_miss_ms": {
+      "seccomp": 12376,
+      "ptrace": 15822,
+      "snapshot": 5211
+    },
+    "overhead_pct": {
+      "seccomp": "+100.0%",
+      "ptrace": "+155.7%",
+      "snapshot": "-15.8%"
+    },
+    "speedup_warm": "55.25",
+    "cache_bytes": 6443603,
+    "dependency_model": "unknown"
+  }
+]
