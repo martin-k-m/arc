@@ -21,9 +21,6 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub enum Fd {
     Path(Rc<PathBuf>),
-    Socket {
-        family: u16,
-    },
     /// A pipe, an eventfd, an anonymous mapping: nothing that can name a file.
     Anonymous,
 }
@@ -39,9 +36,6 @@ impl Fds {
     }
     pub fn remove(&mut self, fd: i32) {
         self.0.remove(&fd);
-    }
-    pub fn get(&self, fd: i32) -> Option<&Fd> {
-        self.0.get(&fd)
     }
     pub fn path(&self, fd: i32) -> Option<Rc<PathBuf>> {
         match self.0.get(&fd) {

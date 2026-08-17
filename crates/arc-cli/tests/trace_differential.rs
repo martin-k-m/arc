@@ -439,6 +439,57 @@ fn both_backends_downgrade_network_use() {
 }
 
 #[test]
+fn both_backends_say_the_same_thing_about_a_unix_socket() {
+    needs_both!();
+    let p = Project::seeded();
+    let live = p.root.join("live.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let prog = |name: &str, target: &Path| {
+        p.write(
+            name,
+            &format!(
+                "import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect({:?})
+except OSError:
+    pass
+",
+                target.to_str().unwrap()
+            ),
+        );
+        format!("python3 {name}")
+    };
+    let absent = prog("absent.py", &p.root.join("not-there.sock"));
+    let present = prog("present.py", &live);
+    for sel in [Selection::Ptrace, Selection::Fast] {
+        // A socket that is not there cannot answer: the connection fails, and
+        // the failure is a fact about the filesystem that Arc can check again.
+        let l = p.trace(sel, &absent);
+        assert!(
+            l.complete,
+            "{} downgraded a connection that could only fail",
+            l.backend
+        );
+        assert!(
+            l.absent.iter().any(|a| a.contains("not-there.sock")),
+            "{} did not record the socket's absence: {:?}",
+            l.backend,
+            l.absent
+        );
+        // One that is there answers with something no filesystem fingerprint
+        // describes.
+        let l = p.trace(sel, &present);
+        assert!(
+            !l.complete,
+            "{} called a live Unix socket complete",
+            l.backend
+        );
+    }
+    drop(listener);
+}
+
+#[test]
 fn neither_backend_learns_arcs_own_state() {
     needs_both!();
     let p = Project::seeded();

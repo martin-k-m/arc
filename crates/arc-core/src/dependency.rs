@@ -34,7 +34,7 @@ use crate::trace::{Capabilities, FileOp, Observations, TRACE_SCHEMA_VERSION};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bumped when the meaning of a stored dependency set changes. A set recorded
 /// under a different version is discarded, never reinterpreted.
@@ -315,6 +315,7 @@ impl DependencySet {
         let inside = display_form(root);
         let mut outside: Vec<PathDep> = Vec::new();
         let mut project: Vec<String> = Vec::new();
+        let mut dangling: Vec<String> = Vec::new();
         let candidates: Vec<String> = self
             .inputs
             .iter()
@@ -322,8 +323,15 @@ impl DependencySet {
             .chain(self.external.iter().map(|e| e.path.clone()))
             .chain(self.executables.iter().map(|e| e.path.clone()))
             .collect();
+        // An existence claim about a dangling link is the same false hit seen
+        // from the other backend: ptrace learns it from `ENOENT`, seccomp from
+        // `lstat`, and both need the missing target recorded.
+        for path in &self.existence {
+            unresolved_target(Path::new(path), &mut dangling);
+        }
         for path in candidates {
             let Ok(real) = Path::new(&path).canonicalize() else {
+                unresolved_target(Path::new(&path), &mut dangling);
                 continue;
             };
             let real = display_form(&real);
@@ -343,6 +351,7 @@ impl DependencySet {
         }
         self.inputs.extend(project);
         self.external.extend(outside);
+        self.existence.extend(dangling);
     }
 
     /// Sort, deduplicate, and resolve the contradictions a union can produce.
@@ -691,6 +700,41 @@ fn dir_digest(path: &Path) -> Digest {
         h.field([is_dir as u8]);
     }
     h.finish()
+}
+
+/// Longest symlink chain followed when the chain does not resolve. The kernel's
+/// own limit is 40; this only walks names that do not exist, so a loop cannot be
+/// entered, but a bound is still cheaper than trusting that.
+const MAX_DANGLING_HOPS: usize = 40;
+
+/// Record every name a broken symlink chain points at that is not there.
+///
+/// `canonicalize` fails for a dangling link, so the ordinary expansion above
+/// records nothing and the link's own fingerprint is its target *text*, which
+/// does not change when the target appears. The appearance is what changes the
+/// answer, so each missing name becomes a negative dependency.
+fn unresolved_target(path: &Path, out: &mut Vec<String>) {
+    let mut at = path.to_path_buf();
+    for _ in 0..MAX_DANGLING_HOPS {
+        match std::fs::symlink_metadata(&at) {
+            Ok(md) if md.file_type().is_symlink() => {}
+            _ => return,
+        }
+        let Ok(target) = std::fs::read_link(&at) else {
+            return;
+        };
+        let next = match (target.is_absolute(), at.parent()) {
+            (true, _) => target,
+            (false, Some(dir)) => dir.join(target),
+            (false, None) => return,
+        };
+        let next = PathBuf::from(display_form(&next));
+        if std::fs::symlink_metadata(&next).is_err() {
+            out.push(display_form(&next));
+            return;
+        }
+        at = next;
+    }
 }
 
 fn digest_of(path: &Path) -> String {

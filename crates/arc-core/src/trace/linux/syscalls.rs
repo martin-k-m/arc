@@ -100,8 +100,12 @@ pub enum Sc {
         to_dir: Dir,
         to: usize,
     },
-    Socket {
-        family: usize,
+    /// A `connect`, which names its peer. A Unix socket that is not there
+    /// cannot answer, so the address is a path dependency rather than a reason
+    /// to distrust the trace.
+    Connect {
+        addr: usize,
+        len: usize,
     },
     /// The socket in `fd` was used to reach something outside this execution.
     Network {
@@ -109,6 +113,8 @@ pub enum Sc {
         addr: Option<usize>,
         len: Option<usize>,
     },
+    /// Randomness straight from the kernel, with no file to fingerprint.
+    Random,
     /// Creates a descriptor that can never name a file.
     Anonymous,
 }
@@ -215,8 +221,8 @@ pub fn decode(nr: i64) -> Option<Sc> {
         },
 
         // ---- network ---------------------------------------------------------------
-        libc::SYS_socket => Sc::Socket { family: 0 },
-        libc::SYS_connect | libc::SYS_bind => Sc::Network {
+        libc::SYS_connect => Sc::Connect { addr: 1, len: 2 },
+        libc::SYS_bind => Sc::Network {
             fd: 0,
             addr: Some(1),
             len: Some(2),
@@ -233,7 +239,10 @@ pub fn decode(nr: i64) -> Option<Sc> {
         },
 
         // ---- descriptors that can never name a file ----------------------------------
-        libc::SYS_pipe2
+        libc::SYS_getrandom => Sc::Random,
+
+        libc::SYS_socket
+        | libc::SYS_pipe2
         | libc::SYS_socketpair
         | libc::SYS_eventfd2
         | libc::SYS_epoll_create1
@@ -453,7 +462,6 @@ pub fn is_irrelevant(nr: i64) -> bool {
                 | libc::SYS_timer_delete
                 | libc::SYS_timerfd_settime
                 | libc::SYS_timerfd_gettime
-                | libc::SYS_getrandom
         )
         // Socket calls that neither create a socket nor reach a peer. Asking a
         // socket about itself is not a dependency; reaching a peer is modelled.

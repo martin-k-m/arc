@@ -312,6 +312,7 @@ fn on_syscall(t: &mut LinuxTracer, l: &mut Loop, pid: i32) {
     };
     match info {
         SyscallStop::Entry { nr, args } => {
+            t.rec.syscall = nr as i64;
             let known = syscalls::decode(nr as i64).is_some() || syscalls::is_irrelevant(nr as i64);
             if !known {
                 // A syscall this backend does not model may have done anything,
@@ -397,6 +398,7 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
     let Some(sc) = syscalls::decode(p.nr as i64) else {
         return;
     };
+    t.rec.syscall = p.nr as i64;
     let args = &p.args;
     let existed = l.table.get_mut(pid).and_then(|pr| pr.existed.take());
 
@@ -518,7 +520,7 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
                 }
                 // The working directory is now something Arc cannot name, so
                 // every later relative path in this process is unresolvable.
-                None => t.rec.obs.downgrade(Downgrade::PathResolutionFailure),
+                None => t.rec.unresolved("the new working directory has no name"),
             }
         }
 
@@ -609,41 +611,28 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
             }
         }
 
-        Sc::Socket { family } => {
-            if ret >= 0 {
-                set_fd(
-                    l,
-                    pid,
-                    ret as i32,
-                    Fd::Socket {
-                        family: args[family] as u16,
-                    },
-                );
+        Sc::Connect { addr, len } => {
+            // glibc asks `/var/run/nscd/socket` for every user and group
+            // lookup, and on a machine with no nscd the answer is ENOENT. That
+            // is a fact about the filesystem, and it is fingerprintable: record
+            // the absence and keep the trace complete. A socket that IS there
+            // answers with something Arc cannot reproduce, so it downgrades.
+            match sys::read_unix_path(pid, args[addr], args[len]) {
+                Some(p) if !p.exists() => t.record(&p, FileOp::Absent),
+                _ => t.rec.obs.downgrade(Downgrade::NetworkAccess),
             }
         }
 
-        Sc::Network { fd, addr, len } => {
-            // Deliberately not gated on success. A refused connection still
-            // means the result depends on whether something was listening, and
-            // that is not a fact Arc can fingerprint.
-            //
-            // A result that came off a socket is a result Arc cannot reproduce
-            // from the filesystem, so the trace stops claiming completeness. The
-            // family is read where the call carries an address, so a run that
-            // only talks to a local socket is described accurately.
-            let family = match (addr, len) {
-                (Some(a), Some(n)) => sys::read_sa_family(pid, args[a], args[n]),
-                _ => None,
-            }
-            .or_else(
-                || match l.table.get(pid)?.fds.borrow().get(args[fd] as i32) {
-                    Some(Fd::Socket { family }) => Some(*family),
-                    _ => None,
-                },
-            );
-            let _ = family;
+        Sc::Network { .. } => {
+            // Deliberately not gated on success, and deliberately not gated on
+            // the address family. A refused connection still means the result
+            // depended on whether something was listening, and a peer on a Unix
+            // socket answers with something Arc cannot reproduce from the
+            // filesystem. See DECISIONS.md.
             t.rec.obs.downgrade(Downgrade::NetworkAccess);
         }
+
+        Sc::Random => t.rec.note_randomness(),
 
         Sc::Anonymous => {
             if ret >= 0 {
@@ -711,10 +700,15 @@ fn resolve(
     idx: usize,
 ) -> Option<PathBuf> {
     t.rec.empty_path_arg = false;
+    // A null path pointer names no file: see the seccomp backend's `read_path`.
+    if args[idx] == 0 {
+        t.rec.empty_path_arg = true;
+        return None;
+    }
     let raw = match sys::read_cstr(pid, args[idx]) {
         Some(r) => r,
         None => {
-            t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
+            t.rec.unresolved("the argument could not be read out of the process");
             return None;
         }
     };
@@ -735,7 +729,7 @@ fn resolve(
     // cannot name, the trace stops claiming completeness and the conservative
     // project scan takes over, which handles arbitrary bytes correctly.
     if std::str::from_utf8(&raw).is_err() {
-        t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
+        t.rec.unresolved("the path is not valid UTF-8");
         return None;
     }
     let raw = Path::new(OsStr::from_bytes(&raw));
@@ -747,7 +741,8 @@ fn resolve(
     match proc.resolve(&base, raw) {
         Some(p) => Some(p),
         None => {
-            t.rec.obs.downgrade(Downgrade::PathResolutionFailure);
+            let detail = format!("{} has no base Arc can name", raw.display());
+            t.rec.unresolved(&detail);
             None
         }
     }
