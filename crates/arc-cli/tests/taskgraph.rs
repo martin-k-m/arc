@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 const ARC: &str = env!("CARGO_BIN_EXE_arc");
 
@@ -603,12 +604,23 @@ inputs = ["generated/root.txt"]
 
     let serial = time_it("1");
     let parallel = time_it("4");
-    // Two one-second sleeps: serial must pay for both, parallel for about one.
-    // The bound is loose enough to survive a slow machine and still prove the
-    // sleeps overlapped.
+
+    // Two one-second sleeps: serial pays for both, parallel for about one, so
+    // running them concurrently saves a second. Assert on that saving rather
+    // than on a ratio.
+    //
+    // A ratio does not survive a slow machine, which is what the previous bound
+    // (parallel < serial * 0.85) assumed it would. Both timings include the same
+    // fixed cost O for process start, git and tracing, so they are O+2 and O+1
+    // and the ratio is (O+1)/(O+2), which climbs toward 1 as O grows: past about
+    // 4.7s of overhead the assertion cannot hold however perfectly the sleeps
+    // overlap. A loaded windows-latest runner gets there, and the test failed
+    // for a reason that had nothing to do with concurrency. In a difference O
+    // cancels.
+    let saved = serial.checked_sub(parallel).unwrap_or_default();
     assert!(
-        parallel < serial.mul_f32(0.85),
-        "expected concurrency: serial {serial:?}, parallel {parallel:?}"
+        saved >= Duration::from_millis(500),
+        "expected concurrency to save about a second: serial {serial:?},          parallel {parallel:?}, saved {saved:?}"
     );
 }
 
