@@ -21,7 +21,12 @@ pub const TRACE_SCHEMA_VERSION: u32 = 2;
 /// `/proc` is treated. A dependency set learned under different semantics is
 /// discarded rather than reinterpreted, because "complete" meant something else
 /// when it was written.
-pub const TRACE_SEMANTICS_VERSION: u32 = 1;
+///
+/// v2: a `connect` to a Unix socket that is not there is a negative dependency
+/// rather than network use, stable pseudo-files under `/proc` and `/sys` are
+/// hashed rather than treated as volatile, and a null path argument is a
+/// question about a descriptor.
+pub const TRACE_SEMANTICS_VERSION: u32 = 2;
 
 /// Operations a tracer may report against a path.
 ///

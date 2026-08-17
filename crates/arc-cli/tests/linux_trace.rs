@@ -446,6 +446,90 @@ fn retargeting_a_symlink_invalidates_and_so_does_editing_its_target() {
     assert!(stdout(&out).contains("beta"), "{}", stdout(&out));
 }
 
+#[test]
+fn a_dangling_links_target_appearing_is_a_miss() {
+    needs_tracer!();
+    // The command's answer is decided by whether the link resolves, so
+    // replaying it after the target appears is a false hit -- the worst
+    // failure a cache has. `canonicalize` fails for a dangling link, so the
+    // target is never learned as an input; it has to be learned as an absence.
+    let sb = Sandbox::new();
+    std::os::unix::fs::symlink("missing.txt", sb.root.join("link.txt")).unwrap();
+    sb.script(
+        "run.sh",
+        "#!/bin/sh
+if [ -e link.txt ]; then echo yes; else echo no; fi
+",
+    );
+    sb.learn("./run.sh");
+
+    sb.write("missing.txt", "appeared");
+    let out = sb.sh("./run.sh");
+    assert_miss(&out, "the link now resolves, so the answer changed");
+    assert!(stdout(&out).contains("yes"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_process_that_outlives_the_command_costs_the_trace_its_completeness() {
+    needs_tracer!();
+    // A detached grandchild can still read files after `arc run` has returned,
+    // and none of those reads are in the trace. Claiming completeness there
+    // means caching a dependency set that is missing an unknown amount.
+    let sb = Sandbox::new();
+    sb.write("in.txt", "one");
+    sb.script(
+        "run.sh",
+        "#!/bin/sh
+setsid sh -c 'sleep 2; cat in.txt > /dev/null' < /dev/null > /dev/null 2>&1 &
+exit 0
+",
+    );
+    let log = stderr(&sb.arc(&["run", "--trace", "./run.sh"]));
+    assert!(
+        log.contains("TRACE PARTIAL") && log.contains("a process could not be followed"),
+        "a trace that misses a live process must not be called complete:
+{log}"
+    );
+}
+
+#[test]
+fn connecting_to_a_unix_socket_that_is_not_there_is_a_dependency_on_its_absence() {
+    needs_tracer!();
+    // glibc asks `/var/run/nscd/socket` on every user lookup and gets ENOENT.
+    // Downgrading on that costs completeness for most of userspace; ignoring it
+    // is a false hit the day the socket appears. It is neither: it is an
+    // absence, and absences are exactly what Arc already fingerprints.
+    let sb = Sandbox::new();
+    let sock = sb.root.join("daemon.sock");
+    sb.write("prog.py", &format!(
+        "import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect({:?})
+except OSError:
+    pass
+print('done')
+",
+        sock.to_str().unwrap()
+    ));
+    let log = stderr(&sb.arc(&["run", "--trace", "python3", "prog.py"]));
+    if log.contains("no python3") || !log.contains("TRACE") {
+        return;
+    }
+    assert!(
+        log.contains("TRACE COMPLETE"),
+        "a refused connection to a socket that does not exist is fingerprintable:
+{log}"
+    );
+
+    assert_hit(&sb.arc(&["run", "python3", "prog.py"]), "nothing changed");
+    std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    assert_miss(
+        &sb.arc(&["run", "python3", "prog.py"]),
+        "the socket now exists, so the connection no longer fails",
+    );
+}
+
 // ------------------------------------------------------ paths and encoding ----
 
 #[test]

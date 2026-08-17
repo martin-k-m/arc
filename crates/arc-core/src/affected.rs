@@ -19,6 +19,7 @@ use crate::scan::build_globs;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -256,6 +257,18 @@ fn direct(
         return Ok((Verdict::Affected, causes));
     }
     if node.provable() {
+        // Nothing it reads has changed -- but if what it produces is not in
+        // this workspace, skipping it leaves the file missing. A fresh checkout
+        // with a shared graph is exactly that case, and it has to reach the
+        // cache rather than be skipped.
+        if let Some(gone) = missing_product(node) {
+            return Ok((
+                Verdict::Unknown,
+                vec![Cause::NotProvable {
+                    reason: format!("{gone} is not in this workspace"),
+                }],
+            ));
+        }
         return Ok((Verdict::Unaffected, Vec::new()));
     }
     Ok((
@@ -264,6 +277,14 @@ fn direct(
             reason: format!("dependency model is {}", node.completeness.label()),
         }],
     ))
+}
+
+fn missing_product(node: &TaskNode) -> Option<String> {
+    let root = Path::new(&node.project_root);
+    node.produces
+        .iter()
+        .find(|rel| !root.join(rel).exists())
+        .cloned()
 }
 
 fn under(child: &PathKey, root: &PathKey) -> bool {

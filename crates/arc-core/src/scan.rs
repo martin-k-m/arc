@@ -192,8 +192,14 @@ fn fingerprint_one(path: &Path, rel: &str, fps: &FingerprintMap, now_ms: i64) ->
     let digest = if symlink {
         let target = std::fs::read_link(path)?;
         hash_bytes(target.to_string_lossy().replace('\\', "/").as_bytes())
-    } else {
+    } else if md.file_type().is_file() {
         hash_file(path)?
+    } else {
+        // A socket, a fifo or a device node has no contents to hash, and
+        // opening one either fails or blocks. Its presence is the whole
+        // dependency: a project that contains a dev server's socket must still
+        // be scannable. See LIMITATIONS.md.
+        hash_bytes(b"<not a regular file>")
     };
     Ok(FileEntry {
         rel: rel.into(),
