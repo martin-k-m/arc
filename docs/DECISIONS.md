@@ -237,9 +237,9 @@ The tempting rule is to ignore those reads. That rule is a false hit: a machine
 where SELinux is switched on is a machine where `ls` behaves differently, and a
 cache that ignored the difference would replay the old answer.
 
-The rule taken instead is to **hash them**. A named list of prefixes — cgroup,
-selinux, `/proc/sys`, `/proc/mounts`, `/proc/filesystems`, cpu topology,
-`/sys/kernel/mm` — is treated as an ordinary file dependency: content hashed
+The rule taken instead is to **hash them**. A named list of prefixes, `HASHABLE`
+in `trace/linux/mod.rs`: `/proc/sys`, cgroup, selinux, cpu topology and
+`/sys/kernel/mm`. Each is treated as an ordinary file dependency: content hashed
 when learned, hashed again when the key is computed. That can only cause
 misses, never stale hits, which is the direction correctness demands. A
 pseudo-file whose content changes on every read simply misses every time.
@@ -249,6 +249,12 @@ some pseudo-files cannot be read twice safely: `/proc/kmsg` blocks,
 `/dev/urandom` is unbounded and meaningless. Randomness and the clock stay
 volatile. Every entry on the list is there because a workload in
 [BENCHMARKS.md](BENCHMARKS.md) was measured falling off the fast path on it.
+
+Two of the paths named above are not on the list and are worth saying so.
+`/proc/mounts` is ignored rather than hashed: it is a symlink to `self/mounts`,
+the per-process view Arc already ignores, and hashing it through the link would
+fingerprint the link text instead of the mount table. `/proc/filesystems` is
+still volatile, for the reason in entry 13.
 
 ## 11. `getrandom` is reported, not downgraded
 

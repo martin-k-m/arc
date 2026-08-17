@@ -155,16 +155,19 @@ running and had not yet opened `in.txt`. It now reports:
 The two backends reach that answer differently, and the difference is cost, not
 claim. **measured**, same script:
 
-| Backend | verdict | wall clock |
-| --- | --- | --- |
-| `linux-seccomp` | `TRACE PARTIAL` | 100 ms |
-| `linux-ptrace` | `TRACE COMPLETE` | 2,077 ms |
+| Backend | verdict |
+| --- | --- |
+| `linux-seccomp` | `TRACE PARTIAL` |
+| `linux-ptrace` | `TRACE COMPLETE` |
 
 ptrace waits for the grandchild and genuinely observes its read, so its
-"complete" is true and it pays the two seconds to earn it. The seccomp backend
-returns as soon as the command does; the listener hangs up only when every
-process holding the filter is gone, so anything else after a short grace means
-a process is still alive and the trace stops claiming to have seen everything.
+"complete" is true, and what it pays to earn it is the grandchild's whole
+lifetime: the script above sleeps two seconds, so the run takes two seconds.
+The seccomp backend returns as soon as the command does. The listener hangs up
+only when every process holding the filter is gone, so it waits a fixed grace
+of 200 ms (`SURVIVOR_GRACE_MS` in `trace/linux/seccomp/backend.rs`) and treats
+anything still there afterwards as a process that is still alive, which stops
+the trace claiming to have seen everything.
 
 Ordinary subprocesses are unaffected: children and grandchildren are followed
 correctly and traced complete (**measured**). The gap was about *outliving*,
@@ -240,6 +243,13 @@ not.
 | --- | --- | --- |
 | add a file to an enumerated directory | MISS | **measured** |
 | create a file the command looked for and did not find | MISS | **measured** |
+
+One thing the fingerprint does not describe. A socket, a fifo or a device node
+inside the project is fingerprinted by its presence only: `scan.rs` hashes a
+fixed marker for it rather than its contents, because opening one either fails
+or blocks. Creating or removing it is a miss; whatever passes through it is
+not seen. A project holding a running dev server's socket is scannable, and
+that is the whole of what the entry claims. **read**, `crates/arc-core/src/scan.rs`.
 
 ## 8. What makes a trace incomplete, in full
 

@@ -197,8 +197,7 @@ fn fingerprint_one(path: &Path, rel: &str, fps: &FingerprintMap, now_ms: i64) ->
     } else {
         // A socket, a fifo or a device node has no contents to hash, and
         // opening one either fails or blocks. Its presence is the whole
-        // dependency: a project that contains a dev server's socket must still
-        // be scannable. See LIMITATIONS.md.
+        // dependency. See LIMITATIONS.md.
         hash_bytes(b"<not a regular file>")
     };
     Ok(FileEntry {

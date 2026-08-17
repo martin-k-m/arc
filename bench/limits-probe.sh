@@ -108,6 +108,26 @@ if runs sysfs; then
   printf 'cat /sys/devices/system/cpu/online > /dev/null\n' > "$DIR/run.sh"
   probe sysfs
 fi
+if runs cgroup; then
+  # On the hashable list: a real dependency Arc fingerprints rather than
+  # distrusts, so this must stay complete.
+  mk cgroup; echo 'cat /sys/fs/cgroup/cpu.max > /dev/null' > "$DIR/run.sh"; probe cgroup
+fi
+if runs proc_sys; then
+  mk proc_sys
+  echo 'cat /proc/sys/vm/overcommit_memory > /dev/null' > "$DIR/run.sh"
+  probe proc_sys
+fi
+if runs proc_mounts; then
+  # Ignored, not hashed: it is a symlink to the per-process view.
+  mk proc_mounts; echo 'cat /proc/mounts > /dev/null' > "$DIR/run.sh"; probe proc_mounts
+fi
+if runs proc_filesystems; then
+  # Deliberately still volatile. See docs/DECISIONS.md.
+  mk proc_filesystems
+  echo 'cat /proc/filesystems > /dev/null' > "$DIR/run.sh"
+  probe proc_filesystems
+fi
 if runs devnull; then
   mk devnull; echo 'echo x > /dev/null; cat /dev/null' > "$DIR/run.sh"; probe devnull
 fi
@@ -140,6 +160,24 @@ except Exception:
 PY
   echo 'python3 un.py' > "$DIR/run.sh"
   probe network_unix
+fi
+if runs network_unix_live; then
+  # A socket that is there answers with something no filesystem fingerprint
+  # describes, so this one must downgrade where the absent one did not.
+  mk network_unix_live
+  cat > "$DIR/setup.sh" <<'SH'
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.bind('live.sock')"
+SH
+  cat > "$DIR/live.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect("live.sock")
+except Exception:
+    pass
+PY
+  echo 'python3 live.py' > "$DIR/run.sh"
+  probe network_unix_live
 fi
 
 # ------------------------------------------------------------- subprocesses --
@@ -220,6 +258,23 @@ SH
   # "yes".
   echo 'if [ -e link.txt ]; then echo yes; else echo no; fi' > "$DIR/run.sh"
   change dangling_symlink "printf 'appeared' > missing.txt"
+fi
+
+if runs unix_socket_appears; then
+  mk unix_socket_appears
+  cat > "$DIR/un.py" <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect("daemon.sock")
+    print("connected")
+except OSError:
+    print("refused")
+PY
+  # The absence is recorded as a negative dependency, so the socket turning up
+  # has to be a miss: that is when the answer changes.
+  echo 'python3 un.py > /dev/null' > "$DIR/run.sh"
+  change unix_socket_appears "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.bind('daemon.sock')\""
 fi
 
 if runs dirlist; then
