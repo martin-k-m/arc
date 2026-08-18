@@ -129,14 +129,14 @@ fn run_loop(t: &mut LinuxTracer) -> Wait {
         match stop {
             Stop::Exited(code) => {
                 finish_proc(&mut l, pid, root, code, false);
-                if l.table.is_empty() && l.seen_root_exit {
+                if l.done() {
                     break;
                 }
                 continue;
             }
             Stop::Killed(sig) => {
                 finish_proc(&mut l, pid, root, 128 + sig, true);
-                if l.table.is_empty() && l.seen_root_exit {
+                if l.done() {
                     break;
                 }
                 continue;
@@ -159,7 +159,32 @@ fn run_loop(t: &mut LinuxTracer) -> Wait {
             }
         }
     }
+    release_pending(&mut l);
     l.exit
+}
+
+impl Loop {
+    /// Whether the tree is finished. `table` alone is not enough: a child that
+    /// has been announced by its parent's event, or one parked waiting for that
+    /// event, is still attached and still holds the command's output pipes.
+    /// Stopping while either is outstanding leaves it stopped for good, and the
+    /// pump threads then read those pipes until the end of time.
+    fn done(&self) -> bool {
+        self.seen_root_exit
+            && self.table.is_empty()
+            && self.announced.is_empty()
+            && self.orphans.is_empty()
+    }
+}
+
+/// Let go of anything still attached once the loop is finished.
+fn release_pending(l: &mut Loop) {
+    for pid in l.orphans.drain() {
+        sys::detach(pid);
+    }
+    for pid in l.announced.keys() {
+        sys::detach(*pid);
+    }
 }
 
 fn finish_proc(l: &mut Loop, pid: i32, root: i32, code: i32, signaled: bool) {
@@ -185,6 +210,12 @@ fn resume(t: &mut LinuxTracer, pid: i32, sig: i32) {
 fn detach_all(l: &Loop) {
     for pid in l.table.pids() {
         sys::detach(pid);
+    }
+    for pid in &l.orphans {
+        sys::detach(*pid);
+    }
+    for pid in l.announced.keys() {
+        sys::detach(*pid);
     }
 }
 
