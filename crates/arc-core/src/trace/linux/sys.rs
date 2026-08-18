@@ -14,6 +14,7 @@
 //! architecture it was never built for.
 
 use std::io;
+use std::path::PathBuf;
 
 /// A stop reported by `waitpid`, already classified. Raw wait statuses are
 /// bit-packed three different ways depending on the stop; decoding once here
@@ -242,24 +243,26 @@ pub fn read_cstr(pid: i32, addr: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The address family of a socket, read out of a `sockaddr` in the tracee. Only
-/// the first two bytes are needed, and every `sockaddr` variant begins with
-/// them.
-pub fn read_sa_family(pid: i32, addr: u64, len: u64) -> Option<u16> {
-    if addr == 0 || len < 2 {
+/// The `sockaddr_un` path a `connect` names, when it names one.
+///
+/// Returns `None` for any other family, and for an abstract socket, whose name
+/// lives in a namespace with no filesystem entry to fingerprint.
+pub fn read_unix_path(pid: i32, addr: u64, len: u64) -> Option<PathBuf> {
+    if addr == 0 || len < 3 {
         return None;
     }
-    let mut buf = [0u8; 2];
-    (read_into(pid, addr, &mut buf) == 2).then(|| u16::from_ne_bytes(buf))
-}
-
-/// Read a fixed number of bytes out of a tracee, or nothing.
-pub fn read_bytes(pid: i32, addr: u64, len: usize) -> Option<Vec<u8>> {
-    if addr == 0 || len == 0 {
+    let want = (len as usize).min(2 + 108);
+    let mut buf = vec![0u8; want];
+    if read_into(pid, addr, &mut buf) != want {
         return None;
     }
-    let mut buf = vec![0u8; len];
-    (read_into(pid, addr, &mut buf) == len).then_some(buf)
+    if u16::from_ne_bytes([buf[0], buf[1]]) != libc::AF_UNIX as u16 {
+        return None;
+    }
+    let path = &buf[2..];
+    let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+    let name = std::str::from_utf8(&path[..end]).ok()?;
+    (!name.is_empty()).then(|| PathBuf::from(name))
 }
 
 /// Bytes actually read; 0 on any failure. The only place `process_vm_readv` is

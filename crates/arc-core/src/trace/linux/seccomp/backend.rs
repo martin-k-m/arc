@@ -75,7 +75,14 @@ struct Shared {
     rec: Mutex<Option<Recorder>>,
     stop: AtomicBool,
     events: AtomicU64,
+    /// A process was still holding the filter when the command returned.
+    survivors: AtomicBool,
 }
+
+/// How long a still-live filter holder is given to exit after the command
+/// returns, before the trace stops claiming to have seen everything. Long
+/// enough for a child mid-exit, far short of a background worker's lifetime.
+const SURVIVOR_GRACE_MS: i32 = 200;
 
 /// The recorder, or a scratch one if the worker somehow lost it. Never panics
 /// and never blocks a trace on a poisoned lock: a broken tracer must not break
@@ -98,6 +105,7 @@ impl SeccompTracer {
             rec: Mutex::new(Some(Recorder::new(cwd, classifier))),
             stop: AtomicBool::new(false),
             events: AtomicU64::new(0),
+            survivors: AtomicBool::new(false),
         });
         let worker = {
             let shared = shared.clone();
@@ -214,6 +222,9 @@ impl Tracer for SeccompTracer {
             return obs;
         };
         let mut obs = rec.finish(NAME);
+        if me.shared.survivors.load(Ordering::Relaxed) {
+            obs.downgrade(Downgrade::ChildEscape);
+        }
         obs.notes.push(format!("{events} notifications"));
         obs
     }
@@ -234,6 +245,13 @@ impl Session {
         let fd = self.listener.as_raw_fd();
         loop {
             if shared.stop.load(Ordering::Relaxed) {
+                // The command has returned. The listener hangs up only once
+                // every process holding the filter is gone, so anything else
+                // here is a process that outlived the command and can still
+                // read files this trace will never see.
+                if !matches!(poll_readable(fd, SURVIVOR_GRACE_MS), Poll::Hangup) {
+                    shared.survivors.store(true, Ordering::Relaxed);
+                }
                 return;
             }
             match poll_readable(fd, 100) {
@@ -289,6 +307,7 @@ impl Session {
         let nr = n.data.nr as i64;
         let pid = n.pid;
         let unmodelled = n.data.arch != sys::NATIVE_ARCH || syscalls::decode(nr).is_none();
+        self.with(shared, |r| r.syscall = nr);
         let known_pid = {
             let mut guard = lock(shared);
             let Some(rec) = guard.as_mut() else { return };
@@ -317,6 +336,14 @@ impl Session {
     fn dispatch(&mut self, shared: &Shared, n: &seccomp_notif, sc: Sc) {
         let args = n.data.args;
         let pid = n.pid;
+        // A null path pointer names no file. Rust's standard library probes for
+        // `statx` support with exactly this call, twice per process, and the
+        // kernel answers `EFAULT` without having looked at anything. With
+        // `AT_EMPTY_PATH` on 6.11 and newer it is a question about a
+        // descriptor, which is dismissed as descriptor I/O either way.
+        if matches!(sc, Sc::Stat { path, .. } | Sc::Open { path, .. } if args[path] == 0) {
+            return;
+        }
         match sc {
             Sc::Open {
                 dir,
@@ -325,7 +352,7 @@ impl Session {
                 flags_indirect,
             } => {
                 let Some(p) = self.resolve(n, dir, args[path]) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 let f = if flags_indirect {
                     libc::O_RDONLY
@@ -365,13 +392,13 @@ impl Session {
                 // stdio asks this about its own stdout, whose descriptor links
                 // to `pipe:[…]` and can never be named.
                 let Some(raw) = self.read_path(n, args[path]) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 if raw.is_empty() {
                     return;
                 }
                 let Some(p) = self.join(n, dir, &raw) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 let op = if exists(&p) {
                     FileOp::Stat
@@ -394,7 +421,7 @@ impl Session {
                     self.resolve(n, dir, args[path])
                 };
                 let Some(p) = resolved else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 self.with(shared, |rec| {
                     rec.record(&p, FileOp::Execute);
@@ -403,13 +430,13 @@ impl Session {
             }
             Sc::ListDir { fd } => {
                 let Some(p) = self.fd_path(pid, args[fd] as i32) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 self.with(shared, |r| r.record(&p, FileOp::ListDir));
             }
             Sc::Modify { dir, path } => {
                 let Some(p) = self.resolve(n, dir, args[path]) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 let op = if exists(&p) {
                     FileOp::Write
@@ -420,7 +447,7 @@ impl Session {
             }
             Sc::Delete { dir, path } => {
                 let Some(p) = self.resolve(n, dir, args[path]) else {
-                    return self.unresolved(shared);
+                    return self.unresolved(shared, n);
                 };
                 self.with(shared, |r| r.record(&p, FileOp::Delete));
             }
@@ -439,7 +466,7 @@ impl Session {
                             rec.record(&b, FileOp::Create);
                         });
                     }
-                    _ => self.unresolved(shared),
+                    _ => self.unresolved(shared, n),
                 }
             }
             Sc::Mmap { fd, flags } => {
@@ -454,21 +481,21 @@ impl Session {
                     self.with(shared, |r| r.record(&p, FileOp::Read));
                 }
             }
-            Sc::Socket { family } => {
-                let family = args[family] as i32;
-                if family != libc::AF_UNIX && family != libc::AF_NETLINK {
-                    self.with(shared, |r| r.obs.downgrade(Downgrade::NetworkAccess));
-                }
+            // Creating a socket reaches nothing; using one reaches a peer,
+            // whatever its family. Both backends apply exactly this rule, which
+            // is what makes "complete" mean the same thing under either.
+            Sc::Connect { addr, len } => {
+                // See the ptrace backend: a Unix socket that is not there is a
+                // negative path dependency, not a reason to distrust the trace.
+                match super::super::sys::read_unix_path(pid as i32, args[addr], args[len]) {
+                    Some(p) if !exists(&p) => self.with(shared, |r| r.record(&p, FileOp::Absent)),
+                    _ => self.with(shared, |r| r.obs.downgrade(Downgrade::NetworkAccess)),
+                };
             }
-            Sc::Network { addr, .. } => {
-                // The address family decides. A `connect` to a Unix socket is
-                // local IPC; anything else, or an address Arc cannot read,
-                // reaches outside this execution.
-                if let Some(i) = addr {
-                    if self.address_family(n, args[i]) == Some(libc::AF_UNIX as u16) {
-                        return;
-                    }
-                }
+            Sc::Random => {
+                self.with(shared, |r| r.note_randomness());
+            }
+            Sc::Network { .. } => {
                 self.with(shared, |r| r.obs.downgrade(Downgrade::NetworkAccess));
             }
             // Descriptor and working-directory bookkeeping is the kernel's,
@@ -487,9 +514,15 @@ impl Session {
         lock(shared).as_mut().map(f)
     }
 
-    fn unresolved(&self, shared: &Shared) {
+    fn unresolved(&self, shared: &Shared, n: &seccomp_notif) {
+        // A notification whose id has stopped being valid belongs to a process
+        // that died before its syscall ran. The call acquired no dependency, so
+        // there is nothing the trace can have missed by not naming its path.
+        if !sys::id_valid(self.listener.as_raw_fd(), n.id) {
+            return;
+        }
         self.with(shared, |r| {
-            r.obs.downgrade(Downgrade::PathResolutionFailure)
+            r.unresolved("the argument could not be read back, or has no base Arc can name")
         });
     }
 
@@ -568,12 +601,6 @@ impl Session {
         target
             .is_absolute()
             .then(|| PathBuf::from(display_form(&target)))
-    }
-
-    /// `sockaddr.sa_family`, read out of the tracee.
-    fn address_family(&mut self, n: &seccomp_notif, ptr: u64) -> Option<u16> {
-        let raw = super::super::sys::read_bytes(n.pid as i32, ptr, 2)?;
-        sys::id_valid(self.listener.as_raw_fd(), n.id).then(|| u16::from_ne_bytes([raw[0], raw[1]]))
     }
 }
 

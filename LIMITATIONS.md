@@ -30,20 +30,26 @@ outside it.
 | `echo $$` (the process id) | `TRACE COMPLETE` | **measured** |
 | `head -c 8 /dev/urandom` | `TRACE PARTIAL`, volatile read | **measured** |
 
-The asymmetry in the last two rows is the important part, and it is not
-principled. `/dev/urandom` is caught because it is a *file*, and files are
+The asymmetry in the last two rows is real and it is now *reported* rather
+than silent. `/dev/urandom` is caught because it is a *file*, and files are
 what Arc watches. `getrandom(2)` — which is how glibc and CPython actually
-seed themselves — is on the explicitly-dismissed syscall list in
-`crates/arc-core/src/trace/linux/syscalls.rs`, alongside `clock_gettime`,
-`gettimeofday`, `getpid` and the whole `sched_*` family. So a program that
-reads randomness the old way loses its completeness claim and a program that
-reads it the modern way does not.
+seed themselves — is modelled, but it produces a note in `arc run --trace`
+rather than a downgrade:
 
-The source states the reasoning: a command that depends on the clock is
-non-hermetic in a way no filesystem tracer can repair, so the limit is
-documented rather than turned into a downgrade on every run. That is a
-defensible position. It is not the same as detecting nondeterminism, and Arc
-should not be read as detecting it.
+```
+note   the execution took randomness from getrandom
+```
+
+Making it a downgrade was implemented and measured, and reverted. glibc calls
+`getrandom` during start-up, so **every** command went partial: `date`,
+`sh -c "cat in.txt"` and a single `pytest` file all lost completeness, and
+nothing narrowed anywhere. **measured.** The syscall is evidence that a process
+started, not that its result depends on randomness. See
+[docs/DECISIONS.md](docs/DECISIONS.md).
+
+So the position is unchanged and now stated exactly: a command that depends on
+the clock or on randomness is non-hermetic in a way no filesystem tracer can
+repair. Arc says what it saw and does not pretend to detect nondeterminism.
 
 **What this means for you.** If your command embeds a timestamp, a random
 seed, a process id or a hostname in its output, Arc will cache the first
@@ -51,102 +57,121 @@ answer and serve it forever, and will call the trace complete while doing so.
 Arc does not and cannot know. `[trace] enabled = false` or simply not caching
 that command are the only remedies.
 
-## 2. Network access revokes completeness — and the two backends disagree about what counts
+## 2. Network access revokes completeness, and a Unix socket is a path
 
 A TCP connection makes the trace partial, whether or not it succeeded: a
 refused connection still means the result depended on whether something was
 listening. **measured** — `python3` connecting to `127.0.0.1:9` reports
 `the execution used the network`.
 
-A Unix-domain socket is where it goes wrong. Same command, same machine, two
-answers depending on which backend ran (**measured**):
+The two backends used to disagree about `AF_UNIX`: seccomp called it local IPC
+and stayed complete, ptrace downgraded. They now apply one rule, and it is
+neither of those. The address of a `connect` is a path, so:
 
-```
-ARC_TRACE_BACKEND=fast    python3 un.py   →  TRACE COMPLETE
-ARC_TRACE_BACKEND=ptrace  python3 un.py   →  TRACE PARTIAL
-                                              the execution used the network
-```
+| Case | Verdict | |
+| --- | --- | --- |
+| `connect` to a Unix socket that does not exist | `TRACE COMPLETE`, absence recorded | **measured**, both backends |
+| that socket then appears | MISS | **measured**, both backends |
+| `connect` to a Unix socket that does exist | `TRACE PARTIAL`, network access | **measured**, both backends |
+| `bind`, `sendto`, `sendmsg`, `recvmsg` on any family | `TRACE PARTIAL` | **read** |
+| an abstract Unix socket (no filesystem name) | `TRACE PARTIAL` | **read** |
 
-The seccomp backend checks the address family and treats `AF_UNIX` and
-`AF_NETLINK` as local IPC rather than as the network. The ptrace backend reads
-the address family, discards it, and downgrades unconditionally —
-`crates/arc-core/src/trace/linux/backend.rs` computes `family` and then does
-`let _ = family;`.
+Why it matters that this is not simply "ignore `AF_UNIX`": anything that talks
+to a live local daemon — a language server, a build daemon, `sccache`, D-Bus,
+systemd's journal — answers with data no filesystem fingerprint describes, and
+those still downgrade. What no longer downgrades is the case that dominates in
+practice, glibc asking `/var/run/nscd/socket` on every user lookup and being
+told `ENOENT`. **measured**: with a blanket downgrade, 32 of 180 runs of the
+click hit-rate experiment lost completeness for that alone.
 
-This is a defect, not a design choice, and I have not fixed it. It matters
-more than a cosmetic inconsistency because both backends advertise identical
-capabilities, and the check that decides whether a learned dependency set may
-still be used compares capabilities rather than backend names. So a set
-learned under seccomp is considered valid for a ptrace run and vice versa,
-while the two disagree about whether the execution that produced it was fully
-observed. In practice this makes Arc *more* conservative under ptrace, never
-less, so it costs cache hits rather than correctness — but it means
-"complete" is not currently backend-independent, and that is exactly the
-property the differential suite exists to guarantee.
-
-Anything that talks to a local daemon over a Unix socket — a language server,
-a build daemon, `sccache`, D-Bus, systemd's journal — is in this class.
+The residual gap is in the seccomp backend only, and it is a race: it decides
+by asking the filesystem whether the socket exists at notification time, so a
+socket created in the microsecond before the syscall runs would be connected to
+under a complete trace. **read**.
 
 ## 3. `/proc`, `/sys` and `/dev`
 
 The policy is one function, `policy::verdict` in
-`crates/arc-core/src/trace/linux/mod.rs`, and it is short enough to state
-completely.
+`crates/arc-core/src/trace/linux/mod.rs`.
 
 | Path | Verdict | |
 | --- | --- | --- |
-| `/proc/self/...`, `/proc/thread-self/...`, `/proc/<pid>/...` | ignored, no downgrade | **measured** |
-| any other `/proc/...` | volatile, trace partial | **measured** (`/proc/uptime`) |
-| any `/sys/...` | volatile, trace partial | **measured** (`/sys/devices/system/cpu/online`) |
+| `/proc/self/...`, `/proc/thread-self/...`, `/proc/<pid>/...`, `/proc/mounts` | ignored, no downgrade | **measured** |
+| `/proc/sys/...`, `/sys/fs/cgroup/...`, `/sys/fs/selinux/...`, `/sys/devices/system/cpu/...`, `/sys/kernel/mm/...` | hashed like an ordinary file | **measured** |
+| any other `/proc/...` or `/sys/...` | volatile, trace partial | **measured** (`/proc/uptime`) |
 | `/dev/null`, `zero`, `full`, `tty`, `console`, `ptmx`, `stdin`, `stdout`, `stderr` | ignored | **measured** (`/dev/null`) |
 | any other `/dev/...`, including `/dev/urandom` | volatile, trace partial | **measured** |
 
-Three consequences worth knowing:
+The hashed row is the change that moved the real workloads. Those pseudo-files
+are machine configuration: small, re-readable and stable, so Arc fingerprints
+them rather than distrusting them. That direction cannot produce a stale hit —
+a changed value changes the key — while ignoring them could. `/proc/mounts` is
+ignored rather than hashed because it is a symlink to `self/mounts`, which is
+the per-process view Arc already ignores. `/proc/filesystems` — what `mkdir`
+and `ls` read — is *not* on the list: hashing it was measured to break
+cross-checkout remote cache hits, and that trade is refused until the mechanism
+is understood. Both in [docs/DECISIONS.md](docs/DECISIONS.md).
+
+What this bought, **measured**, on the three workloads in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md):
+
+| Workload | before | after |
+| --- | --- | --- |
+| `cargo test` (serde_json) | partial: cgroup, `/proc/sys/vm/overcommit_memory`, transparent hugepage, `/dev/urandom`, network, one unresolved path | partial: `/dev/urandom` and a real TCP connection |
+| `pytest`, whole suite (click) | partial: `/sys/fs/selinux`, `/proc/mounts` | partial: one non-UTF-8 filename its own tests create |
+| `make -j1` (tinycc) | partial: `/dev/urandom` via GCC | unchanged |
+
+None of them reaches complete, and the reasons that remain are honest ones:
+GCC and rustc really do read `/dev/urandom`, serde_json's tests really do open
+a TCP connection, and click's tests really do create a filename that is not
+valid UTF-8.
+
+Three consequences still worth knowing:
 
 - The harmless-device list is an exact match on the name after `/dev/`, so
   `/dev/shm/...`, `/dev/tty1` and `/dev/ttyS0` are all volatile. **read**
-- The prefix test is on the literal strings `"/proc/"`, `"/sys/"`, `"/dev/"`.
-  A procfs bind-mounted elsewhere, or a chroot, is invisible to it. **read**
+- The prefix test is on literal strings. A procfs bind-mounted elsewhere, or a
+  chroot, is invisible to it. **read**
 - A *write* to a volatile path is dropped silently: no record, no downgrade.
   Only reads count. **read**
 
-This is why ordinary commands fall off the fast path. On a stock Debian
-system `ls`, `mv` and `cp` probe SELinux through `/sys` and read
-`/proc/mounts` and `/proc/filesystems`, so they never narrow. **measured** —
-`/bin/ls` reports all three.
-
-It is also the dominant reason real builds do not narrow. Of the three
-workloads in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), all three trace
-partial, and volatile reads are the reason in every case: `cargo test` reads
-`/sys/fs/cgroup/cpu.max`, `/proc/sys/vm/overcommit_memory` and
-`/dev/urandom`; `pytest` reads `/sys/fs/selinux` and `/proc/mounts`; `make`
-reads `/dev/urandom` through GCC. **measured**
-
-## 4. Processes that outlive the command are not waited for, and the trace still claims completeness
+## 4. A process that outlives the command costs the trace its completeness
 
 **measured.** A run script that does:
 
 ```sh
-setsid sh -c 'sleep 3; cat in.txt > /dev/null' < /dev/null > /dev/null 2>&1 &
+setsid sh -c 'sleep 2; cat in.txt > /dev/null' < /dev/null > /dev/null 2>&1 &
 exit 0
 ```
 
-produces `TRACE COMPLETE`, and `arc run` returns in 54 ms while the detached
-grandchild is still running and has not yet opened `in.txt`.
+used to produce `TRACE COMPLETE` while the detached grandchild was still
+running and had not yet opened `in.txt`. It now reports:
 
-So a command that spawns a background worker gets a complete-looking trace
-that does not include anything the worker went on to read. If that worker's
-reads genuinely affect the result — a daemon that writes a file the next
-command consumes — Arc has no record of the dependency and will hit when it
-should miss.
+```
+◆ TRACE PARTIAL
+  not complete        a process could not be followed
+```
 
-Ordinary subprocesses are fine, and this is worth separating clearly.
-Children and grandchildren are followed correctly (**measured**: a file read
-only by `sh -c "cat in.txt"` inside the traced command is recorded as a
-dependency, and the trace is complete). ptrace follows them through
-`PTRACE_O_TRACEFORK`/`VFORK`/`CLONE`; the seccomp filter is inherited across
-`fork` and survives `exec` and cannot be removed. **read** The gap is
-specifically about *outliving*, not about *descending*.
+The two backends reach that answer differently, and the difference is cost, not
+claim. **measured**, same script:
+
+| Backend | verdict |
+| --- | --- |
+| `linux-seccomp` | `TRACE PARTIAL` |
+| `linux-ptrace` | `TRACE COMPLETE` |
+
+ptrace waits for the grandchild and genuinely observes its read, so its
+"complete" is true, and what it pays to earn it is the grandchild's whole
+lifetime: the script above sleeps two seconds, so the run takes two seconds.
+The seccomp backend returns as soon as the command does. The listener hangs up
+only when every process holding the filter is gone, so it waits a fixed grace
+of 200 ms (`SURVIVOR_GRACE_MS` in `trace/linux/seccomp/backend.rs`) and treats
+anything still there afterwards as a process that is still alive, which stops
+the trace claiming to have seen everything.
+
+Ordinary subprocesses are unaffected: children and grandchildren are followed
+correctly and traced complete (**measured**). The gap was about *outliving*,
+not about descending, and it is now reported rather than hidden.
 
 Related, from source: `clone3` passes its flags in a struct rather than a
 register, so Arc cannot read them and models the child as sharing nothing with
@@ -179,36 +204,26 @@ and `io_uring_enter` are deliberately neither modelled nor dismissed, so they
 land in the unsupported-syscall path and revoke completeness. Arc cannot see
 io_uring I/O; it refuses to claim it did. **read**
 
-## 6. Symlinks: correct for the ordinary cases, wrong for a dangling link
+## 6. Symlinks
 
-Arc records the path the program asked for, symlink spelling included, and
-then adds the canonicalised target as a second dependency, so both the link
-and what it points at are fingerprinted.
+Arc records the path the program asked for, symlink spelling included, and then
+adds the canonicalised target as a second dependency, so both the link and what
+it points at are fingerprinted.
 
 | Case | Result | |
 | --- | --- | --- |
 | edit the target's contents | MISS, correct | **measured** |
 | repoint the link at another file | MISS, correct | **measured** |
-| a dangling link's target appears | **HIT, wrong** | **measured** |
+| a dangling link's target appears | MISS, correct | **measured** |
 
-The last row is a genuine false hit and it is reproducible:
-
-```sh
-ln -sf missing.txt link.txt
-# run.sh:  if [ -e link.txt ]; then echo yes; else echo no; fi
-# learn, settle, then:
-printf 'appeared' > missing.txt
-# arc run  →  CACHE HIT, replays "no"
-```
-
-**Root cause** (**read**): symlink expansion canonicalises each candidate and
-skips it when `canonicalize()` fails, with no downgrade recorded. For a
-dangling link that always fails, so the target is never added as a dependency
-and its later appearance is invisible. The link itself is hashed by its target
-*path string*, which did not change. Separately, existence probes use
-`symlink_metadata`, i.e. `lstat` semantics, so a dangling link counts as
-present — which is why it becomes an input rather than a negative dependency
-on the target.
+The last row was a reproducible false hit and is fixed. `canonicalize` fails
+for a dangling link, so the target was never added and its later appearance was
+invisible, while the link itself hashes to its target *path string*, which had
+not changed. The chain is now walked by hand when canonicalisation fails, and
+the first name in it that is not there is recorded as a *negative* dependency —
+the same mechanism Arc already uses for a file a command looked for and did not
+find. `a_dangling_links_target_appearing_is_a_miss` in
+`crates/arc-cli/tests/linux_trace.rs` fails without the fix.
 
 Two more from source, not reproduced here:
 
@@ -229,6 +244,13 @@ not.
 | add a file to an enumerated directory | MISS | **measured** |
 | create a file the command looked for and did not find | MISS | **measured** |
 
+One thing the fingerprint does not describe. A socket, a fifo or a device node
+inside the project is fingerprinted by its presence only: `scan.rs` hashes a
+fixed marker for it rather than its contents, because opening one either fails
+or blocks. Creating or removing it is a miss; whatever passes through it is
+not seen. A project holding a running dev server's socket is scannable, and
+that is the whole of what the entry claims. **read**, `crates/arc-core/src/scan.rs`.
+
 ## 8. What makes a trace incomplete, in full
 
 The complete list of downgrade reasons, from
@@ -238,11 +260,11 @@ The complete list of downgrade reasons, from
 | --- | --- |
 | `backend_partial` | the backend cannot observe every dependency class (this is every run on Windows and macOS) |
 | `unsupported_syscall` | a syscall this backend does not model, including one a newer kernel added |
-| `path_resolution_failure` | a path argument could not be read back, or is not valid UTF-8 |
+| `path_resolution_failure` | a path argument could not be read back, or is not valid UTF-8. `arc run --trace` now names the syscall it came from, up to three per run |
 | `child_escape` | a process could not be followed |
 | `event_overflow` | the execution exceeded the trace budget |
-| `volatile_read` | a read of `/proc`, `/sys`, `/dev/urandom` or similar |
-| `network_access` | a socket was connected, bound or sent on |
+| `volatile_read` | a read of an unstable `/proc` or `/sys` file, `/dev/urandom` or similar |
+| `network_access` | a socket was bound or sent on, or connected to a peer that exists |
 | `dependency_disappeared` | a path was read and is now gone |
 | `backend_error` | the tracer itself failed |
 
@@ -316,14 +338,20 @@ spawns children, and writes results. It is correct on all of those, including
 the two — directory enumeration and negative dependencies — that a file-level
 tracer gets wrong.
 
-It is silent about time, randomness through `getrandom`, process identity and
-anything that happens after the command returns. It disagrees with itself
-about Unix sockets depending on which backend ran. It has one reproducible
-false hit, on a dangling symlink whose target later appears.
+There is no known false hit. The one that was here — a dangling symlink whose
+target later appears — is fixed and pinned by a test. The two backends now
+agree about Unix sockets, and a process that outlives the command costs the
+trace its completeness under both.
 
-And in practice the fast path is narrower than the feature list suggests: none
-of the three real workloads measured in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) produce a complete trace, so none of
-them narrow, so all of them fall back to hashing the project. Arc is still
-useful there — the numbers show why — but it is useful as a whole-project
-cache, not as the dependency-learning one the front page leads with.
+It is still silent about time, about process identity, and about randomness in
+the sense that matters: `getrandom` is reported but does not downgrade, because
+making it downgrade was measured to take completeness away from every command
+including `sh -c "cat in.txt"`.
+
+And the fast path is still narrower than the feature list suggests. All three
+real workloads in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) still trace partial,
+but no longer for reasons Arc can do anything about: GCC and rustc read
+`/dev/urandom`, serde_json's tests open a TCP connection, and click's own test
+suite creates a filename that is not valid UTF-8. Per-file test tasks — the
+granularity that actually gets value out of a cache — do trace complete and do
+narrow, 180 runs out of 180 in the hit-rate experiment.
