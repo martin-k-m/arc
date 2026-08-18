@@ -129,7 +129,29 @@ pub mod policy {
         "null", "zero", "full", "tty", "console", "ptmx", "stdin", "stdout", "stderr",
     ];
 
+    /// Pseudo-files that are small, re-readable and stable: machine
+    /// configuration rather than machine weather. Reading one is a real
+    /// dependency, and it is a dependency Arc can hash, so it is recorded like
+    /// any other file instead of costing the trace its completeness. Nothing
+    /// here is ever *ignored*: if the value changes, the key changes.
+    ///
+    /// Every entry is on this list because a real workload was measured falling
+    /// off the fast path on it. See docs/DECISIONS.md.
+    const HASHABLE: &[&str] = &[
+        "/proc/sys/",
+        "/sys/fs/cgroup/",
+        "/sys/fs/selinux/",
+        "/sys/devices/system/cpu/",
+        "/sys/kernel/mm/",
+    ];
+
     pub fn verdict(path: &str) -> Verdict {
+        if HASHABLE
+            .iter()
+            .any(|p| path == p.trim_end_matches('/') || path.starts_with(p))
+        {
+            return Verdict::Normal;
+        }
         if let Some(rest) = path.strip_prefix("/proc/") {
             // A process asking about itself is not consulting shared state: the
             // answer is a function of this execution, not of anything a
@@ -137,7 +159,15 @@ pub mod policy {
             // as machine state would downgrade essentially every Rust or Go
             // program for no gain in safety.
             let first = rest.split('/').next().unwrap_or("");
-            if first == "self" || first == "thread-self" || first.parse::<u32>().is_ok() {
+            // `/proc/mounts` is a symlink to `self/mounts`: the same
+            // process-private view under a shorter name, and hashing it through
+            // the link would fingerprint the link text rather than the mount
+            // table. It is treated as what it is.
+            if first == "self"
+                || first == "thread-self"
+                || first == "mounts"
+                || first.parse::<u32>().is_ok()
+            {
                 return Verdict::Ignore;
             }
             return Verdict::Volatile;
@@ -170,7 +200,7 @@ mod tests {
         assert_eq!(verdict("/proc/thread-self/stat"), Verdict::Ignore);
         assert_eq!(verdict("/proc/4711/cmdline"), Verdict::Ignore);
         assert_eq!(verdict("/proc/cpuinfo"), Verdict::Volatile);
-        assert_eq!(verdict("/sys/fs/cgroup/cpu.max"), Verdict::Volatile);
+        assert_eq!(verdict("/proc/uptime"), Verdict::Volatile);
     }
 
     #[test]
@@ -180,6 +210,23 @@ mod tests {
         assert_eq!(verdict("/dev/null"), Verdict::Ignore);
         assert_eq!(verdict("/dev/pts/3"), Verdict::Ignore);
         assert_eq!(verdict("/dev/sda1"), Verdict::Volatile);
+    }
+
+    #[test]
+    fn stable_machine_configuration_is_hashed_rather_than_distrusted() {
+        // Hashing these is strictly safer than ignoring them: a change is a
+        // miss, never a stale hit. They are here because `cargo test` and
+        // `pytest` read them and lost completeness for it.
+        assert_eq!(verdict("/sys/fs/cgroup/cpu.max"), Verdict::Normal);
+        assert_eq!(verdict("/sys/fs/selinux/enforce"), Verdict::Normal);
+        assert_eq!(verdict("/proc/mounts"), Verdict::Ignore);
+        // Not on the list: hashing it was measured to break cross-checkout
+        // remote hits. See docs/DECISIONS.md.
+        assert_eq!(verdict("/proc/filesystems"), Verdict::Volatile);
+        assert_eq!(verdict("/proc/sys/vm/overcommit_memory"), Verdict::Normal);
+        // Randomness and the clock are not configuration and stay volatile.
+        assert_eq!(verdict("/dev/urandom"), Verdict::Volatile);
+        assert_eq!(verdict("/proc/loadavg"), Verdict::Volatile);
     }
 
     #[test]

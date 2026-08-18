@@ -41,7 +41,17 @@ pub struct Recorder {
     /// a path Arc genuinely failed to resolve, without reading the tracee's
     /// memory twice.
     pub empty_path_arg: bool,
+    /// The syscall currently being decoded. Only used to say *which* call could
+    /// not have its path read back, which is otherwise unanswerable from the
+    /// outside: `path_resolution_failure` names no path by construction.
+    pub syscall: i64,
+    reported: usize,
+    randomness: bool,
 }
+
+/// Unresolved-path notes kept per run. The downgrade already says the trace is
+/// partial; these say what to go and look at.
+const MAX_UNRESOLVED_NOTES: usize = 3;
 
 impl Recorder {
     pub fn new(cwd: &Path, classifier: &Classifier) -> Recorder {
@@ -53,7 +63,35 @@ impl Recorder {
             processes: HashMap::new(),
             root: 0,
             empty_path_arg: false,
+            syscall: -1,
+            reported: 0,
+            randomness: false,
         }
+    }
+
+    /// `getrandom` is reported, once, and does not downgrade. Measured reason:
+    /// glibc calls it during start-up, so every command including `sh -c cat`
+    /// would lose completeness and nothing would ever narrow. See
+    /// LIMITATIONS.md.
+    pub fn note_randomness(&mut self) {
+        if !self.randomness {
+            self.randomness = true;
+            self.obs
+                .notes
+                .push("the execution took randomness from getrandom".into());
+        }
+    }
+
+    /// A path argument that could not be turned into a name.
+    pub fn unresolved(&mut self, why: &str) {
+        if self.reported < MAX_UNRESOLVED_NOTES {
+            self.reported += 1;
+            self.obs.notes.push(format!(
+                "unresolved path: {why} on syscall {}",
+                self.syscall
+            ));
+        }
+        self.obs.downgrade(Downgrade::PathResolutionFailure);
     }
 
     /// Record one observation, applying scope and volatility policy.

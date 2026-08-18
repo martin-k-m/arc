@@ -184,3 +184,125 @@ The stated cost of the shortcut: a call that passes an empty path *without*
 what is lost is a negative dependency on a path that can never exist, so the
 compromise is safe. It is still less precise than the code should be, and
 the reason it is acceptable is written down rather than assumed.
+
+## 9. A `connect` to a Unix socket that is not there is a dependency, not network use
+
+The two Linux backends used to disagree about `AF_UNIX`. The seccomp backend
+treated it as local IPC and kept the trace complete; the ptrace backend read
+the address family, discarded it, and downgraded. Both were defensible and
+they could not both be right, and "complete" has to mean the same thing under
+either backend or the differential suite guarantees nothing.
+
+Converging on the seccomp answer was rejected first. A peer on a Unix socket
+answers with data no filesystem fingerprint describes: `sccache`, a language
+server, a build daemon and D-Bus are all in that class, and treating them as
+invisible is a false hit waiting for a daemon to change its mind.
+
+Converging on the ptrace answer was measured and rejected too. glibc asks
+`/var/run/nscd/socket` on every user or group lookup, and on a machine with no
+nscd the answer is `ENOENT`. With a blanket downgrade, 32 of 180 runs in the
+click hit-rate experiment lost completeness for that alone, and `pytest` on two
+of three test files stopped narrowing.
+
+The rule that survived is neither: **the address of a `connect` is a path, and
+a path that is not there is an absence.** Arc already models absences
+precisely, so a refused connection to a socket that does not exist is recorded
+as a negative dependency and the trace stays complete. The socket appearing is
+a miss, which is exactly right — that is when the answer changes. A socket that
+*is* there downgrades, unchanged, because then something answered.
+
+Both backends apply that one rule; `both_backends_say_the_same_thing_about_a_unix_socket`
+in `crates/arc-cli/tests/trace_differential.rs` pins it. `bind`, `sendto` and
+the rest still downgrade unconditionally: they are not a question about whether
+a name exists.
+
+The compromise, stated: the seccomp backend has no return value, so it decides
+by asking the filesystem whether the socket exists at notification time. A
+socket created in the microsecond between that check and the syscall would be
+connected to under a complete trace. It is the same race the backend already
+documents for existence checks, and it is a narrower window than the one a
+daemon starting mid-build already represents.
+
+## 10. Stable pseudo-files are hashed, not distrusted
+
+`/proc` and `/sys` were volatile wholesale: reading any of them revoked
+completeness. That is what kept every real workload off the fast path.
+Measured, before this change: `cargo test` lost completeness to
+`/sys/fs/cgroup/cpu.max`, `/proc/sys/vm/overcommit_memory` and
+`/sys/kernel/mm/transparent_hugepage/enabled`; the whole `pytest` suite lost it
+to `/sys/fs/selinux` and `/proc/mounts`; Debian's `ls`, `mv` and `cp` lose it
+to the same SELinux probe.
+
+The tempting rule is to ignore those reads. That rule is a false hit: a machine
+where SELinux is switched on is a machine where `ls` behaves differently, and a
+cache that ignored the difference would replay the old answer.
+
+The rule taken instead is to **hash them**. A named list of prefixes, `HASHABLE`
+in `trace/linux/mod.rs`: `/proc/sys`, cgroup, selinux, cpu topology and
+`/sys/kernel/mm`. Each is treated as an ordinary file dependency: content hashed
+when learned, hashed again when the key is computed. That can only cause
+misses, never stale hits, which is the direction correctness demands. A
+pseudo-file whose content changes on every read simply misses every time.
+
+It is a list rather than a rule about `/proc` and `/sys` in general because
+some pseudo-files cannot be read twice safely: `/proc/kmsg` blocks,
+`/dev/urandom` is unbounded and meaningless. Randomness and the clock stay
+volatile. Every entry on the list is there because a workload in
+[BENCHMARKS.md](BENCHMARKS.md) was measured falling off the fast path on it.
+
+Two of the paths named above are not on the list and are worth saying so.
+`/proc/mounts` is ignored rather than hashed: it is a symlink to `self/mounts`,
+the per-process view Arc already ignores, and hashing it through the link would
+fingerprint the link text instead of the mount table. `/proc/filesystems` is
+still volatile, for the reason in entry 13.
+
+## 11. `getrandom` is reported, not downgraded
+
+`getrandom(2)` was invisible: dismissed alongside the clock, so a run that
+consumed randomness looked deterministic while the same program reading
+`/dev/urandom` did not. That asymmetry is indefensible on its face and the
+obvious fix is to downgrade on `getrandom` too.
+
+It was implemented and measured, and it is not viable. glibc calls `getrandom`
+during start-up, so **every** command loses completeness, including `sh -c "cat
+in.txt"`, `date` and a single `pytest` file. Nothing narrows, and the
+dependency model is switched off across the board. The syscall is evidence that
+a process started, not evidence that its result depends on randomness.
+
+So the change was reverted, and what stands in its place is visibility: a run
+that calls `getrandom` says so in `arc run --trace`. Arc still does not detect
+nondeterminism, and [LIMITATIONS.md](../LIMITATIONS.md) still says so, but the
+fact is no longer invisible. A per-project opt-in downgrade is the obvious next
+step and is not built.
+
+## 12. A task cannot be skipped as unaffected while its product is missing
+
+Making more traces complete made more tasks *provable*, and that exposed a
+skip that had always been available and was rarely reached: on a fresh
+checkout with a shared graph, `arc ci` proved a code-generation task unaffected
+by a docs-only change and skipped it — leaving `generated/client.txt` absent in
+a workspace whose next task reads it. Arc's own report counts that case
+(`avoided_without_history`), which is how it was found.
+
+"Unaffected" answers "does this need re-running to be up to date", and on a
+machine that has never run it the honest answer is no longer no. So a provable
+task whose recorded products are not present in this workspace is raised to
+unknown, which sends it to the cache: a remote hit restores the outputs and
+costs nothing. Nothing executes that would not otherwise have executed.
+
+The alternative was to leave selection alone and treat the missing file as the
+user's problem, which is what a cache is supposed to remove.
+
+## 13. `/proc/filesystems` is not on the hashable list, and the reason is a measurement
+
+It was, briefly. It is what `mkdir` and `ls` read, so hashing it would have put
+a large class of ordinary commands back on the fast path.
+
+It broke `the_scheduler_gets_remote_hits_transparently` in
+`crates/arc-cli/tests/remote.rs`: two checkouts of the same project on the same
+machine, the second of which had always taken the first's results out of the
+remote cache, started executing instead. Removing that one entry — and nothing
+else — makes the test pass again, so the effect is established even though the
+mechanism is not. A rule that trades cross-checkout reuse for local
+completeness is not a trade worth making blind, so the entry is out until
+someone can say why.

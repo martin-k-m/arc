@@ -927,8 +927,18 @@ fn a_fresh_machine_reuses_both_the_results_and_the_task_knowledge() {
     // unaffected without this machine ever having run them.
     assert_eq!(v["analysis"]["knowledge_remote"], 3, "{v}");
     assert_eq!(v["analysis"]["knowledge_local"], 0);
-    assert!(selected(&v).is_empty(), "{:?}", selected(&v));
-    assert_eq!(counts(&v)["skipped"], 3);
+    // `test-web` reads a file and produces nothing, so being unaffected is the
+    // whole story and it is skipped. `gen` produces `generated/client.txt`,
+    // which this checkout does not have, so proving it unaffected is not enough
+    // to skip it: it goes to the cache instead, and the file lands.
+    assert_eq!(
+        selected(&v),
+        vec!["gen".to_string(), "test-api".to_string()],
+        "{v}"
+    );
+    assert_eq!(counts(&v)["skipped"], 1);
+    assert_eq!(counts(&v)["executed"], 0, "{v}");
+    assert!(b.root.join("generated/client.txt").exists(), "{v}");
 }
 
 /// A task with no declared inputs can never be proven unaffected, so it is
@@ -959,7 +969,7 @@ fn a_selected_task_another_machine_already_ran_is_a_remote_hit() {
     assert_eq!(
         selected(&v),
         vec!["probe".to_string()],
-        "unknown, so selected"
+        "its output is not in this checkout, so it cannot be skipped"
     );
     assert_eq!(outcomes(&v)["probe"], "remote_hit", "{v}");
     assert_eq!(counts(&v)["executed"], 0);
