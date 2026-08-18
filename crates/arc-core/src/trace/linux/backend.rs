@@ -708,7 +708,8 @@ fn resolve(
     let raw = match sys::read_cstr(pid, args[idx]) {
         Some(r) => r,
         None => {
-            t.rec.unresolved("the argument could not be read out of the process");
+            t.rec
+                .unresolved("the argument could not be read out of the process");
             return None;
         }
     };

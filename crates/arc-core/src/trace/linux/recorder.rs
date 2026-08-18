@@ -86,9 +86,10 @@ impl Recorder {
     pub fn unresolved(&mut self, why: &str) {
         if self.reported < MAX_UNRESOLVED_NOTES {
             self.reported += 1;
-            self.obs
-                .notes
-                .push(format!("unresolved path: {why} on syscall {}", self.syscall));
+            self.obs.notes.push(format!(
+                "unresolved path: {why} on syscall {}",
+                self.syscall
+            ));
         }
         self.obs.downgrade(Downgrade::PathResolutionFailure);
     }

@@ -501,8 +501,10 @@ fn connecting_to_a_unix_socket_that_is_not_there_is_a_dependency_on_its_absence(
     // absence, and absences are exactly what Arc already fingerprints.
     let sb = Sandbox::new();
     let sock = sb.root.join("daemon.sock");
-    sb.write("prog.py", &format!(
-        "import socket
+    sb.write(
+        "prog.py",
+        &format!(
+            "import socket
 s = socket.socket(socket.AF_UNIX)
 try:
     s.connect({:?})
@@ -510,8 +512,9 @@ except OSError:
     pass
 print('done')
 ",
-        sock.to_str().unwrap()
-    ));
+            sock.to_str().unwrap()
+        ),
+    );
     let log = stderr(&sb.arc(&["run", "--trace", "python3", "prog.py"]));
     if log.contains("no python3") || !log.contains("TRACE") {
         return;

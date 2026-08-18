@@ -931,7 +931,11 @@ fn a_fresh_machine_reuses_both_the_results_and_the_task_knowledge() {
     // whole story and it is skipped. `gen` produces `generated/client.txt`,
     // which this checkout does not have, so proving it unaffected is not enough
     // to skip it: it goes to the cache instead, and the file lands.
-    assert_eq!(selected(&v), vec!["gen".to_string(), "test-api".to_string()], "{v}");
+    assert_eq!(
+        selected(&v),
+        vec!["gen".to_string(), "test-api".to_string()],
+        "{v}"
+    );
     assert_eq!(counts(&v)["skipped"], 1);
     assert_eq!(counts(&v)["executed"], 0, "{v}");
     assert!(b.root.join("generated/client.txt").exists(), "{v}");
