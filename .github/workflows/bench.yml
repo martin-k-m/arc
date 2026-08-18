@@ -34,7 +34,7 @@ jobs:
       - run: cargo build --release
       - run: sudo apt-get update && sudo apt-get install -y strace
       - name: environment
-        run: bash bench/environment.sh
+        run: ARC=$PWD/target/release/arc bash bench/environment.sh
       - name: micro benchmarks
         run: bash scripts/bench.sh
       - name: tracing backends
