@@ -438,6 +438,7 @@ fn both_backends_downgrade_network_use() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn both_backends_say_the_same_thing_about_a_unix_socket() {
     needs_both!();
