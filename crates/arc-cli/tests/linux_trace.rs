@@ -472,24 +472,37 @@ if [ -e link.txt ]; then echo yes; else echo no; fi
 #[test]
 fn a_process_that_outlives_the_command_costs_the_trace_its_completeness() {
     needs_tracer!();
-    // A detached grandchild can still read files after `arc run` has returned,
-    // and none of those reads are in the trace. Claiming completeness there
-    // means caching a dependency set that is missing an unknown amount.
-    let sb = Sandbox::new();
-    sb.write("in.txt", "one");
-    sb.script(
-        "run.sh",
-        "#!/bin/sh
+    // A detached grandchild can still read files after `arc run` has returned.
+    // The two backends answer differently and both answers are correct, which is
+    // the table in LIMITATIONS 4. Pinning the backend is what makes the
+    // expectation well defined; one verdict for both is not.
+    for backend in ["seccomp", "ptrace"] {
+        let sb = Sandbox::new();
+        sb.write("in.txt", "one");
+        sb.script(
+            "run.sh",
+            "#!/bin/sh
 setsid sh -c 'sleep 2; cat in.txt > /dev/null' < /dev/null > /dev/null 2>&1 &
 exit 0
 ",
-    );
-    let log = stderr(&sb.arc(&["run", "--trace", "./run.sh"]));
-    assert!(
-        log.contains("TRACE PARTIAL") && log.contains("a process could not be followed"),
-        "a trace that misses a live process must not be called complete:
+        );
+        let log = stderr(&sb.arc(&["run", "--trace", "--trace-backend", backend, "./run.sh"]));
+        // A pinned backend that is unavailable falls back rather than failing, so
+        // the verdict is chosen by the backend that actually ran.
+        if log.contains("linux-ptrace") {
+            assert!(
+                log.contains("TRACE COMPLETE"),
+                "ptrace waits the grandchild out, so its completeness is earned:
 {log}"
-    );
+            );
+        } else {
+            assert!(
+                log.contains("TRACE PARTIAL") && log.contains("a process could not be followed"),
+                "a trace that misses a live process must not be called complete:
+{log}"
+            );
+        }
+    }
 }
 
 #[test]
