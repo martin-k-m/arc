@@ -602,7 +602,6 @@ impl Session {
             .is_absolute()
             .then(|| PathBuf::from(display_form(&target)))
     }
-
 }
 
 fn exists(p: &Path) -> bool {
