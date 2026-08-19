@@ -7,7 +7,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::Duration;
 
 const ARC: &str = env!("CARGO_BIN_EXE_arc");
 
@@ -589,39 +588,84 @@ inputs = ["generated/root.txt"]
 "#,
     );
     sb.init_git();
-    sb.learn("cat src/seed.txt > generated/root.txt # fan-root");
-    sb.learn("cat generated/root.txt > /dev/null; sleep 1 # fan-left");
-    sb.learn("cat generated/root.txt > /dev/null; sleep 1 # fan-right");
-    sb.commit();
 
-    let time_it = |jobs: &str| {
-        sb.write("src/seed.txt", &format!("change-{jobs}"));
-        let start = std::time::Instant::now();
-        let out = sb.arc(&["affected", "--run", "--jobs", jobs, "--json"]);
-        assert!(out.status.success(), "{}", stderr(&out));
-        start.elapsed()
+    // Whether two tasks overlapped is a fact about the schedule, so ask the
+    // schedule rather than the clock. Each leaf announces itself, watches for
+    // the other for up to a second, records what it saw, and takes its own
+    // marker down again.
+    //
+    // This replaces a comparison of two timed runs. Subtracting the timings
+    // cancels the fixed overhead but not the variance around it, and on a
+    // contended windows-latest runner that variance is larger than the second
+    // the sleeps were meant to save: one run measured 6.58s against 6.40s, a
+    // saving of 176ms against a 500ms bound, and failed for a reason that had
+    // nothing to do with concurrency.
+    //
+    // The markers live outside the project on purpose. Arc holds a task's
+    // writes back and materialises them when it finishes, so a marker written
+    // inside the project is invisible to a task running beside it and visible
+    // to one running after it: exactly backwards for this. Taking the marker
+    // down on the way out matters for the same reason, since one left behind
+    // says only that the peer ran at some point.
+    //
+    // Hence the pause before taking it down: the first leaf to spot the other
+    // would otherwise clear its marker before the other had looked, and the run
+    // would report one "concurrent" and one "alone".
+    let rendezvous = std::env::temp_dir().join(format!("arc-rendezvous-{}", std::process::id()));
+    std::fs::create_dir_all(&rendezvous).unwrap();
+    let rv = rendezvous
+        .display()
+        .to_string()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+
+    let watcher = |me: &str, peer: &str| {
+        format!(
+            "cat generated/root.txt > /dev/null;              : > {rv}/{me}.tick;              seen=alone; i=0;              while [ $i -lt 10 ]; do                if [ -f {rv}/{peer}.tick ]; then seen=concurrent; break; fi;                sleep 0.1; i=$((i+1));              done;              echo $seen > generated/{me}.seen;              sleep 0.3; rm -f {rv}/{me}.tick # fan-{me}"
+        )
     };
 
-    let serial = time_it("1");
-    let parallel = time_it("4");
+    sb.learn("cat src/seed.txt > generated/root.txt # fan-root");
+    sb.learn(&watcher("left", "right"));
+    sb.learn(&watcher("right", "left"));
+    sb.commit();
 
-    // Two one-second sleeps: serial pays for both, parallel for about one, so
-    // running them concurrently saves a second. Assert on that saving rather
-    // than on a ratio.
-    //
-    // A ratio does not survive a slow machine, which is what the previous bound
-    // (parallel < serial * 0.85) assumed it would. Both timings include the same
-    // fixed cost O for process start, git and tracing, so they are O+2 and O+1
-    // and the ratio is (O+1)/(O+2), which climbs toward 1 as O grows: past about
-    // 4.7s of overhead the assertion cannot hold however perfectly the sleeps
-    // overlap. A loaded windows-latest runner gets there, and the test failed
-    // for a reason that had nothing to do with concurrency. In a difference O
-    // cancels.
-    let saved = serial.checked_sub(parallel).unwrap_or_default();
+    let run = |jobs: &str| -> (String, String) {
+        for marker in ["left.tick", "right.tick"] {
+            let _ = std::fs::remove_file(rendezvous.join(marker));
+        }
+        // Only the markers inside the project, not generated/ itself, which
+        // root redirects its output into.
+        for marker in ["left.seen", "right.seen"] {
+            let _ = std::fs::remove_file(sb.root.join("generated").join(marker));
+        }
+        sb.write("src/seed.txt", &format!("change-{jobs}"));
+        let out = sb.arc(&["affected", "--run", "--jobs", jobs, "--json"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let read = |name: &str| {
+            std::fs::read_to_string(sb.root.join("generated").join(name))
+                .unwrap_or_else(|e| panic!("{name} was not written: {e}"))
+                .trim()
+                .to_string()
+        };
+        (read("left.seen"), read("right.seen"))
+    };
+
+    let (left, right) = run("4");
     assert!(
-        saved >= Duration::from_millis(500),
-        "expected concurrency to save about a second: serial {serial:?},          parallel {parallel:?}, saved {saved:?}"
+        left == "concurrent" && right == "concurrent",
+        "with --jobs 4 the leaves did not overlap: left {left}, right {right}"
     );
+
+    // The other half of the claim, and the guard on this test: a serial run
+    // that also reported "concurrent" would mean the rendezvous measures
+    // nothing and would pass however the tasks were scheduled.
+    let (left, right) = run("1");
+    assert!(
+        left == "alone" && right == "alone",
+        "with --jobs 1 a leaf still saw the other: left {left}, right {right}"
+    );
+
+    let _ = std::fs::remove_dir_all(&rendezvous);
 }
 
 #[test]
