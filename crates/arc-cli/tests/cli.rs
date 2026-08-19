@@ -453,3 +453,43 @@ fn first_blob(dir: &Path) -> PathBuf {
     }
     panic!("no blobs stored");
 }
+
+// A reader that stops early must not turn into a panic. Rust ignores SIGPIPE,
+// so `arc doctor | head` used to die at status 101 with "failed printing to
+// stdout", and bench/environment.sh, whose awk stops at the section after
+// tracing, inherited that status through pipefail and failed the nightly
+// benchmark run for three nights.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_stops_early_does_not_panic() {
+    use std::io::Read;
+
+    let s = Sandbox::new();
+    let mut child = Command::new(ARC)
+        .arg("doctor")
+        .current_dir(&s.root)
+        .env("ARC_HOME", &s.home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("running arc");
+
+    // Read one chunk and drop the pipe, which is what `| head` does.
+    let mut out = child.stdout.take().unwrap();
+    let mut buf = [0u8; 64];
+    let _ = out.read(&mut buf);
+    drop(out);
+
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).ok();
+    let status = child.wait().expect("waiting for arc");
+
+    assert!(
+        !err.contains("panicked"),
+        "arc panicked when its reader went away: {err}"
+    );
+    assert!(
+        status.code() != Some(101),
+        "arc exited 101, the Rust panic status, when its reader went away"
+    );
+}
