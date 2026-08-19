@@ -263,7 +263,26 @@ enum ConfigCmd {
     Show,
 }
 
+/// Rust ignores SIGPIPE, so a write to a closed pipe returns EPIPE and the
+/// print macros panic on it: `arc doctor | head` exits 101 with a panic
+/// message rather than stopping quietly, and any script that reads part of
+/// Arc's output and stops inherits that status. Restoring the default
+/// disposition makes Arc behave like every other command in a pipeline. It
+/// also gives traced children the disposition a shell would have given them,
+/// which is what Arc is trying to observe.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // Safety: setting a signal disposition before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() {
+    restore_sigpipe();
     match real_main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {

@@ -1,7 +1,7 @@
 # Bugs
 
 Defects I actually shipped, and what each one taught me. Every entry names
-the commit that fixed it and the test that keeps it fixed. There are seven,
+the commit that fixed it and the test that keeps it fixed. There are eight,
 which is a thin history, and I would rather it read thin and true than long
 and padded — nothing here is a hypothetical or a near miss.
 
@@ -250,9 +250,54 @@ mitigation is that the release was rehearsed at all.
 
 ---
 
+## 8. A reader that stopped early turned Arc's own output into a panic
+
+**Symptom.** The nightly `bench` workflow failed three nights running, at
+`bench/environment.sh`, with exit code 101 and no error text. The script had
+printed its host, toolchain and tracing sections first, so it looked like it
+had finished its work and then died anyway.
+
+**Root cause.** 101 is Rust's panic status. The script pipes `arc doctor` into
+an `awk` that stopped at the section after `tracing` with `exit`, which closes
+the read end while `doctor` still has the remote-cache and CI sections to
+write. Rust ignores SIGPIPE, so that write returned `EPIPE`, and `println!`
+panics on a failed write: `failed printing to stdout: Broken pipe (os error
+32)`. `set -o pipefail` then made the panic the status of the script.
+
+It is a race between `doctor` finishing its writes and `awk` reaching its
+`exit`, which is why it was invisible for two days after the CI section landed
+and why it does not reproduce on a fast machine: in a container here the old
+pipeline wins 30 times out of 30, and on the four-core CI runner it lost three
+nights out of three.
+
+**How it was caught.** By the workflow, and only because it is scheduled.
+Nothing in the test suite piped Arc's output anywhere.
+
+**Fix.** Two, because the script was only where it surfaced.
+
+The script now clears its flag at the next section instead of exiting at it,
+so `awk` always reads to EOF and no reader ever goes away early.
+
+Arc now restores the default `SIGPIPE` disposition at startup. Rust ignoring
+SIGPIPE is right for a library and wrong for a command: `arc doctor | head`
+exited 101 and printed a panic where every other Unix command exits quietly.
+It now dies on the signal, status 141, as `head` expects. The traced children
+inherit the same disposition a shell would have given them, which is closer to
+what Arc is trying to observe in the first place.
+
+`a_reader_that_stops_early_does_not_panic` in `crates/arc-cli/tests/cli.rs`
+reads one chunk of `arc doctor`, drops the pipe, and fails if Arc panicked or
+exited 101. It fails without the startup change and passes with it.
+
+**What it taught me.** The measurement harness is code, and it was the only
+code here nothing tested. The bug was in Arc, not in the script: the script
+just happened to be the one caller that stopped reading.
+
+---
+
 ## What I would do differently
 
-Six of these seven were silent, and the two most serious — #1 and #2 — were
+Six of these eight were silent, and the two most serious — #1 and #2 — were
 both a cache that had stopped doing the one thing it exists to do while
 reporting success. That is the failure mode this project has to defend
 against, and the defence is not more tests. It is tests that assert on the
