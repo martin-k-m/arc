@@ -33,8 +33,13 @@ echo "arc"
 echo "  version             $("$ARC" --version)"
 # doctor puts a blank line immediately after the section heading, so a
 # /^tracing/,/^$/ range prints the heading and nothing else.
+#
+# This clears the flag at the next section rather than exiting at it. Exiting
+# closes the pipe while doctor is still writing, and doctor dies on EPIPE with
+# a Rust panic and status 101, which pipefail then makes the status of this
+# script.
 "$ARC" doctor 2>/dev/null | awk '
   /^tracing/ { on = 1 }
-  on && /^[a-z]/ && !/^tracing/ { exit }
+  on && /^[a-z]/ && !/^tracing/ { on = 0 }
   on { print "  " $0 }
 '
