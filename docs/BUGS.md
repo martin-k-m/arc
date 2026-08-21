@@ -1,9 +1,9 @@
 # Bugs
 
 Defects I actually shipped, and what each one taught me. Every entry names
-the commit that fixed it and the test that keeps it fixed. There are nine,
+the commit that fixed it and the test that keeps it fixed. There are ten,
 which is a thin history, and I would rather it read thin and true than long
-and padded — nothing here is a hypothetical or a near miss. The ninth is the
+and padded — nothing here is a hypothetical or a near miss. The tenth is the
 odd one out: it is a defect in the tests rather than in Arc, it is still open,
 and it says so.
 
@@ -275,7 +275,8 @@ nights out of three.
 **How it was caught.** By the workflow, and only because it is scheduled.
 Nothing in the test suite piped Arc's output anywhere.
 
-**Fix.** Two, because the script was only where it surfaced.
+**Fix.** `c5690a3` (`Die quietly when a reader stops early, instead of
+panicking`). Two changes, because the script was only where it surfaced.
 
 The script now clears its flag at the next section instead of exiting at it,
 so `awk` always reads to EOF and no reader ever goes away early.
@@ -297,7 +298,54 @@ just happened to be the one caller that stopped reading.
 
 ---
 
-## 9. Five trace tests depend on the host's `coreutils` being GNU
+## 9. The tracer loop could exit with a child still stopped, and hang the whole command
+
+**Symptom.** `arc run` hung for good, not slowly. One `linux_trace` suite run
+took 36 minutes at 0% CPU. It was load-dependent and looked like flakiness:
+under eight concurrent runs of the outliving-grandchild script from
+[LIMITATIONS.md](../LIMITATIONS.md) §4 on two pinned CPUs, **12 hangs in 80**.
+
+**Root cause.** The tracer loop stopped when the root had exited and its
+`table` was empty, but `table` is not the whole process tree. A child announced
+by its parent's `PTRACE_EVENT` but not yet stopped lives in `announced`, and
+one that stopped before that event arrived lives in `orphans`. Either can be
+outstanding while `table` is empty, so the loop returned with that child still
+parked in signal-delivery-stop and nothing left running to release it.
+
+What that cost was not the trace, it was the command. The stopped child still
+held the write end of the command's stdout and stderr, so those pipes never
+reached EOF, so the pump threads in `exec::run` blocked in `read` and the join
+never returned.
+
+**How it was caught.** By taking a stack instead of reading the code. `gdb` on
+a hung run showed thread 1 in `JoinHandle::join` at `exec.rs:117`, threads 4
+and 5 in `pump` at `exec.rs:207` blocked in `read`, no thread in `waitpid` at
+all, and the tracee at state `t` with `TracerPid` pointing back at Arc. That
+stack names the mechanism outright, which two rounds of reading the code had
+not.
+
+**Fix.** `580e1ce` (`Do not stop tracing while a child is still attached`). The
+termination test now covers all three sets, and whatever is still attached when
+the loop does finish is detached rather than abandoned. Same measurement after
+the change: **0 hangs in 80**.
+
+**Two earlier attempts, both wrong.** Releasing the orphan on the
+`ChildEscape` path gave 21 in 80. Draining `orphans` at loop exit gave 16 in
+80. Both were reasoned from the code rather than from a stack, both looked
+right, and both were wrong about which set the stuck child was in. That is the
+entry's real lesson: for a hang, get the stack and a measured rate before
+editing anything, because a fix that moves 12 to 16 is indistinguishable from
+noise if you are not counting.
+
+**Regression test.** None dedicated, and that is a gap I am recording rather
+than papering over. `a_process_that_outlives_the_command_costs_the_trace_its_completeness`
+(`crates/arc-cli/tests/linux_trace.rs:473`) exercises the same shape and would
+hang rather than fail if this regressed, but nothing asserts on the hang rate,
+so a partial regression would show up as flakiness rather than as a failure.
+
+---
+
+## 10. Five trace tests depend on the host's `coreutils` being GNU
 
 **Symptom.** `cargo test --release` fails 5 of the 35 tests in
 `crates/arc-cli/tests/linux_trace.rs` on Ubuntu under WSL2, while the same
@@ -366,7 +414,7 @@ that a test has asserted on the host rather than on Arc.
 
 ## What I would do differently
 
-Six of these nine were silent, and the two most serious — #1 and #2 — were
+Six of these ten were silent, and the two most serious — #1 and #2 — were
 both a cache that had stopped doing the one thing it exists to do while
 reporting success. That is the failure mode this project has to defend
 against, and the defence is not more tests. It is tests that assert on the

@@ -776,7 +776,7 @@ a `rust:1-bookworm` container on a four-core WSL2 VM that was not idle:
 | `make -j1` (tinycc, from clean), median of 7 | 5,773 ms | 8,844 ms | 8,139 ms | **41 ms** |
 | `cargo test` (serde_json), median of 3 | 6,188 ms | 17,635 ms | 31,880 ms | **112 ms** |
 
-Cache on disk after settling: 4.3 MB, 5.7 MB and 6.4 MB respectively — small
+Cache on disk after settling: 4.29 MiB, 5.71 MiB and 6.14 MiB respectively — small
 because the default captures stdout, stderr and the exit code rather than
 build products.
 
