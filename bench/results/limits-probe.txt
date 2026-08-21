@@ -1,48 +1,65 @@
-arc limits probe ? arc 1.0.0 ? Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+arc limits probe · arc 1.0.0 · Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
 glibc: 2.36
 
 ### clock
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### urandom
-    ? TRACE PARTIAL
+    ◆ TRACE PARTIAL
       not complete        read volatile path /dev/urandom
 
 ### getrandom
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### pid
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### proc
-    ? TRACE PARTIAL
+    ◆ TRACE PARTIAL
       not complete        read volatile path /proc/uptime
 
 ### proc_self
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### sysfs
-    ? TRACE PARTIAL
-      not complete        read volatile path /sys/devices/system/cpu/online
+    ◆ TRACE COMPLETE
+
+### cgroup
+    ◆ TRACE COMPLETE
+
+### proc_sys
+    ◆ TRACE COMPLETE
+
+### proc_mounts
+    ◆ TRACE COMPLETE
+
+### proc_filesystems
+    ◆ TRACE PARTIAL
+      not complete        read volatile path /proc/filesystems
 
 ### devnull
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### network_tcp
-    ? TRACE PARTIAL
+    ◆ TRACE PARTIAL
       not complete        the execution used the network
 
 ### network_unix
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
+
+### network_unix_live
+    ◆ TRACE PARTIAL
+      not complete        the execution used the network
 
 ### child
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### detached_child
-    ? TRACE COMPLETE
+    ◆ TRACE PARTIAL
+      not complete        a process could not be followed
 
 ### mmap_read
-    ? TRACE COMPLETE
+    ◆ TRACE COMPLETE
 
 ### mmap_write
     MISS  -- Arc noticed the change
@@ -54,7 +71,10 @@ glibc: 2.36
     MISS  -- Arc noticed the change
 
 ### dangling_symlink
-    HIT   -- Arc did not notice the change
+    MISS  -- Arc noticed the change
+
+### unix_socket_appears
+    MISS  -- Arc noticed the change
 
 ### dirlist
     MISS  -- Arc noticed the change
