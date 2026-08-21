@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Store {
     pub root: PathBuf,
@@ -35,14 +36,29 @@ impl Store {
     }
 
     fn tmp(&self) -> PathBuf {
-        // Process id plus nanoseconds: unique across concurrent Arc processes.
+        // Process id and nanoseconds separate concurrent Arc processes; the
+        // counter separates threads within one. The clock alone is not enough:
+        // its granularity is about 15ms on Windows, so two threads committing
+        // *different* blobs in the same tick used to get the same tmp name.
+        // The winner renamed it into place and the loser's rename then failed
+        // with "the system cannot find the file specified", which the
+        // `dest.is_file()` arm below does not absorb because the loser's
+        // destination is a different digest.
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        self.tmp_at(n)
+    }
+
+    /// The naming itself, with the clock reading passed in so a test can hold
+    /// it still. Two calls in the same tick must still differ.
+    fn tmp_at(&self, nanos: u128) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         self.root
             .join("tmp")
-            .join(format!("{}-{}", std::process::id(), n))
+            .join(format!("{}-{}-{}", std::process::id(), nanos, seq))
     }
 
     fn commit(&self, tmp: &Path, d: &Digest) -> Result<()> {
@@ -250,6 +266,47 @@ fn set_exec(_p: &Path, _exec: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The tmp name must not depend on the clock alone. Where the clock is
+    // coarse, as on Windows, two threads that ask in the same tick used to get
+    // the same path, and whichever renamed second failed outright.
+    #[test]
+    fn tmp_names_are_distinct_within_one_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::open(tmp.path()).unwrap();
+        // The clock is held still, which is what a coarse-grained clock does
+        // on its own. Without the counter every one of these is the same path,
+        // so this fails on any platform rather than only where the tick is
+        // long enough to catch it by luck.
+        let frozen = 1_700_000_000_000_000_000u128;
+        let names: std::collections::HashSet<_> = (0..1_000).map(|_| s.tmp_at(frozen)).collect();
+        assert_eq!(names.len(), 1_000, "tmp() handed out a duplicate path");
+    }
+
+    // Concurrent commits of *different* blobs. The failure this pins is not a
+    // lost blob but an error return: the loser of a tmp-name collision saw
+    // "the system cannot find the file specified" because the winner had
+    // already renamed the shared tmp file to a different digest's path.
+    #[test]
+    fn concurrent_puts_of_distinct_blobs_all_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(Store::open(tmp.path()).unwrap());
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let s = std::sync::Arc::clone(&s);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..64 {
+                    let body = format!("thread-{t}-item-{i}");
+                    s.put_bytes(body.as_bytes())
+                        .unwrap_or_else(|e| panic!("put failed: {e:#}"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(s.iter_blobs().unwrap().len(), 8 * 64);
+    }
 
     #[test]
     fn put_get_dedup_verify() {
