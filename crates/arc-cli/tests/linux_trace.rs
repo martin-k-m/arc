@@ -73,6 +73,72 @@ impl Sandbox {
         assert_ok(&self.sh(script));
         assert_hit(&self.sh(script), "the run after learning should reuse");
     }
+
+    /// Compile a C fixture into the sandbox and return the command that runs it.
+    /// Used where the test needs a real stdio program rather than a shell, so the
+    /// syscalls under test are the ones the fixture makes and not whatever the
+    /// host's coreutils happens to do.
+    fn c_program(&self, name: &str, src: &str) -> String {
+        self.write(&format!("{name}.c"), src);
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let out = Command::new(&cc)
+            .args(["-O0", "-o", name, &format!("{name}.c")])
+            .current_dir(&self.root)
+            .output()
+            .unwrap_or_else(|e| panic!("running {cc}: {e}"));
+        assert!(
+            out.status.success(),
+            "compiling the {name} fixture failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        format!("./{name}")
+    }
+}
+
+/// Read a file using only shell builtins.
+///
+/// The host's `cat` is not a fixture these tests control. With uutils coreutils
+/// it is a symlink into a multi-call binary that reads `/proc/filesystems`,
+/// which arc correctly treats as volatile, so the trace is partial and nothing
+/// narrows. That is arc being right and the test being wrong about what it was
+/// measuring. A builtin read touches only the file it is given.
+/// Calls `fstat` on stdout outright. glibc turns that into
+/// `newfstatat(1, "", &st, AT_EMPTY_PATH)`, which is the syscall the descriptor
+/// test exists to pin, so it is issued by construction rather than left to
+/// whatever the host's stdio happens to do.
+const DESCRIPTOR_READER_C: &str = r#"#include <stdio.h>
+#include <sys/stat.h>
+
+int main(void) {
+    struct stat st;
+    if (fstat(1, &st) != 0) return 1;
+
+    FILE *f = fopen("input.txt", "r");
+    if (!f) return 1;
+    int c;
+    while ((c = fgetc(f)) != EOF) putchar(c);
+    fclose(f);
+    return 0;
+}
+"#;
+
+/// Outlives the command that started it, then reads a file. Waiting and reading
+/// are done in the fixture so neither depends on the host's coreutils.
+const OUTLIVER_C: &str = r#"#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    sleep(2);
+    FILE *f = fopen("in.txt", "r");
+    if (!f) return 1;
+    while (fgetc(f) != EOF) {}
+    fclose(f);
+    return 0;
+}
+"#;
+
+fn read_file(path: &str) -> String {
+    format!("while IFS= read -r __line; do printf '%s\n' \"$__line\"; done < {path}")
 }
 
 fn stderr(o: &Output) -> String {
@@ -121,19 +187,17 @@ fn a_file_that_was_read_is_a_dependency_and_one_that_was_not_is_free() {
     needs_tracer!();
     let sb = Sandbox::new();
     sb.write("input.txt", "one").write("unrelated.txt", "x");
-    sb.learn("cat input.txt");
+    let read = read_file("input.txt");
+    sb.learn(&read);
 
     sb.write("unrelated.txt", "completely different");
     assert_hit(
-        &sb.sh("cat input.txt"),
+        &sb.sh(&read),
         "a file the execution never read cannot change its result",
     );
 
     sb.write("input.txt", "two");
-    assert_miss(
-        &sb.sh("cat input.txt"),
-        "the file it did read must invalidate",
-    );
+    assert_miss(&sb.sh(&read), "the file it did read must invalidate");
 }
 
 #[test]
@@ -145,15 +209,21 @@ fn asking_about_a_descriptor_does_not_cost_the_trace_its_completeness() {
     // it treats the empty path as a name it failed to resolve, every trace of
     // every stdio program is partial and nothing ever narrows.
     //
-    // `cat` is the smallest command that does it. The assertion is on the
+    // This used to run the host's `cat`, as the smallest command that does it.
+    // That made the test depend on which coreutils the host ships: uutils `cat`
+    // also reads `/proc/filesystems`, which arc correctly calls volatile, so the
+    // trace went partial and the test failed for a reason it was not about. The
+    // fixture below makes the call outright, so the test measures arc rather
+    // than the host. The assertion is on the
     // headline claim rather than on a hit, because a conservative whole-project
     // scan hits too when nothing changed -- which is exactly how this hid.
     let sb = Sandbox::new();
     sb.write("input.txt", "one");
-    let log = stderr(&sb.arc(&["run", "--trace", "cat", "input.txt"]));
+    let reader = sb.c_program("descriptor-reader", DESCRIPTOR_READER_C);
+    let log = stderr(&sb.arc(&["run", "--trace", &reader]));
     assert!(
         log.contains("TRACE COMPLETE"),
-        "reading a file with cat must produce a complete trace:\n{log}"
+        "reading a file must produce a complete trace:\n{log}"
     );
     assert!(
         !log.contains("a path argument could not be read back"),
@@ -479,12 +549,19 @@ fn a_process_that_outlives_the_command_costs_the_trace_its_completeness() {
     for backend in ["seccomp", "ptrace"] {
         let sb = Sandbox::new();
         sb.write("in.txt", "one");
+        // `sleep` is coreutils, and the uutils build of it reads
+        // `/proc/filesystems`, which would make this trace partial for a reason
+        // that has nothing to do with the grandchild. The fixture waits and
+        // reads on its own. `setsid` is util-linux and stays.
+        let outliver = sb.c_program("outliver", OUTLIVER_C);
         sb.script(
             "run.sh",
-            "#!/bin/sh
-setsid sh -c 'sleep 2; cat in.txt > /dev/null' < /dev/null > /dev/null 2>&1 &
+            &format!(
+                "#!/bin/sh
+setsid {outliver} < /dev/null > /dev/null 2>&1 &
 exit 0
-",
+"
+            ),
         );
         let log = stderr(&sb.arc(&["run", "--trace", "--trace-backend", backend, "./run.sh"]));
         // A pinned backend that is unavailable falls back rather than failing, so
@@ -841,8 +918,14 @@ match = "*the-consumer*"
         let sb = Sandbox::new();
         project(&sb, NAMES);
         sb.write("seed.txt", "one");
-        sb.learn("cat seed.txt > out.txt # the-producer");
-        sb.learn("cat out.txt > /dev/null # the-consumer");
+        sb.learn(&format!(
+            "{} > out.txt # the-producer",
+            read_file("seed.txt")
+        ));
+        sb.learn(&format!(
+            "{} > /dev/null # the-consumer",
+            read_file("out.txt")
+        ));
         assert!(
             edges(&sb).contains(&("producer".into(), "consumer".into())),
             "{:?}",
@@ -941,8 +1024,14 @@ match = "*the-consumer*"
         project(&sb, NAMES);
         sb.write("x.txt", "x");
         sb.write("y.txt", "y");
-        sb.learn("cat y.txt > /dev/null; echo a > x.txt # the-producer");
-        sb.learn("cat x.txt > /dev/null; echo b > y.txt # the-consumer");
+        sb.learn(&format!(
+            "{} > /dev/null; echo a > x.txt # the-producer",
+            read_file("y.txt")
+        ));
+        sb.learn(&format!(
+            "{} > /dev/null; echo b > y.txt # the-consumer",
+            read_file("x.txt")
+        ));
         let g = graph_json(&sb);
         assert_eq!(g["cycles"].as_array().unwrap().len(), 1, "{g}");
 
