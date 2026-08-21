@@ -1,9 +1,11 @@
 # Bugs
 
 Defects I actually shipped, and what each one taught me. Every entry names
-the commit that fixed it and the test that keeps it fixed. There are eight,
+the commit that fixed it and the test that keeps it fixed. There are nine,
 which is a thin history, and I would rather it read thin and true than long
-and padded — nothing here is a hypothetical or a near miss.
+and padded — nothing here is a hypothetical or a near miss. The ninth is the
+odd one out: it is a defect in the tests rather than in Arc, it is still open,
+and it says so.
 
 The pattern across almost all of them is the same, and it is the reason I
 keep this file: **the failure was silent**. Arc kept working. It cached, it
@@ -295,9 +297,76 @@ just happened to be the one caller that stopped reading.
 
 ---
 
+## 9. Five trace tests depend on the host's `coreutils` being GNU
+
+**Symptom.** `cargo test --release` fails 5 of the 35 tests in
+`crates/arc-cli/tests/linux_trace.rs` on Ubuntu under WSL2, while the same
+commit is green on CI:
+
+```
+a_file_that_was_read_is_a_dependency_and_one_that_was_not_is_free       FAILED
+asking_about_a_descriptor_does_not_cost_the_trace_its_completeness      FAILED
+graph::a_cycle_between_two_tasks_is_reported_and_still_schedulable      FAILED
+graph::an_observed_write_and_read_form_an_edge_with_no_configuration    FAILED
+a_process_that_outlives_the_command_costs_the_trace_its_completeness    FAILED
+```
+
+Every one of them reduces to the same assertion, that tracing `cat` produces a
+complete trace, and the same recorded reason for why it did not:
+
+```
+  dependency model    partial
+  not complete        read volatile path /proc/filesystems
+```
+
+**Root cause.** Not Arc. This Ubuntu ships **uutils coreutils 0.8.0** rather
+than GNU coreutils, and `/usr/bin/cat` is a symlink to
+`../lib/cargo/bin/coreutils/cat`, the uutils multi-call binary. That
+implementation reads `/proc/filesystems`. Arc classifies `/proc` as a volatile
+path, which is correct and is the documented behaviour in
+[LIMITATIONS.md](../LIMITATIONS.md), so the trace is honestly reported as
+partial. The tests assume the `cat` on the box does not touch `/proc`, which is
+true of GNU coreutils and false here.
+
+**How it was caught.** By building and running the suite on a machine that is
+not the CI runner. It is worth recording that my first attempt to diagnose it
+was wrong: I ran `strace` to prove `cat` never opened `/proc/filesystems`, got
+a clean result, and nearly wrote this up as the tracer inventing a read.
+`strace` was not installed, so the pipeline had been grepping an empty stream
+and every check I based on it was vacuous.
+
+What settled it was a positive control instead of a negative one. Compile a
+three-line C program that opens the same file and nothing else, trace it, and
+compare:
+
+```sh
+cc -O2 -o reader r.c
+arc run --trace-backend ptrace --trace -- ./reader   # dependency model complete, 3 files read
+arc run --trace-backend ptrace --trace -- cat input.txt  # partial, read volatile path /proc/filesystems
+```
+
+Both Linux backends agree, which also rules out a backend-specific fault:
+`ptrace` and the seccomp backend independently record the same `/proc` read.
+
+**Fix.** None applied. Arc is doing the right thing, so there is nothing to fix
+in the tracer, and I am not going to weaken a test to make a machine happy. The
+correct repair is to the fixtures: they should exercise the tracer with a
+helper whose syscalls the test controls, rather than with whatever `cat` the
+host distribution supplies. That is the same defect as
+[#5](#5-a-ci-test-inherited-the-ci-it-was-running-inside), which was a test
+inheriting the environment it ran in, and it is the third time in this file
+that a test has asserted on the host rather than on Arc.
+
+**Reproduction environment.** Ubuntu on WSL2, kernel
+`6.18.33.2-microsoft-standard-WSL2`, glibc 2.43, rustc 1.97.1, uutils coreutils
+0.8.0. The suite is green where `cat` is GNU.
+
+
+---
+
 ## What I would do differently
 
-Six of these eight were silent, and the two most serious — #1 and #2 — were
+Six of these nine were silent, and the two most serious — #1 and #2 — were
 both a cache that had stopped doing the one thing it exists to do while
 reporting success. That is the failure mode this project has to defend
 against, and the defence is not more tests. It is tests that assert on the
