@@ -279,8 +279,7 @@ mod tests {
         // so this fails on any platform rather than only where the tick is
         // long enough to catch it by luck.
         let frozen = 1_700_000_000_000_000_000u128;
-        let names: std::collections::HashSet<_> =
-            (0..1_000).map(|_| s.tmp_at(frozen)).collect();
+        let names: std::collections::HashSet<_> = (0..1_000).map(|_| s.tmp_at(frozen)).collect();
         assert_eq!(names.len(), 1_000, "tmp() handed out a duplicate path");
     }
 
