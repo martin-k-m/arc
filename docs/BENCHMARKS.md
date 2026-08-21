@@ -70,7 +70,7 @@ docker exec arcbench sh -c 'cd /work/arc && cargo build --release'
 docker exec arcbench bash /work/arc/bench/fetch-projects.sh
 docker exec arcbench bash /work/arc/bench/environment.sh
 docker exec arcbench sh -c 'cd /work/arc && REPS=7 bash bench/real-workloads.sh'
-docker exec arcbench sh -c 'cd /work/arc && bash bench/hit-rate-click.sh 50'
+docker exec arcbench sh -c 'cd /work/arc && bash bench/hit-rate-click.sh 60'
 docker exec arcbench bash /work/arc/bench/limits-probe.sh
 ```
 
@@ -180,13 +180,13 @@ Measured after the cache has settled, `du -sb $ARC_HOME`.
 
 | Workload | cache on disk |
 | --- | --- |
-| click | 4.29 MB |
-| tinycc | 5.71 MB |
-| serde_json | 6.44 MB |
+| click | 4.29 MiB (4,495,283 B) |
+| tinycc | 5.71 MiB (5,988,992 B) |
+| serde_json | 6.14 MiB (6,443,603 B) |
 
 These are small because the default captures stdout, stderr and the exit
 code, which is the right thing for a test run. Declaring `[outputs]` to
-restore build artifacts is what makes a cache large; tinycc's 5.7 MB is
+restore build artifacts is what makes a cache large; tinycc's 5.71 MiB is
 mostly the trace's own dependency records over an 849-file, 74-process build.
 
 ## Results: what tracing costs
