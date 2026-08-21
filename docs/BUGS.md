@@ -396,18 +396,37 @@ arc run --trace-backend ptrace --trace -- cat input.txt  # partial, read volatil
 Both Linux backends agree, which also rules out a backend-specific fault:
 `ptrace` and the seccomp backend independently record the same `/proc` read.
 
-**Fix.** None applied. Arc is doing the right thing, so there is nothing to fix
-in the tracer, and I am not going to weaken a test to make a machine happy. The
-correct repair is to the fixtures: they should exercise the tracer with a
-helper whose syscalls the test controls, rather than with whatever `cat` the
-host distribution supplies. That is the same defect as
+**Fix.** The fixtures, not the tracer and not the assertions. Nothing in Arc
+changed and no test was weakened. Each of the five now exercises the tracer with
+something whose syscalls the test controls:
+
+- Four only needed *a* file read, so they read with shell builtins, which touch
+  the file and nothing else.
+- `asking_about_a_descriptor_does_not_cost_the_trace_its_completeness` could not
+  take that route. Its point is that a stdio program issues
+  `newfstatat(fd, "", AT_EMPTY_PATH)`, and a builtin loop would have made it pass
+  while testing nothing. It compiles a C fixture that calls `fstat(1)` outright,
+  so the syscall is issued by construction.
+
+Finding the second one cost a wrong guess of its own. After replacing `cat`,
+`a_process_that_outlives_the_command_costs_the_trace_its_completeness` still
+reported the same `/proc/filesystems` read, and I assumed `setsid` was the
+culprit. It is not: `setsid` here is util-linux 2.41.3 and traces clean. The
+reader was **`sleep`**, which is coreutils and so is also uutils on this box.
+`arc run --trace sh -c "sleep 1"` reproduces it on its own. That fixture now
+waits and reads in C as well.
+
+Verified both ways: 35 of 35 pass on the uutils machine, and 35 of 35 in a
+`rust:1-bookworm` container with GNU coreutils 9.1, so the repair did not simply
+move the host dependency somewhere else. That is the same defect as
 [#5](#5-a-ci-test-inherited-the-ci-it-was-running-inside), which was a test
 inheriting the environment it ran in, and it is the third time in this file
 that a test has asserted on the host rather than on Arc.
 
 **Reproduction environment.** Ubuntu on WSL2, kernel
 `6.18.33.2-microsoft-standard-WSL2`, glibc 2.43, rustc 1.97.1, uutils coreutils
-0.8.0. The suite is green where `cat` is GNU.
+0.8.0. The suite was green where `cat` is GNU and red here; it is now green on
+both.
 
 
 ---
