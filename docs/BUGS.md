@@ -600,14 +600,28 @@ cleared by a concurrent test, or an upstream trace that came back incomplete and
 so was never cacheable, are all still open. The failing summary records a
 `family_key` per task, which is where I would start.
 
-**Frequency.** Once in ten full workspace runs. Not seen in the other nine. The
-`taskgraph` binary has never been run in isolation in a loop, so nothing is
-known about whether it fails on its own.
+**Frequency.** Once in ten full workspace runs. Not seen in the other nine.
 
-**What would settle it.** Loop the `taskgraph` binary alone and under load, the
-way [#11](#11-a-traced-connect-recorded-a-path-truncated-to-the-project-root)
-was probed, and if it reproduces, compare the `family_key` of the task that
-should have hit against the key written by the run that populated the cache.
+**Reproduction attempt: the binary alone does not fail.** Twenty iterations of
+the whole `taskgraph` binary in the container, ten idle and ten with four `yes`
+processes saturating all four CPUs. Zero failures in both arms. Its own
+concurrent cases — `concurrent_scheduler_runs_do_not_corrupt_the_graph`,
+`independent_tasks_run_concurrently` — do not provoke it, and neither does CPU
+pressure.
+
+**The one thing #11 and #12 share.** Both have been seen only during
+`cargo test --workspace`, and neither reproduces when its own binary is looped
+alone: #11 survived ten unfiltered runs, #12 twenty. What the workspace run adds
+is other test binaries executing as separate processes on the same four cores.
+That is a boundary condition, not a cause, and it is the same for two failures
+that otherwise have nothing in common. I am recording the coincidence without
+claiming it explains either.
+
+**What would settle it.** Instrument rather than repeat: during a workspace
+loop, record each task's `family_key` and the completeness of the upstream
+trace, so a failure says whether the key differed or the upstream was never
+cacheable in the first place. Repeating the workspace loop unattended only buys
+another denominator.
 
 **Reproduction environment.** Arc at `70e7be1` plus a diagnostic print in an
 unrelated test file. Debian 13 container on Docker 29.6.2, run with
