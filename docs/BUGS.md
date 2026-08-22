@@ -509,11 +509,27 @@ isolated configuration that passes. `.github/workflows/release.yml` runs
 `cargo test --workspace --all-features --no-fail-fast`, which is the shape that
 failed, and it passed on 2026-08-22.
 
-**What would settle it.** Get a reproduction first: the differential binary
-alone under synthetic CPU load, which separates wall-clock pressure from the
-particular set of neighbouring test binaries. With a reproduction in hand, log
-`len` and the raw sockaddr bytes inside `read_unix_path` and see whether `len`
-is short. Without one, the hypothesis above stays a hypothesis.
+**Reproduction attempt: CPU load is not it.** Twelve runs of this case alone in
+the container, six idle and six with four `yes` processes saturating all four
+CPUs. Zero failures in both arms, and every run recorded
+`absent={"not-there.sock"}` on both backends. Wall-clock pressure on its own
+does not produce it.
+
+That is a useful negative, because it leaves one variable untested. Every run
+that has ever passed used a test filter, so twelve of the thirteen cases in the
+binary were filtered out and nothing else in the process was spawning children.
+The only run that failed had all thirteen running at once alongside the rest of
+the workspace. The suspicion therefore moves from load to concurrent siblings,
+and the file already names the hazard: ptrace reaps with `waitpid(-1, __WALL)`,
+which is process-wide, so any other thread in this binary spawning a child can
+have its status stolen. The reaper lock in the test serialises tracing sessions
+against each other; it does not cover a child spawned by anything else.
+
+**What would settle it.** Run the whole differential binary unfiltered, in a
+loop, rather than one case under load — that is the configuration the failure
+was seen in and the one no experiment here has repeated. With a reproduction in
+hand, log `len` and the raw sockaddr bytes inside `read_unix_path` and see
+whether `len` is short. Without one, the hypothesis above stays a hypothesis.
 
 **Reproduction environment.** Arc at `70e7be1`. Debian 13 container on Docker
 29.6.2, run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four
