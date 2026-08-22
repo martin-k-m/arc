@@ -1,11 +1,12 @@
 # Bugs
 
-Defects I actually shipped, and what each one taught me. Every entry names
-the commit that fixed it and the test that keeps it fixed. There are ten,
-which is a thin history, and I would rather it read thin and true than long
-and padded — nothing here is a hypothetical or a near miss. The tenth is the
-odd one out: it is a defect in the tests rather than in Arc, it is still open,
-and it says so.
+Defects I actually shipped, and what each one taught me. Every fixed entry
+names the commit that fixed it and the test that keeps it fixed. There are
+eleven, which is a thin history, and I would rather it read thin and true than
+long and padded — nothing here is a hypothetical or a near miss. The last two
+are the odd ones out. #10 was a defect in the tests rather than in Arc, and is
+now fixed. #11 is a failure I have reproduced but not explained, so it carries
+no fix and no root cause, and it says so.
 
 The pattern across almost all of them is the same, and it is the reason I
 keep this file: **the failure was silent**. Arc kept working. It cached, it
@@ -431,9 +432,68 @@ both.
 
 ---
 
+## 11. A traced `connect` to an absent Unix socket loses its path under load
+
+**Status: open.** No fix, and no root cause. This entry records a failure that
+was observed, not one that is understood.
+
+**Symptom.** `both_backends_say_the_same_thing_about_a_unix_socket` in
+`crates/arc-cli/tests/trace_differential.rs` fails intermittently, and so far
+only while the whole workspace is under test at once:
+
+```
+thread 'both_backends_say_the_same_thing_about_a_unix_socket' panicked at
+crates/arc-cli/tests/trace_differential.rs:475:9:
+linux-ptrace did not record the socket's absence: {""}
+```
+
+The case connects to `not-there.sock`, which cannot exist, and asserts that the
+failed connect is recorded as an absence Arc can check again. The absent set
+came back holding exactly one entry, and that entry was the empty string.
+
+**What can be said from the failure alone.** The completeness assertion
+immediately above it passed, so the run was still called complete and nothing
+downgraded. That rules out the path being unreadable: an argument that cannot
+be reconstructed is reported as `path_resolution_failure`, which downgrades the
+run, and no downgrade happened. The readback returned, and what it returned was
+empty. Why, I do not know.
+
+Nothing can be said about the seccomp backend here. The loop runs
+`Selection::Ptrace` first and the panic ends the test, so the fast backend never
+executed in the failing run. Whether it agrees or disagrees is unmeasured.
+
+**Frequency.** Failed once in two `cargo test --workspace --no-fail-fast` runs.
+Passed three times out of three when run on its own in the same container. The
+run that failed reported 460 passed and 1 failed of 461; the run that did not
+reported 461 passed. In the failing run the sibling case
+`a_thousand_sessions_leak_nothing` logged that it had been going for over sixty
+seconds, so the machine was tracing hard at the time, but that is a coincidence
+in timing rather than a demonstrated cause.
+
+**Why CI does not catch it.** `.github/workflows/ci.yml` runs
+`cargo test -p arc-cli --test trace_differential` as a step of its own, which is
+the isolated configuration that passes. `.github/workflows/release.yml` does run
+`cargo test --workspace --all-features --no-fail-fast`, which is the shape that
+failed here, and it passed on 2026-08-22. So the flake is real but infrequent
+enough that a green pipeline says little about it either way.
+
+**What would settle it.** Run the differential binary alone under artificial
+load rather than the whole workspace, which separates "parallel tracing" from
+"this particular set of neighbours". If it reproduces there, the next question
+is whether the empty string arrives from the `connect` sockaddr readback or is
+written by the absent-path recorder afterwards.
+
+**Reproduction environment.** Arc at `70e7be1`. Debian 13 container on Docker
+29.6.2, run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four
+CPUs, kernel `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. Both
+Linux backends reported available by `arc doctor`.
+
+
+---
+
 ## What I would do differently
 
-Six of these ten were silent, and the two most serious — #1 and #2 — were
+Six of these eleven were silent, and the two most serious — #1 and #2 — were
 both a cache that had stopped doing the one thing it exists to do while
 reporting success. That is the failure mode this project has to defend
 against, and the defence is not more tests. It is tests that assert on the
