@@ -2,11 +2,11 @@
 
 Defects I actually shipped, and what each one taught me. Every fixed entry
 names the commit that fixed it and the test that keeps it fixed. There are
-eleven, which is a thin history, and I would rather it read thin and true than
+twelve, which is a thin history, and I would rather it read thin and true than
 long and padded — nothing here is a hypothetical or a near miss. The last two
 are the odd ones out. #10 was a defect in the tests rather than in Arc, and is
-now fixed. #11 is a failure I have reproduced but not explained, so it carries
-no fix and no root cause, and it says so.
+now fixed. #11 and #12 are failures I have seen but not explained, so they carry
+no fix and no root cause, and they say so.
 
 The pattern across almost all of them is the same, and it is the reason I
 keep this file: **the failure was silent**. Arc kept working. It cached, it
@@ -536,12 +536,17 @@ configuration that has ever failed is a full `cargo test --workspace`, where
 other test binaries run as separate processes at the same time, and that has
 been seen exactly once.
 
-The honest reading of the frequency is that it is unknown. One failure in two
-workspace runs is a single event, not a rate: it is equally consistent with a
-common fault I have since been lucky about and a rare one I was unlucky to
-catch. Nothing here justifies quoting a number, and the 0/10 above does not
-prove the configuration matters, only that this configuration did not fail ten
+Eight further workspace runs did not reproduce it, so the standing count is one
+occurrence in ten full workspace runs. That is a denominator rather than a rate
+I would defend: a single event against ten trials bounds it loosely and says
+nothing about the mechanism. The 0/10 unfiltered runs above do not prove the
+configuration matters either, only that that configuration did not fail ten
 times.
+
+Those same eight runs did surface a different intermittent failure in the same
+configuration — a cache hit that re-ran, in `taskgraph.rs` — which is recorded
+separately as [#12](#12-a-task-that-should-have-hit-the-cache-re-ran-under-a-full-workspace-run).
+Whether the two share a cause is unknown, and I have not assumed they do.
 
 **What would settle it.** Loop the full workspace run itself, which is the only
 shape that has ever failed, and accept that it costs minutes per iteration and
@@ -554,11 +559,65 @@ hypothesis above stays a hypothesis, and this entry stays open.
 CPUs, kernel `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. Both
 Linux backends reported available by `arc doctor`.
 
+## 12. A task that should have hit the cache re-ran under a full workspace run
+
+**Status: open.** Seen once, not diagnosed, and no reproduction attempt has been
+made yet beyond the runs described here.
+
+**Symptom.** `an_upstream_cache_hit_still_lets_downstream_proceed` in
+`crates/arc-cli/tests/taskgraph.rs` failed on the eighth of eight consecutive
+`cargo test --workspace --no-fail-fast` runs:
+
+```
+crates/arc-cli/tests/taskgraph.rs:744
+assertion `left == right` failed
+  left: "ran"
+ right: "hit"
+```
+
+The summary it asserts against shows nothing hit at all:
+
+```
+{"blocked":0,"duration_ms":1270,"failed":0,"hits":0,"ran":3, ...}
+```
+
+All three tasks ran, each with `"cache_source":null` and `"outcome":"ran"`, on a
+run where the upstream task was expected to be served from the cache.
+
+**Why it is worth an entry.** Every other defect in this file that mattered was
+a cache quietly not doing its job while reporting success, and this is that
+shape again: the work completed, the exit codes were zero, and the only thing
+that went wrong was the cache being skipped. It was caught because the test
+asserts on the *claim* — `outcome == "hit"` — rather than on the run succeeding.
+That is the discipline the closing section of this file argues for, and it is
+the reason this one was visible at all.
+
+**Root cause.** Not established. Nothing has been ruled out: a key that differs
+between the producing and consuming run, a cache directory shared with or
+cleared by a concurrent test, or an upstream trace that came back incomplete and
+so was never cacheable, are all still open. The failing summary records a
+`family_key` per task, which is where I would start.
+
+**Frequency.** Once in ten full workspace runs. Not seen in the other nine. The
+`taskgraph` binary has never been run in isolation in a loop, so nothing is
+known about whether it fails on its own.
+
+**What would settle it.** Loop the `taskgraph` binary alone and under load, the
+way [#11](#11-a-traced-connect-recorded-a-path-truncated-to-the-project-root)
+was probed, and if it reproduces, compare the `family_key` of the task that
+should have hit against the key written by the run that populated the cache.
+
+**Reproduction environment.** Arc at `70e7be1` plus a diagnostic print in an
+unrelated test file. Debian 13 container on Docker 29.6.2, run with
+`--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four CPUs, kernel
+`6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. That iteration
+reported 460 passed and 1 failed of 461.
+
 ---
 
 ## What I would do differently
 
-Six of these eleven were silent, and the two most serious — #1 and #2 — were
+Six of these twelve were silent, and the two most serious — #1 and #2 — were
 both a cache that had stopped doing the one thing it exists to do while
 reporting success. That is the failure mode this project has to defend
 against, and the defence is not more tests. It is tests that assert on the
