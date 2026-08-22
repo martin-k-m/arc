@@ -525,11 +525,29 @@ which is process-wide, so any other thread in this binary spawning a child can
 have its status stolen. The reaper lock in the test serialises tracing sessions
 against each other; it does not cover a child spawned by anything else.
 
-**What would settle it.** Run the whole differential binary unfiltered, in a
-loop, rather than one case under load — that is the configuration the failure
-was seen in and the one no experiment here has repeated. With a reproduction in
-hand, log `len` and the raw sockaddr bytes inside `read_unix_path` and see
-whether `len` is short. Without one, the hypothesis above stays a hypothesis.
+**Reproduction attempt: concurrent siblings are not it either.** Ten iterations
+of the whole binary unfiltered, all thirteen cases each time, alone in the
+container. Zero failures, and the case ran on both backends every iteration.
+So the twelve neighbours inside the process do not produce it, and the
+`waitpid(-1)` suspicion above is not supported by anything I have measured.
+
+**Where that leaves it.** Two theories proposed and two knocked down. The only
+configuration that has ever failed is a full `cargo test --workspace`, where
+other test binaries run as separate processes at the same time, and that has
+been seen exactly once.
+
+The honest reading of the frequency is that it is unknown. One failure in two
+workspace runs is a single event, not a rate: it is equally consistent with a
+common fault I have since been lucky about and a rare one I was unlucky to
+catch. Nothing here justifies quoting a number, and the 0/10 above does not
+prove the configuration matters, only that this configuration did not fail ten
+times.
+
+**What would settle it.** Loop the full workspace run itself, which is the only
+shape that has ever failed, and accept that it costs minutes per iteration and
+may need many. With a reproduction in hand, log `len` and the raw sockaddr
+bytes inside `read_unix_path` and see whether `len` is short. Without one, the
+hypothesis above stays a hypothesis, and this entry stays open.
 
 **Reproduction environment.** Arc at `70e7be1`. Debian 13 container on Docker
 29.6.2, run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four
