@@ -432,14 +432,15 @@ both.
 
 ---
 
-## 11. A traced `connect` to an absent Unix socket loses its path under load
+## 11. A traced `connect` recorded a path truncated to the project root
 
-**Status: open.** No fix, and no root cause. This entry records a failure that
-was observed, not one that is understood.
+**Status: open.** Reproduced once, not yet reproduced on demand, and the
+mechanism below is a hypothesis fitted to a single failure rather than
+something I have demonstrated.
 
 **Symptom.** `both_backends_say_the_same_thing_about_a_unix_socket` in
-`crates/arc-cli/tests/trace_differential.rs` fails intermittently, and so far
-only while the whole workspace is under test at once:
+`crates/arc-cli/tests/trace_differential.rs` failed during a full-workspace
+run:
 
 ```
 thread 'both_backends_say_the_same_thing_about_a_unix_socket' panicked at
@@ -447,47 +448,77 @@ crates/arc-cli/tests/trace_differential.rs:475:9:
 linux-ptrace did not record the socket's absence: {""}
 ```
 
-The case connects to `not-there.sock`, which cannot exist, and asserts that the
-failed connect is recorded as an absence Arc can check again. The absent set
-came back holding exactly one entry, and that entry was the empty string.
+**What the empty string actually is.** Not an empty path. The test relativises
+every path against the project root in `Learned::of`, and a path *equal* to the
+root strips to `""`. So the absent set held exactly one entry and that entry was
+the project root.
 
-**What can be said from the failure alone.** The completeness assertion
-immediately above it passed, so the run was still called complete and nothing
-downgraded. That rules out the path being unreadable: an argument that cannot
-be reconstructed is reported as `path_resolution_failure`, which downgrades the
-run, and no downgrade happened. The readback returned, and what it returned was
-empty. Why, I do not know.
+That matters because a healthy run holds exactly one entry too, and it is the
+socket. Printed from a passing run:
 
-Nothing can be said about the seccomp backend here. The loop runs
-`Selection::Ptrace` first and the panic ends the test, so the fast backend never
-executed in the failing run. Whether it agrees or disagrees is unmeasured.
+```
+DIAG backend=linux-ptrace   complete=true absent={"not-there.sock"}
+DIAG backend=linux-seccomp  complete=true absent={"not-there.sock"}
+```
 
-**Frequency.** Failed once in two `cargo test --workspace --no-fail-fast` runs.
-Passed three times out of three when run on its own in the same container. The
-run that failed reported 460 passed and 1 failed of 461; the run that did not
-reported 461 passed. In the failing run the sibling case
-`a_thousand_sessions_leak_nothing` logged that it had been going for over sixty
-seconds, so the machine was tracing hard at the time, but that is a coincidence
-in timing rather than a demonstrated cause.
+So the connect was not missed and the set was not emptied. One path was
+recorded, and it was the socket path cut off exactly where the project root
+ends, losing the trailing `/not-there.sock`.
+
+**Why it cannot be an empty readback.** `read_unix_path` in
+`trace/linux/sys.rs` ends with `(!name.is_empty()).then(...)`, so it returns
+`None` rather than an empty path, and a `None` there records nothing at all.
+The empty string cannot have come from it. An earlier version of this entry
+claimed the readback "returned, and what it returned was empty"; that was wrong
+and is the reason this entry now leads with where the string comes from.
+
+**Hypothesis, untested.** The name is bounded by the syscall's `addrlen`
+argument:
+
+```rust
+let want = (len as usize).min(2 + 108);
+if read_into(pid, addr, &mut buf) != want { return None; }
+let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+```
+
+If `len` arrives as `2 + root.len()`, the buffer stops at the root boundary, no
+NUL is found, `end` falls back to `path.len()`, and the result is the root
+exactly. Every observed detail follows from a short `len`, including the run
+still being called complete: a truncated but non-empty path is a *successful*
+readback, not a `path_resolution_failure`, so nothing downgrades. That would
+make this a syscall-argument read taken at the wrong moment rather than
+anything about sockets — which would also fit its load sensitivity.
+
+I have not tested this. It is the first thing to check if it reproduces.
+
+**Nothing can be said about the fast backend.** The loop runs
+`Selection::Ptrace` first and the panic ends the test, so `linux-seccomp` never
+executed in the failing run.
+
+**Frequency.** Failed once in two `cargo test --workspace --no-fail-fast` runs;
+460 passed and 1 failed of 461 in the failing run, 461 passed in the other.
+Passed three times out of three run alone in the same container, and CI has
+passed it since. In the failing run the sibling case
+`a_thousand_sessions_leak_nothing` had been going for over sixty seconds, so
+the machine was tracing hard, but that is timing rather than a demonstrated
+cause.
 
 **Why CI does not catch it.** `.github/workflows/ci.yml` runs
-`cargo test -p arc-cli --test trace_differential` as a step of its own, which is
-the isolated configuration that passes. `.github/workflows/release.yml` does run
+`cargo test -p arc-cli --test trace_differential` as its own step, which is the
+isolated configuration that passes. `.github/workflows/release.yml` runs
 `cargo test --workspace --all-features --no-fail-fast`, which is the shape that
-failed here, and it passed on 2026-08-22. So the flake is real but infrequent
-enough that a green pipeline says little about it either way.
+failed, and it passed on 2026-08-22.
 
-**What would settle it.** Run the differential binary alone under artificial
-load rather than the whole workspace, which separates "parallel tracing" from
-"this particular set of neighbours". If it reproduces there, the next question
-is whether the empty string arrives from the `connect` sockaddr readback or is
-written by the absent-path recorder afterwards.
+**What would settle it.** Get a reproduction first: the differential binary
+alone under synthetic CPU load, which separates wall-clock pressure from the
+particular set of neighbouring test binaries. With a reproduction in hand, log
+`len` and the raw sockaddr bytes inside `read_unix_path` and see whether `len`
+is short. Without one, the hypothesis above stays a hypothesis.
 
 **Reproduction environment.** Arc at `70e7be1`. Debian 13 container on Docker
 29.6.2, run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four
 CPUs, kernel `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. Both
 Linux backends reported available by `arc doctor`.
-
 
 ---
 
