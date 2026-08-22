@@ -559,6 +559,8 @@ hypothesis above stays a hypothesis, and this entry stays open.
 CPUs, kernel `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. Both
 Linux backends reported available by `arc doctor`.
 
+---
+
 ## 12. A task that should have hit the cache re-ran under a full workspace run
 
 **Status: open.** Seen once, not diagnosed, and no reproduction attempt has been
