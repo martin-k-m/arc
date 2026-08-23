@@ -536,8 +536,9 @@ configuration that has ever failed is a full `cargo test --workspace`, where
 other test binaries run as separate processes at the same time, and that has
 been seen exactly once.
 
-Eight further workspace runs did not reproduce it, so the standing count is one
-occurrence in ten full workspace runs. That is a denominator rather than a rate
+Eighteen further workspace runs did not reproduce it, ten of them with the
+instrumentation below in place, so the standing count is one occurrence in
+twenty full workspace runs. That is a denominator rather than a rate
 I would defend: a single event against ten trials bounds it loosely and says
 nothing about the mechanism. The 0/10 unfiltered runs above do not prove the
 configuration matters either, only that that configuration did not fail ten
@@ -600,7 +601,8 @@ cleared by a concurrent test, or an upstream trace that came back incomplete and
 so was never cacheable, are all still open. The failing summary records a
 `family_key` per task, which is where I would start.
 
-**Frequency.** Once in ten full workspace runs. Not seen in the other nine.
+**Frequency.** Once in twenty full workspace runs, ten of them with the
+instrumentation below in place. Not seen in the other nineteen.
 
 **Reproduction attempt: the binary alone does not fail.** Twenty iterations of
 the whole `taskgraph` binary in the container, ten idle and ten with four `yes`
@@ -617,11 +619,27 @@ That is a boundary condition, not a cause, and it is the same for two failures
 that otherwise have nothing in common. I am recording the coincidence without
 claiming it explains either.
 
-**What would settle it.** Instrument rather than repeat: during a workspace
-loop, record each task's `family_key` and the completeness of the upstream
-trace, so a failure says whether the key differed or the upstream was never
-cacheable in the first place. Repeating the workspace loop unattended only buys
-another denominator.
+**The instrumentation to apply, written but never triggered.** Ten workspace
+runs were done with the failing assertion wired to dump, at the moment it
+fails: the populating run's status and output, `arc cache list --limit 50`
+taken after the populate and before the scheduled run, and the summary. That is
+the fork worth capturing. An empty cache list means the populating run never
+cached at all, and the wrong-key theory dies with it; an entry present with
+`hits 0` means the cache was there and was not consulted, and comparing its key
+against the summary's `family_key` becomes the next question. None of it
+printed, because none of the ten runs failed.
+
+The same loop carried a hook in `read_unix_path` for
+[#11](#11-a-traced-connect-recorded-a-path-truncated-to-the-project-root),
+behind `ARC_INSTR_SOCK`, logging `len`, `want`, `end` and whether a NUL was
+found. Also silent, for the same reason.
+
+**What would settle it.** Not more unattended loops. Twenty workspace runs have
+now produced two failures between the two entries and no diagnostic output from
+either, because the instrumentation only speaks when the assertion fails. The
+cheap version of this is to leave the dump in place behind an environment
+variable and let CI's own `release.yml` workspace run carry it, so the next
+natural occurrence is captured instead of hunted.
 
 **Reproduction environment.** Arc at `70e7be1` plus a diagnostic print in an
 unrelated test file. Debian 13 container on Docker 29.6.2, run with
