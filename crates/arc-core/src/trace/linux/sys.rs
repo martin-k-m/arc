@@ -262,7 +262,19 @@ pub fn read_unix_path(pid: i32, addr: u64, len: u64) -> Option<PathBuf> {
     let path = &buf[2..];
     let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
     let name = std::str::from_utf8(&path[..end]).ok()?;
+    // Diagnostic for docs/BUGS.md #11, off unless ARC_TEST_DIAG is set.
+    if diag_enabled() {
+        eprintln!(
+            "ARC_DIAG sockaddr len={len} want={want} end={end} nul={} name={name:?}",
+            path.contains(&0)
+        );
+    }
     (!name.is_empty()).then(|| PathBuf::from(name))
+}
+
+fn diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ARC_TEST_DIAG").is_some())
 }
 
 /// Bytes actually read; 0 on any failure. The only place `process_vm_readv` is

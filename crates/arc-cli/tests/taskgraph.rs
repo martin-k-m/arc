@@ -732,9 +732,34 @@ fn an_upstream_cache_hit_still_lets_downstream_proceed() {
     sb.write("schema/api.yaml", "v2");
     // Run the upstream task on its own first, so the scheduler meets it already
     // cached.
-    sb.run("cat schema/api.yaml > generated/schema.json # generate-schema");
+    let pop = sb.run("cat schema/api.yaml > generated/schema.json # generate-schema");
+    // Captured before the scheduled run so a failure can say whether the
+    // populating run cached at all. See docs/BUGS.md #12.
+    let cached = sb.arc(&["cache", "list", "--limit", "50"]);
 
     let summary = json(&sb.arc(&["affected", "--run", "--json"]));
+    if summary["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["label"].as_str() == Some("generate-schema"))
+        .and_then(|r| r["outcome"].as_str())
+        != Some("hit")
+    {
+        eprintln!("ARC_DIAG populate status={:?}", pop.status.code());
+        eprintln!(
+            "ARC_DIAG populate stdout={}",
+            String::from_utf8_lossy(&pop.stdout)
+        );
+        eprintln!(
+            "ARC_DIAG populate stderr={}",
+            String::from_utf8_lossy(&pop.stderr)
+        );
+        eprintln!(
+            "ARC_DIAG cache after populate={}",
+            String::from_utf8_lossy(&cached.stdout)
+        );
+    }
     let by_label: std::collections::BTreeMap<&str, &str> = summary["results"]
         .as_array()
         .unwrap()

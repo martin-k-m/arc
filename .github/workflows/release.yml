@@ -54,6 +54,8 @@ jobs:
       - run: git config --global user.email ci@example.com
       - run: git config --global user.name ci
       - run: cargo test --workspace --all-features --no-fail-fast
+        env:
+          ARC_TEST_DIAG: "1"
       - run: cargo build --workspace --release --locked
 
   build:

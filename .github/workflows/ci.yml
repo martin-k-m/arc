@@ -29,7 +29,12 @@ jobs:
       # --no-fail-fast so one failing test binary does not hide the others.
       # Twice now a real cross-platform bug has sat behind an unrelated
       # failure, invisible until that one was fixed.
+      # ARC_TEST_DIAG arms the diagnostics for docs/BUGS.md #11 and #12, which
+      # print only when their assertion fails. Both are rare and have never
+      # reproduced on demand, so the workspace run is where they get caught.
       - run: cargo test --workspace --no-fail-fast
+        env:
+          ARC_TEST_DIAG: "1"
       - run: cargo build --release
       - run: cargo run --release -q -p arc-core --example graph_bench
       - run: cargo run --release -q -p arc-core --example ci_bench
@@ -71,7 +76,7 @@ jobs:
         run: |
           ./target/release/arc doctor | grep -q 'linux-seccomp *available' ||
             { echo "the fast backend is unavailable on this runner" >&2; exit 1; }
-          cargo test -p arc-cli --test trace_differential
+          ARC_TEST_DIAG=1 cargo test -p arc-cli --test trace_differential
       # Each denial should cost exactly one backend, and the command must run
       # either way. With ptrace gone Arc still traces completely through
       # seccomp; with both gone it degrades to snapshot and stops claiming to
