@@ -328,6 +328,46 @@ A traced tree cannot gain privilege through `setuid`, because the seccomp
 filter is installed with `PR_SET_NO_NEW_PRIVS`. If your build depends on a
 `setuid` helper, it will behave differently under `arc run`.
 
+## 13. macOS will not run a copy of an Apple binary, so such an environment cannot be materialised
+
+**Measured on this machine, 2026-09-01.** Materialising an environment copies
+each captured tool into the store and runs the copy. On macOS with SIP enabled
+that is refused for Apple's own binaries: `/bin/sh` is a *platform binary*, a
+copy of it is not, and AMFI kills the copy. Three lines, no Arc involved:
+
+```console
+$ cp /bin/sh /tmp/sh-copy && /tmp/sh-copy -c 'echo hi'
+$ echo $?
+137
+```
+
+137 is SIGKILL. The signature on the copy is intact — `codesign -v` passes —
+and a copy of a *non-Apple* binary (Homebrew's `jq`) runs normally, so this is
+about platform-binary status rather than about copying or about permissions.
+
+An environment declaring `tools = ["sh"]` therefore cannot be materialised on
+such a machine: the run reports exit 137, no stdout, and a trace that observed
+nothing. Eight tests in `crates/arc-cli/tests/environment.rs` exercise exactly
+that and now skip, loudly, behind `needs_a_runnable_copy_of_sh!()`. **The macro
+probes the capability rather than the operating system**, because CI's
+`macos-latest` job runs these tests and passes — so something about that image
+does allow it, most likely SIP being off, which is not verified here. A skip
+keyed on `target_os = "macos"` would stop covering the machines where it works.
+
+**A fix exists and is a decision, not a patch.** Re-signing the copy ad hoc
+makes it run:
+
+```console
+$ codesign -f -s - /tmp/sh-copy && /tmp/sh-copy -c 'echo hi'
+hi
+```
+
+That changes the bytes of the materialised file, so the thing on disk stops
+being identical to the thing that was captured, and Arc's whole claim about an
+environment is that it is the same tool. Whether a re-signed copy is still "the
+same tool" is a question about identity rather than about macOS, which is why
+this entry records it instead of fixing it. **read**
+
 ---
 
 ## The honest summary

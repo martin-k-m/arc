@@ -29,6 +29,82 @@ macro_rules! needs_sh {
     };
 }
 
+/// Whether a *copy* of the shell can be executed on this machine.
+///
+/// Materialising an environment copies each captured tool into the store and
+/// runs the copy. On macOS with SIP enabled that is refused for Apple's own
+/// binaries: `/bin/sh` is a platform binary, a copy of it is not, and AMFI
+/// SIGKILLs it — the run reports exit 137 and no output at all. Reproducible in
+/// three lines, with no Arc involved:
+///
+/// ```text
+/// $ cp /bin/sh /tmp/sh-copy && /tmp/sh-copy -c 'echo hi'
+/// $ echo $?
+/// 137
+/// ```
+///
+/// A copy of a non-Apple binary runs fine, and re-signing the copy ad hoc
+/// (`codesign -f -s -`) makes it run — which is a possible fix for the
+/// materialiser and a decision about identity, since the bytes then stop
+/// matching the ones that were captured. See LIMITATIONS.md.
+///
+/// This probes the capability rather than the operating system on purpose. CI's
+/// macOS job passes these tests, so whatever it runs on does allow it, and a
+/// test skipped by `cfg!(target_os = "macos")` would stop covering the platform
+/// that actually works. The probe answers for the machine in front of it.
+fn can_execute_a_copy_of_sh() -> bool {
+    use std::io::Write;
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(sh) = which_sh() else { return false };
+    let copy = dir.path().join("sh-probe");
+    if std::fs::copy(&sh, &copy).is_err() {
+        return false;
+    }
+    make_executable(&copy);
+    // Written and flushed before use: a stale file handle is a different
+    // failure from the one being probed for.
+    let _ = std::io::stderr().flush();
+    matches!(
+        Command::new(&copy).arg("-c").arg("exit 0").status(),
+        Ok(status) if status.success()
+    )
+}
+
+/// The `sh` the materialiser would capture: the first one on PATH.
+fn which_sh() -> Result<PathBuf, ()> {
+    let path = std::env::var_os("PATH").ok_or(())?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("sh");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(())
+}
+
+/// A test that materialises an environment containing the host's `sh`.
+///
+/// Skips, loudly, where the platform will not execute a copy of it. Skipping is
+/// the honest answer rather than a weakened assertion: the capability the test
+/// asserts genuinely does not exist on such a machine, and the failure it would
+/// otherwise report says nothing about Arc.
+macro_rules! needs_a_runnable_copy_of_sh {
+    () => {
+        needs_sh!();
+        if !can_execute_a_copy_of_sh() {
+            eprintln!(
+                "SKIP: this machine refuses to execute a copy of `sh` \
+                 (macOS + SIP kills a copied Apple platform binary), so an \
+                 environment containing the host shell cannot be materialised. \
+                 See LIMITATIONS.md."
+            );
+            return;
+        }
+    };
+}
+
 // ------------------------------------------------------------------ fixture --
 
 struct Fixture {
@@ -310,7 +386,7 @@ mod execution {
 
     #[test]
     fn the_captured_tool_runs_and_the_host_copy_does_not() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let f = Fixture::new();
         with_command(&f);
         f.capture();
@@ -341,7 +417,7 @@ mod execution {
 
     #[test]
     fn a_radically_different_host_path_changes_nothing() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let f = Fixture::new();
         with_command(&f);
         f.capture();
@@ -367,7 +443,7 @@ mod execution {
 
     #[test]
     fn re_capturing_a_changed_tool_invalidates_the_cache_safely() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let f = Fixture::new();
         with_command(&f);
         f.capture();
@@ -422,7 +498,7 @@ mod execution {
     #[test]
     fn a_materialised_environment_is_written_read_only() {
         use std::os::unix::fs::PermissionsExt;
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let f = Fixture::new();
         with_command(&f);
         let id = f.capture()["id"].as_str().unwrap().to_string();
@@ -458,7 +534,7 @@ mod execution {
 
     #[test]
     fn reading_host_state_downgrades_hermeticity_rather_than_being_ignored() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let f = Fixture::new();
         with_command(&f);
         f.capture();
@@ -553,7 +629,7 @@ mod remote {
 
     #[test]
     fn a_worker_without_the_tool_runs_the_command_by_materialising_the_environment() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let c = Cluster::new();
         let f = Fixture::new();
         remote_config(&f, &c);
@@ -581,7 +657,7 @@ mod remote {
 
     #[test]
     fn a_second_job_reuses_the_workers_copy_of_the_environment() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let c = Cluster::new();
         let f = Fixture::new();
         remote_config(&f, &c);
@@ -598,7 +674,7 @@ mod remote {
 
     #[test]
     fn a_result_built_here_is_a_remote_hit_on_a_machine_that_never_had_the_tool() {
-        needs_sh!();
+        needs_a_runnable_copy_of_sh!();
         let c = Cluster::new();
         let f = Fixture::new();
         remote_config(&f, &c);
