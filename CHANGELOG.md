@@ -3,6 +3,20 @@
 Arc follows semantic versioning. What that covers, and what it does not, is
 described under [Compatibility](#compatibility).
 
+## Unreleased
+
+### Fixed
+
+- **ptrace read a `connect`'s socket address after the syscall, not before.**
+  The pointer was captured at the entry stop and the memory behind it was read
+  at the exit stop, by which time the calling thread is stopped and its siblings
+  are not: a thread that only writes memory makes no syscalls, is never stopped,
+  and can rewrite that buffer while the tracer reads it. The result is a
+  plausible path that was never connected to, recorded as a dependency, on a
+  trace that still calls itself complete. The read now happens at the entry
+  stop, where the kernel itself reads it. The seccomp backend was never
+  affected: it is notified before the syscall runs. See `docs/BUGS.md` #11.
+
 ## 1.0.0
 
 The first stable release. Everything below already existed across the 0.x

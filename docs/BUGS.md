@@ -555,6 +555,47 @@ may need many. With a reproduction in hand, log `len` and the raw sockaddr
 bytes inside `read_unix_path` and see whether `len` is short. Without one, the
 hypothesis above stays a hypothesis, and this entry stays open.
 
+**Found since: ptrace read the sockaddr at the wrong stop.** Not the hypothesis
+above, and not proof of it either, but a defect in its own right and the only
+one of the two backends that can have it.
+
+`prepare_entry` exists for work that can only be done before a syscall runs,
+and it held two cases: whether a path existed before a creating open, and the
+image of an `execve` that will never return. The `sockaddr` of a `connect`
+belonged there and was not there. The pointer was captured at the entry stop
+and the *memory it points at* was read at the exit stop, through
+`process_vm_readv`, after the syscall was over.
+
+By then the thread that made the call is stopped and its siblings are not. Arc
+traces every thread, but a thread doing nothing but writing to memory makes no
+syscalls and so is never stopped: it can rewrite that buffer while the tracer
+is reading it. What comes back is whatever is there now, which is a different
+question from what the syscall was asked to connect to. A shorter string there
+reads back as a perfectly plausible path that was never connected to, and a
+truncated-but-non-empty readback is a *successful* one, so nothing downgrades
+and the trace stays complete. That is the exact shape of the failure: one path
+recorded, complete, wrong.
+
+The seccomp backend never had this. It is notified *before* the syscall runs
+and reads the address then, which is also why the failing run said nothing
+about it -- and why the two backends could disagree at all.
+
+The read now happens in `prepare_entry` and the result is carried on `Proc` as
+`pending_connect`, the same way `pending_exec` is. This makes the class
+impossible rather than unlikely: the buffer is read at the only moment its
+contents are guaranteed, which is the moment the kernel itself reads it.
+
+**It is still not a reproduction, and this entry stays open.** A test was
+written to summon the race -- `connect` called through `ctypes` so the sockaddr
+is a Python buffer, with a second thread rewriting it between a decoy path and
+the real one, four hundred times -- and it **passed against the old code**. It
+was deleted rather than kept: a test that passes with and without the fix
+proves nothing and would tell the next reader it was covered. The window
+between the kernel finishing the call and the tracer reading is evidently too
+small for a Python thread to win reliably, and a C helper would be needed to
+close it. So the mechanism above is demonstrated by construction, not by
+observation, and whether it is what happened on 2026-08-22 is still unknown.
+
 **Reproduction environment.** Arc at `70e7be1`. Debian 13 container on Docker
 29.6.2, run with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four
 CPUs, kernel `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. Both
@@ -640,6 +681,30 @@ either, because the instrumentation only speaks when the assertion fails. The
 cheap version of this is to leave the dump in place behind an environment
 variable and let CI's own `release.yml` workspace run carry it, so the next
 natural occurrence is captured instead of hunted.
+
+**The workspace configuration is flaky on a second machine, and not always in
+the same place.** Two `cargo test --workspace --no-fail-fast` runs in a `rust:1`
+container on aarch64 Docker (four CPUs, emulated) failed three tests each, and
+the sets were not identical:
+
+| run | failed |
+|---|---|
+| baseline `e3fb1e3` | `two_ci_runs_sharing_one_cache_do_not_corrupt_it`, `concurrent_traced_runs_stay_independent`, `independent_tasks_run_concurrently` |
+| the same tree plus the #11 fix | `concurrent_traced_runs_do_not_corrupt_dependency_metadata`, `concurrent_traced_runs_stay_independent`, `independent_tasks_run_concurrently` |
+
+Every one of them is a concurrency test, and none is this entry's case. What
+that adds is a caution about the framing above: "only ever seen under a full
+workspace run" reads like a property of the two defects, and this says the
+configuration is simply where contention lives. A machine slow enough will fail
+*something* there.
+
+One of the three is a test-design problem rather than a defect.
+`independent_tasks_run_concurrently` asserts that two leaves genuinely overlap
+under `--jobs 4`, which cannot hold on a machine with nothing spare to overlap
+on, and it failed in both runs. It is the only one that failed every time.
+
+Whether the same contention explains #11 and #12 is still not established, and
+these runs did not reproduce either of them.
 
 **Reproduction environment.** Arc at `70e7be1` plus a diagnostic print in an
 unrelated test file. Debian 13 container on Docker 29.6.2, run with

@@ -71,6 +71,14 @@ pub struct Proc {
     /// Whether the path of a creating open already existed, established at the
     /// entry stop because by the exit stop the answer has changed.
     pub existed: Option<bool>,
+    /// The `sockaddr_un` path of a `connect` in flight, read at the entry stop.
+    ///
+    /// The kernel reads that buffer while the caller is stopped at entry, and
+    /// nothing keeps it intact afterwards: by the exit stop it is memory the
+    /// tracee owns and any thread sharing the address space may have reused.
+    /// Reading it then is reading whatever is there now, which is a different
+    /// question from what the syscall was asked to connect to.
+    pub pending_connect: Option<PathBuf>,
     /// The image of an `execve` in flight. A successful `execve` never returns,
     /// so it has no exit stop; the `PTRACE_EVENT_EXEC` stop collects this
     /// instead.
@@ -91,6 +99,7 @@ impl Proc {
             pending: None,
             existed: None,
             pending_exec: None,
+            pending_connect: None,
             clone_flags: 0,
             configured: false,
         }
@@ -117,6 +126,7 @@ impl Proc {
             pending: None,
             existed: None,
             pending_exec: None,
+            pending_connect: None,
             clone_flags: 0,
             configured: false,
         }
