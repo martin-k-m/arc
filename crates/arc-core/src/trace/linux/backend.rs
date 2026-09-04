@@ -380,11 +380,13 @@ fn on_syscall(t: &mut LinuxTracer, l: &mut Loop, pid: i32) {
 
 /// Work that can only be done before the syscall runs.
 ///
-/// Two things qualify. Whether a path exists can only be established before the
-/// call that may create it — this is the one place Arc touches the filesystem
-/// during a trace, and only for creating opens. And a successful `execve` never
-/// returns, so its image has to be captured now and confirmed at the resulting
-/// `PTRACE_EVENT_EXEC`.
+/// Three things qualify. Whether a path exists can only be established before
+/// the call that may create it — this is the one place Arc touches the
+/// filesystem during a trace, and only for creating opens. A successful
+/// `execve` never returns, so its image has to be captured now and confirmed at
+/// the resulting `PTRACE_EVENT_EXEC`. And the `sockaddr` a `connect` names is
+/// the caller's own memory: the kernel reads it here, while the thread is
+/// stopped at entry, and nothing keeps it intact past that point.
 fn prepare_entry(t: &mut LinuxTracer, l: &mut Loop, pid: i32, nr: u64, args: &[u64; 6]) {
     match syscalls::decode(nr as i64) {
         Some(Sc::Open {
@@ -399,6 +401,18 @@ fn prepare_entry(t: &mut LinuxTracer, l: &mut Loop, pid: i32, nr: u64, args: &[u
             let existed = std::fs::symlink_metadata(&resolved).is_ok();
             if let Some(p) = l.table.get_mut(pid) {
                 p.existed = Some(existed);
+            }
+        }
+        Some(Sc::Connect { addr, len }) => {
+            // Read now, recorded at the exit stop once the return value says
+            // what happened. Reading it at the exit stop instead means reading
+            // a buffer the tracee has owned again since the syscall returned,
+            // and a thread sharing the address space can have written anything
+            // into it -- including a shorter string, which reads back as a
+            // perfectly plausible path that was never connected to.
+            let named = sys::read_unix_path(pid, args[addr], args[len]);
+            if let Some(p) = l.table.get_mut(pid) {
+                p.pending_connect = named;
             }
         }
         Some(Sc::Exec {
@@ -642,13 +656,15 @@ fn on_exit(t: &mut LinuxTracer, l: &mut Loop, pid: i32, p: Pending, ret: i64, is
             }
         }
 
-        Sc::Connect { addr, len } => {
+        Sc::Connect { .. } => {
             // glibc asks `/var/run/nscd/socket` for every user and group
             // lookup, and on a machine with no nscd the answer is ENOENT. That
             // is a fact about the filesystem, and it is fingerprintable: record
             // the absence and keep the trace complete. A socket that IS there
             // answers with something Arc cannot reproduce, so it downgrades.
-            match sys::read_unix_path(pid, args[addr], args[len]) {
+            //
+            // The path was read at the entry stop; see `prepare_entry`.
+            match l.table.get_mut(pid).and_then(|p| p.pending_connect.take()) {
                 Some(p) if !p.exists() => t.record(&p, FileOp::Absent),
                 _ => t.rec.obs.downgrade(Downgrade::NetworkAccess),
             }
