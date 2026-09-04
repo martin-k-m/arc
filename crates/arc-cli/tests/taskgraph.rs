@@ -591,8 +591,25 @@ inputs = ["generated/root.txt"]
 
     // Whether two tasks overlapped is a fact about the schedule, so ask the
     // schedule rather than the clock. Each leaf announces itself, watches for
-    // the other for up to a second, records what it saw, and takes its own
-    // marker down again.
+    // the other, records what it saw, and takes its own marker down again.
+    //
+    // How long it watches for is written into a file before each run, and the
+    // two runs ask for very different amounts. That is the whole point of this
+    // shape. A leaf that has seen its peer stops watching immediately, so a
+    // large budget costs a machine that really did overlap them nothing, and
+    // the cost only lands where there is nothing to find.
+    //
+    // It was one second for both, and one second is a guess about a machine.
+    // Starting a traced child under an emulated container costs more than that,
+    // so both leaves gave up before either had announced itself and the test
+    // failed reporting "alone, alone" -- a scheduler that had done its job
+    // exactly right. Measured: it failed idle on aarch64 Docker and three times
+    // out of three with the CPUs saturated.
+    //
+    // The serial run keeps a short budget, because there is nothing to wait
+    // for: arc has not started the peer and will not until this task exits. A
+    // generous budget there would buy nothing and would be paid in full twice,
+    // every run, on every machine.
     //
     // This replaces a comparison of two timed runs. Subtracting the timings
     // cancels the fixed overhead but not the variance around it, and on a
@@ -610,7 +627,10 @@ inputs = ["generated/root.txt"]
     //
     // Hence the pause before taking it down: the first leaf to spot the other
     // would otherwise clear its marker before the other had looked, and the run
-    // would report one "concurrent" and one "alone".
+    // would report one "concurrent" and one "alone". It pauses only when it saw
+    // the peer, because that is the only case where anybody is still looking --
+    // and in the serial run, holding the marker would be holding it against the
+    // task that runs next.
     let rendezvous = std::env::temp_dir().join(format!("arc-rendezvous-{}", std::process::id()));
     std::fs::create_dir_all(&rendezvous).unwrap();
     let rv = rendezvous
@@ -620,16 +640,25 @@ inputs = ["generated/root.txt"]
 
     let watcher = |me: &str, peer: &str| {
         format!(
-            "cat generated/root.txt > /dev/null;              : > {rv}/{me}.tick;              seen=alone; i=0;              while [ $i -lt 10 ]; do                if [ -f {rv}/{peer}.tick ]; then seen=concurrent; break; fi;                sleep 0.1; i=$((i+1));              done;              echo $seen > generated/{me}.seen;              sleep 0.3; rm -f {rv}/{me}.tick # fan-{me}"
+            "cat generated/root.txt > /dev/null;              budget=$(cat {rv}/budget);              : > {rv}/{me}.tick;              seen=alone; i=0;              while [ $i -lt $budget ]; do                if [ -f {rv}/{peer}.tick ]; then seen=concurrent; break; fi;                sleep 0.1; i=$((i+1));              done;              echo $seen > generated/{me}.seen;              if [ $seen = concurrent ]; then sleep 1; fi;              rm -f {rv}/{me}.tick # fan-{me}"
         )
     };
+
+    // The learning runs read the budget too, and they happen before either
+    // scheduled run sets one. Without this the two `sh` processes each print
+    // "[: -lt: unary operator expected" and carry on, which is a passing test
+    // with an error in its output.
+    std::fs::write(rendezvous.join("budget"), "10").unwrap();
 
     sb.learn("cat src/seed.txt > generated/root.txt # fan-root");
     sb.learn(&watcher("left", "right"));
     sb.learn(&watcher("right", "left"));
     sb.commit();
 
-    let run = |jobs: &str| -> (String, String) {
+    // Tenths of a second. Thirty seconds when there should be something to see,
+    // one when there should not.
+    let run = |jobs: &str, budget: u32| -> (String, String) {
+        std::fs::write(rendezvous.join("budget"), budget.to_string()).unwrap();
         for marker in ["left.tick", "right.tick"] {
             let _ = std::fs::remove_file(rendezvous.join(marker));
         }
@@ -650,16 +679,17 @@ inputs = ["generated/root.txt"]
         (read("left.seen"), read("right.seen"))
     };
 
-    let (left, right) = run("4");
+    let (left, right) = run("4", 300);
     assert!(
         left == "concurrent" && right == "concurrent",
-        "with --jobs 4 the leaves did not overlap: left {left}, right {right}"
+        "with --jobs 4 the leaves did not overlap inside thirty seconds: \
+         left {left}, right {right}"
     );
 
     // The other half of the claim, and the guard on this test: a serial run
     // that also reported "concurrent" would mean the rendezvous measures
     // nothing and would pass however the tasks were scheduled.
-    let (left, right) = run("1");
+    let (left, right) = run("1", 10);
     assert!(
         left == "alone" && right == "alone",
         "with --jobs 1 a leaf still saw the other: left {left}, right {right}"

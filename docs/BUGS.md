@@ -698,10 +698,29 @@ workspace run" reads like a property of the two defects, and this says the
 configuration is simply where contention lives. A machine slow enough will fail
 *something* there.
 
-One of the three is a test-design problem rather than a defect.
+One of the three was a test-design problem rather than a defect, and is fixed.
 `independent_tasks_run_concurrently` asserts that two leaves genuinely overlap
-under `--jobs 4`, which cannot hold on a machine with nothing spare to overlap
-on, and it failed in both runs. It is the only one that failed every time.
+under `--jobs 4`, and each leaf watched for the other for **one second** before
+giving up. One second is a guess about a machine: starting a traced child in an
+emulated container costs more than that, so both leaves gave up before either
+had announced itself and the test failed reporting "alone, alone" -- a scheduler
+that had done its job exactly right.
+
+Measured before and after, in the same container. Before: failed idle, and three
+times out of three with six `yes` processes on four CPUs. After: passes idle,
+and three times out of three under the same load. It still fails when
+concurrency is genuinely absent -- pointing the concurrent half at `--jobs 1`
+reproduces "alone, alone" -- so it has not been made vacuous.
+
+The watch is now budgeted from a file the test writes before each run: thirty
+seconds where there should be something to see, one where there should not. A
+leaf stops watching the moment it sees its peer, so the large budget costs a
+machine that really did overlap them nothing, and the cost only lands where
+there is nothing to find. The serial half keeps the short budget because arc
+has not started the peer and will not until the task exits.
+
+That leaves two of the three failures above unexplained, and they remain
+concurrency tests failing under contention.
 
 Whether the same contention explains #11 and #12 is still not established, and
 these runs did not reproduce either of them.
