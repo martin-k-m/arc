@@ -42,8 +42,8 @@ use crate::outputs;
 use crate::paths::Classifier;
 use crate::project::{Config, Project};
 use crate::record::{
-    format_command, BlobRef, CacheEntry, CacheSource, CacheStatus, ExecutionRecord, OutputFile,
-    TraceSummary,
+    format_command, BlobRef, CacheEntry, CacheSource, CacheStatus, ExecutionRecord, KeyComponents,
+    OutputFile, TraceSummary,
 };
 use crate::remote::{self, Remote};
 use crate::scan::{self, FingerprintMap};
@@ -285,6 +285,16 @@ pub fn run(
     let env = key::fingerprint_env_in(&plan.cfg, plan.environment.is_some());
     let toolchain = key::fingerprint_toolchain_at(program, &plan.resolved);
     let dep_digest = plan.deps.key_digest();
+    // The same values the key is built from, kept so a later run can say which
+    // one moved. Built here rather than at record time so the two can never
+    // drift apart.
+    let components = KeyComponents {
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        dependency_digest: dep_digest.hex(),
+        output_globs: plan.cfg.outputs.include.clone(),
+        environment_id: plan.environment_id().to_string(),
+    };
     let exec_key = key::execution_key(&KeyInputs {
         program,
         args,
@@ -444,7 +454,8 @@ pub fn run(
     }
 
     if explain.reason.is_empty() {
-        let (reason, changed) = diff_reason(&db, &store, &plan, &inputs, &env)?;
+        let (reason, changed) =
+            diff_reason(&db, &store, &plan, &inputs, &env, &toolchain, &components)?;
         explain.reason = reason;
         explain.changed = changed;
     }
@@ -685,6 +696,7 @@ pub fn run(
                 id: e.id.clone(),
                 hermeticity: e.hermeticity.clone(),
             }),
+        key_components: Some(components.clone()),
     };
 
     let entry = store_cacheable.then(|| CacheEntry {
@@ -1023,6 +1035,10 @@ fn materialise_remote(
         family_key: plan.family_key.clone(),
         trace: None,
         environment: None,
+        // The producing run's components are the producing machine's, and the
+        // wire format does not carry them. Nothing is better than a guess:
+        // `diff_reason` reports what it cannot attribute rather than inventing.
+        key_components: None,
     };
     let base = remote::to_record(&wire, &template)?;
     for d in base.replay_digests() {
@@ -1350,6 +1366,7 @@ fn bypass(
         family_key: plan.family_key.clone(),
         trace: None,
         environment: None,
+        key_components: None,
     };
     db.put_execution(&record, None)?;
     let explain = Explain {
@@ -1430,12 +1447,15 @@ fn try_replay(
 }
 
 /// Explain a miss by diffing against the most recent run of the same family.
+#[allow(clippy::too_many_arguments)]
 fn diff_reason(
     db: &Db,
     store: &Store,
     plan: &Plan,
     inputs: &Inputs,
     env: &EnvFingerprint,
+    toolchain: &Toolchain,
+    components: &KeyComponents,
 ) -> Result<(String, Vec<String>)> {
     let history = db.history(200)?;
     // Only executions, not replays. A hit's record is a copy of the execution it
@@ -1484,10 +1504,95 @@ fn diff_reason(
             .unwrap_or_else(|| "environment changed".into());
         return Ok((reason, changed));
     }
-    Ok((
-        "toolchain, observed dependencies or execution policy changed".into(),
-        Vec::new(),
+    Ok(key_component_reason(
+        prev.schema,
+        &prev.toolchain,
+        prev.key_components.as_ref(),
+        crate::SCHEMA_VERSION,
+        toolchain,
+        components,
     ))
+}
+
+/// Name the execution-key component that moved, for a miss no input or
+/// environment-variable change explains.
+///
+/// Order matters: the components are reported most-specific first, because a
+/// user who changed their compiler wants to hear "the program changed" and not
+/// a list. Exactly one line is returned, plus the same line in `changed`, so
+/// `--json` consumers do not have to parse prose.
+///
+/// A record written before Arc stored [`KeyComponents`] carries `None`, and the
+/// three components it cannot compare are then named as *unattributable* rather
+/// than guessed at. That is a worse answer than the ones above and it says so;
+/// it is not the old lump, which claimed the same thing about records that
+/// could have been diffed.
+fn key_component_reason(
+    prev_schema: u32,
+    prev_tool: &Toolchain,
+    prev: Option<&KeyComponents>,
+    schema: u32,
+    tool: &Toolchain,
+    now: &KeyComponents,
+) -> (String, Vec<String>) {
+    let one = |s: String| (s.clone(), vec![s]);
+
+    if prev_schema != schema {
+        return one(format!(
+            "Arc's cache format changed (schema {prev_schema} to {schema});              results cached by the older format are not reused"
+        ));
+    }
+    // The toolchain digest covers the program's *contents*, so this fires when
+    // the compiler was upgraded under a command whose sources never moved --
+    // historically the most confusing miss Arc could produce.
+    if prev_tool.digest != tool.digest {
+        let which = tool
+            .resolved_path
+            .as_deref()
+            .unwrap_or(tool.program.as_str());
+        return one(format!("the program changed: {which}"));
+    }
+    let Some(prev) = prev else {
+        return (
+            "this command's key changed in a component the previous record              does not carry, so Arc cannot say which; re-run once and the next              miss will name it"
+                .into(),
+            Vec::new(),
+        );
+    };
+    if prev.os != now.os || prev.arch != now.arch {
+        return one(format!(
+            "the platform changed: {}/{} was {}/{}",
+            now.os, now.arch, prev.os, prev.arch
+        ));
+    }
+    if prev.environment_id != now.environment_id {
+        return one(
+            match (
+                prev.environment_id.is_empty(),
+                now.environment_id.is_empty(),
+            ) {
+                (true, false) => "this command now runs inside an Arc environment".into(),
+                (false, true) => "this command no longer runs inside an Arc environment".into(),
+                _ => "the Arc environment changed".into(),
+            },
+        );
+    }
+    if prev.output_globs != now.output_globs {
+        return one("the configured output patterns changed".into());
+    }
+    if prev.dependency_digest != now.dependency_digest {
+        // Arc learns what a command executes by watching it, so the first run
+        // after a trace, and any run that reaches a new subprocess, moves this.
+        return one(
+            "what Arc observed this command execute changed; this is what a              newly-learned or newly-widened dependency set looks like"
+                .into(),
+        );
+    }
+    (
+        "no execution-key component differs from the previous run, which should          not happen; please report this with `arc inspect`"
+            .into(),
+        Vec::new(),
+    )
 }
 
 /// `path changed|added|removed` lines, by comparing against the stored input
@@ -1581,4 +1686,147 @@ fn new_id(seed: &str, now: i64) -> String {
 
 pub fn short(id: &str) -> &str {
     &id[..id.len().min(6)]
+}
+
+#[cfg(test)]
+mod key_attribution_tests {
+    use super::*;
+
+    fn tool(digest: &str) -> Toolchain {
+        Toolchain {
+            program: "cc".into(),
+            resolved_path: Some("/usr/bin/cc".into()),
+            digest: digest.into(),
+        }
+    }
+
+    fn base() -> KeyComponents {
+        KeyComponents {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            dependency_digest: "dddd".into(),
+            output_globs: vec!["out/**".into()],
+            environment_id: String::new(),
+        }
+    }
+
+    /// The whole point of the function: it names one component, not a list of
+    /// candidates. Each case moves exactly one thing.
+    fn reason(prev: KeyComponents, now: KeyComponents) -> String {
+        key_component_reason(
+            crate::SCHEMA_VERSION,
+            &tool("tttt"),
+            Some(&prev),
+            crate::SCHEMA_VERSION,
+            &tool("tttt"),
+            &now,
+        )
+        .0
+    }
+
+    #[test]
+    fn a_changed_program_outranks_everything_else() {
+        // A different compiler with a different learned dependency set: the
+        // program is the answer the user can act on.
+        let mut now = base();
+        now.dependency_digest = "eeee".into();
+        let (r, changed) = key_component_reason(
+            crate::SCHEMA_VERSION,
+            &tool("tttt"),
+            Some(&base()),
+            crate::SCHEMA_VERSION,
+            &tool("uuuu"),
+            &now,
+        );
+        assert!(r.contains("the program changed"), "{r}");
+        assert!(r.contains("/usr/bin/cc"), "{r}");
+        assert_eq!(changed, vec![r]);
+    }
+
+    #[test]
+    fn a_schema_bump_is_named_rather_than_blamed_on_the_program() {
+        let (r, _) = key_component_reason(
+            crate::SCHEMA_VERSION - 1,
+            &tool("tttt"),
+            Some(&base()),
+            crate::SCHEMA_VERSION,
+            &tool("uuuu"),
+            &base(),
+        );
+        assert!(r.contains("cache format changed"), "{r}");
+    }
+
+    #[test]
+    fn a_different_platform_is_named() {
+        let mut now = base();
+        now.arch = "aarch64".into();
+        let r = reason(base(), now);
+        assert!(r.contains("platform changed"), "{r}");
+        assert!(r.contains("aarch64") && r.contains("x86_64"), "{r}");
+    }
+
+    #[test]
+    fn gaining_and_losing_an_environment_read_differently() {
+        let mut with = base();
+        with.environment_id = "envid".into();
+        assert!(
+            reason(base(), with.clone()).contains("now runs inside"),
+            "{}",
+            reason(base(), with.clone())
+        );
+        assert!(
+            reason(with.clone(), base()).contains("no longer runs inside"),
+            "{}",
+            reason(with.clone(), base())
+        );
+        let mut other = base();
+        other.environment_id = "different".into();
+        assert!(reason(with, other).contains("environment changed"));
+    }
+
+    #[test]
+    fn changed_output_patterns_are_named() {
+        let mut now = base();
+        now.output_globs.push("dist/**".into());
+        assert!(reason(base(), now).contains("output patterns"));
+    }
+
+    /// The miss every user of a learning cache hits on their second run and
+    /// cannot explain. Arc used to lump it in with two unrelated causes.
+    #[test]
+    fn a_widened_dependency_set_is_named_as_learning() {
+        let mut now = base();
+        now.dependency_digest = "eeee".into();
+        let r = reason(base(), now);
+        assert!(r.contains("observed this command execute"), "{r}");
+    }
+
+    /// An old record cannot be diffed this way, and Arc must say so rather
+    /// than name a component it did not compare.
+    #[test]
+    fn a_record_without_components_admits_it_cannot_attribute() {
+        let (r, changed) = key_component_reason(
+            crate::SCHEMA_VERSION,
+            &tool("tttt"),
+            None,
+            crate::SCHEMA_VERSION,
+            &tool("tttt"),
+            &base(),
+        );
+        assert!(r.contains("cannot say which"), "{r}");
+        assert!(
+            changed.is_empty(),
+            "nothing may be listed as changed: {changed:?}"
+        );
+    }
+
+    /// Reaching this means the key was rebuilt from components that all agree,
+    /// which is a defect in Arc rather than a change by the user. It must not
+    /// be reported as if the user did something.
+    #[test]
+    fn everything_agreeing_is_reported_as_a_defect_not_a_change() {
+        let r = reason(base(), base());
+        assert!(r.contains("should"), "{r}");
+        assert!(!r.contains("changed:"), "{r}");
+    }
 }

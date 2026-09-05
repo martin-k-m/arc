@@ -104,6 +104,34 @@ pub struct RecordedEnvironment {
     pub hermeticity: String,
 }
 
+/// The parts of the execution key that a record does not otherwise carry.
+///
+/// Inputs, environment variables and the toolchain each already have a field on
+/// [`ExecutionRecord`], so a miss caused by one of those could always be named.
+/// The rest of `key::KeyInputs` could not be, and a miss caused by any of them
+/// was reported as one three-way lump: "toolchain, observed dependencies or
+/// execution policy changed". Recording them makes every component of the key
+/// attributable.
+///
+/// `Option` on the record and `default` on every field, because a record
+/// written before this existed must still read — it simply cannot be diffed
+/// this way, and the reason Arc reports says so rather than guessing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyComponents {
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub arch: String,
+    /// Digest of the learned dependencies that participate in the key.
+    #[serde(default)]
+    pub dependency_digest: String,
+    #[serde(default)]
+    pub output_globs: Vec<String>,
+    /// Empty when the host's toolchain was used rather than an Arc environment.
+    #[serde(default)]
+    pub environment_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
     pub schema: u32,
@@ -141,6 +169,10 @@ pub struct ExecutionRecord {
     /// `default` so records written before v0.8 still read.
     #[serde(default)]
     pub environment: Option<RecordedEnvironment>,
+    /// The remaining execution-key components, so a miss can name which one
+    /// moved. `None` for records written before Arc recorded them.
+    #[serde(default)]
+    pub key_components: Option<KeyComponents>,
 }
 
 impl ExecutionRecord {

@@ -5,6 +5,19 @@ described under [Compatibility](#compatibility).
 
 ## Unreleased
 
+### Added
+
+- **A miss names which component of the execution key moved.** Previously a
+  miss that no input or environment-variable change explained was reported as
+  one three-way lump — "toolchain, observed dependencies or execution policy
+  changed" — which is three unrelated causes and no way to tell them apart. The
+  record now carries the remaining key components (OS, architecture, dependency
+  digest, output patterns, environment id), so `--explain` names exactly one:
+  the program's own contents changed, the learned dependency set widened, the
+  Arc environment changed, the output patterns changed, the platform changed,
+  or the cache schema moved. A record written before this existed carries none
+  of them, and Arc says it cannot attribute the miss rather than guessing.
+
 ### Fixed
 
 - **ptrace read a `connect`'s socket address after the syscall, not before.**
