@@ -2,11 +2,11 @@
 
 Defects I actually shipped, and what each one taught me. Every fixed entry
 names the commit that fixed it and the test that keeps it fixed. There are
-twelve, which is a thin history, and I would rather it read thin and true than
-long and padded — nothing here is a hypothetical or a near miss. The last two
-are the odd ones out. #10 was a defect in the tests rather than in Arc, and is
-now fixed. #11 and #12 are failures I have seen but not explained, so they carry
-no fix and no root cause, and they say so.
+thirteen, which is a thin history, and I would rather it read thin and true than
+long and padded — nothing here is a hypothetical or a near miss. Four are odd
+ones out. #10 and #13 were defects in the tests and in the test harness rather
+than in Arc, and both are fixed. #11 and #12 are failures I have seen but not
+explained, so they carry no fix and no root cause, and they say so.
 
 The pattern across almost all of them is the same, and it is the reason I
 keep this file: **the failure was silent**. Arc kept working. It cached, it
@@ -730,6 +730,85 @@ unrelated test file. Debian 13 container on Docker 29.6.2, run with
 `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, four CPUs, kernel
 `6.18.33.2-microsoft-standard-WSL2`, glibc 2.41, rustc 1.97.1. That iteration
 reported 460 passed and 1 failed of 461.
+
+---
+
+## 13. The Linux container harness ran nothing, and exited 0 doing it
+
+**Symptom.** None, which is the entry. `scripts/linux-check.sh test --workspace`
+returned success in under a second and printed nothing at all. A full workspace
+build in a cold container takes minutes and prints hundreds of lines, so the
+silence was the only evidence there was.
+
+It was noticed by accident. The intent was to verify an unrelated change on
+Linux; the run came back instantly and green, and instant and green is not a
+thing a container build can be.
+
+**Root cause.** The script the container was to run was inlined into the
+`docker run` command line inside single quotes, and one of its own comments read
+
+```
+    # The host target directory is another platform's and can be gigabytes.
+```
+
+The apostrophe in `platform's` closed the quoting. Everything after it was
+re-parsed by the *host* shell as ordinary words, and `-- "$@"` — the caller's
+arguments — went with it. Substituting a `docker` that prints its argv shows
+exactly what was asked for:
+
+```
+argv[15]='rust:1'
+argv[16]='bash'
+argv[17]='-c'
+argv[18]='\n    # The host target directory is another platforms'
+argv[19]='and'
+argv[20]='can'
+argv[21]='be'
+argv[22]='gigabytes.'
+```
+
+The container ran `bash -c` on a single comment. `bash` executes a comment
+successfully and silently, so the exit status was 0. The `tar`, the `rustup
+component add`, and `exec cargo "$@"` were never in the string; nor were `test`
+and `--workspace`.
+
+**Why it is the worst shape of defect in this file.** Every other silent failure
+here is Arc reporting success while not doing its job. This is the *test
+harness* doing that, and it is strictly worse, because the harness is what the
+other entries were caught by. The Linux tracer cannot be built on macOS or
+Windows, so this script is the only gate the two Linux backends pass through on
+a developer machine, and for as long as this stood, "checked on Linux" meant
+nothing whatsoever. Every claim of a container run made through it is void.
+
+**How long.** Not established. `git log` is not conclusive on it and I am not
+going to guess a date I have not verified.
+
+**Fix.** Structural rather than an escape. The container script now lives in
+`scripts/linux-check-inner.sh` and is named on the command line as a path, so
+no quoting of the outer command can truncate it. Escaping the apostrophe would
+have fixed this instance and left the next comment free to do it again.
+
+`scripts/linux-verify.sh`, which was already a file for the full fixed pipeline,
+was the pattern; the inline copy was a leftover of a half-finished extraction.
+
+The inner script also configures `git user.email`, `user.name` and
+`init.defaultBranch`, which several tests need and which the inline version
+never did — so the first genuinely-executed run would have failed on that
+instead.
+
+**Regression test.** `crates/arc-cli/tests/harness.rs`, four cases, run on every
+platform because the harness is a host-side script. They put a `docker` that
+records its arguments first on `PATH` and assert on what the harness asks for:
+that the caller's arguments arrive, that what is named is a script file and not
+a comment, that no fragment of a comment appears as an argument, and that every
+script named exists and passes `bash -n`. All four failed against the old
+script, printing the argv above.
+
+**The lesson, which the rest of this file already knew.** A green that was never
+red is not evidence. The harness had never been watched fail, and there was
+nothing in it that could fail: it had no way to report that it had run nothing,
+because running nothing is a success. Assert on the *claim* — the container was
+asked to run the command — not on the exit status.
 
 ---
 

@@ -11,6 +11,13 @@
 #
 # `ARC_DOCKER_ARGS=--security-opt=seccomp=unconfined` relaxes the default
 # seccomp profile, for comparing behaviour with and without it.
+#
+# The work the container does lives in `linux-check-inner.sh`, named here as a
+# path rather than inlined as a quoted string. It used to be inlined, and an
+# apostrophe inside one of its comments ended the quoting early: docker was
+# handed a lone comment to run, the caller's arguments were dropped as loose
+# words, and the whole thing exited 0 without printing anything. See
+# docs/BUGS.md #13.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -31,13 +38,4 @@ exec docker run --rm "${TTY[@]}" \
   ${ARC_DOCKER_ARGS:-} \
   -w /work \
   "$IMAGE" \
-  bash -c '
-    # The host target directory is another platform's and can be gigabytes.
-    tar -C /src -cf - --exclude=./target --exclude=./.git . | tar -C /work -xf -
-    # The slim image ships no clippy or rustfmt; add them only when asked for,
-    # so a plain `test` run does not pay for a component download.
-    case "$1" in
-      clippy) rustup component add clippy >/dev/null 2>&1 ;;
-      fmt)    rustup component add rustfmt >/dev/null 2>&1 ;;
-    esac
-    exec cargo "$@"' -- "$@"
+  bash /src/scripts/linux-check-inner.sh "$@"
