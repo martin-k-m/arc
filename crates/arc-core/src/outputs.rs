@@ -52,7 +52,8 @@ pub fn capture(root: &Path, globs: &[String], store: &Store) -> Result<Vec<Outpu
 }
 
 /// Restore captured outputs into the project. Refuses any path that escapes
-/// `root`, whether through `..`, an absolute path, or a symlinked parent.
+/// `root`, whether through `..`, an absolute path, a symlinked parent, or a
+/// destination that is itself a symlink.
 pub fn restore(root: &Path, outputs: &[OutputFile], store: &Store) -> Result<u64> {
     let mut bytes = 0;
     // Resolve every destination before writing any, so an unsafe entry aborts
@@ -76,7 +77,7 @@ pub fn restore(root: &Path, outputs: &[OutputFile], store: &Store) -> Result<u64
 }
 
 /// Join a recorded relative path onto `root`, rejecting anything that could
-/// land outside it.
+/// land outside it, and any destination that is itself a symlink.
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let p = Path::new(rel);
     anyhow::ensure!(
@@ -111,6 +112,24 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
         }
         cur = dir.parent();
     }
+    // And the destination itself. `docs/security.md` has always said this was
+    // refused; until now only the ancestors were checked, and the property
+    // survived by accident because `Store::materialize` renames over the
+    // destination rather than opening it. Checking it here makes the guarantee
+    // belong to the function that documents it.
+    //
+    // `symlink_metadata` does not follow the link, so a dangling one is caught
+    // too -- which matters, because a dangling symlink is the easy version of
+    // the attack: create it pointing anywhere, and let the write create the
+    // target.
+    if let Ok(md) = std::fs::symlink_metadata(&dest) {
+        if md.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to restore `{rel}`: `{}` is a symlink",
+                dest.display()
+            );
+        }
+    }
     Ok(dest)
 }
 
@@ -137,6 +156,79 @@ mod tests {
         assert!(safe_join(root, "a/../../b").is_err());
         assert!(safe_join(root, "/etc/passwd").is_err());
         assert!(safe_join(root, "target/debug/app").is_ok());
+    }
+
+    /// `docs/security.md` has claimed for some time that "a destination that
+    /// is itself a symlink is rejected". It was not: `safe_join` walked
+    /// `dest.parent()` upward and never looked at `dest`. The write did not in
+    /// fact escape, because `Store::materialize` renames a temp file over the
+    /// destination and a rename replaces a symlink rather than following it --
+    /// but that is an accident of an unrelated function, whose own doc comment
+    /// says it verifies "nothing about `dest`". A security property that holds
+    /// by accident somewhere else is one refactor away from not holding.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_that_is_itself_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"do not overwrite me").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out/a.bin")).unwrap();
+
+        let err = safe_join(&root, "out/a.bin")
+            .expect_err("a symlinked destination must be refused, not resolved");
+        let msg = err.to_string();
+        assert!(msg.contains("symlink"), "the refusal should say why: {msg}");
+
+        // A dangling symlink is the same question: the name exists and is not a
+        // regular file, so Arc has no business writing through it either.
+        std::fs::remove_file(root.join("out/a.bin")).unwrap();
+        std::os::unix::fs::symlink("nowhere-at-all", root.join("out/a.bin")).unwrap();
+        assert!(safe_join(&root, "out/a.bin").is_err());
+
+        // An ordinary existing file is still perfectly restorable over.
+        std::fs::remove_file(root.join("out/a.bin")).unwrap();
+        std::fs::write(root.join("out/a.bin"), b"old").unwrap();
+        assert!(safe_join(&root, "out/a.bin").is_ok());
+        // As is a path that does not exist yet, which is the common case.
+        assert!(safe_join(&root, "out/new.bin").is_ok());
+    }
+
+    /// The rejection has to happen in the same pass as every other check, or
+    /// the "applied nowhere" half of the documented guarantee is lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_destination_aborts_the_restore_before_anything_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&tmp.path().join(".store")).unwrap();
+        let d = store.put_bytes(b"x").unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"original").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("evil.txt")).unwrap();
+
+        let outputs = vec![
+            OutputFile {
+                rel: "first.txt".into(),
+                digest: d.hex(),
+                size: 1,
+                exec: false,
+            },
+            OutputFile {
+                rel: "evil.txt".into(),
+                digest: d.hex(),
+                size: 1,
+                exec: false,
+            },
+        ];
+        assert!(restore(&root, &outputs, &store).is_err());
+        assert!(
+            !root.join("first.txt").exists(),
+            "the safe entry was applied before the unsafe one was rejected"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"original");
     }
 
     #[test]

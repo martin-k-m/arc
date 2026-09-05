@@ -245,17 +245,24 @@ can cause a client to do **more** work than necessary. It cannot cause a client
 to run different work, and it cannot cause a client to skip work. Task knowledge
 informs selection only — it never narrows a cache key.
 
-## What the protocol does not do
+## What the cache protocol does not do
 
-There is no remote execution, no worker registration, no object enumeration, no
-namespace listing and no deletion. A client learns object digests only from
-records it is allowed to read.
+The v1 **cache** protocol has no object enumeration, no namespace listing and no
+deletion. A client learns object digests only from records it is allowed to
+read.
+
+It also has no remote execution — but the same host may serve the separate
+`/v1/exec/` surface described below, `GET /v1/exec/capabilities` and
+`POST /v1/exec/{namespace}/jobs`, implemented by `arc-worker`. There is still no
+worker registration: a client is configured with a worker's endpoint and asks it
+directly. This section previously said "there is no remote execution" without
+that qualification, which contradicted the rest of the document.
 
 ## Environments
 
 v0.8 adds no endpoint. An environment manifest is a CAS object whose digest is
 its `EnvironmentId`, so it is published and fetched through
-`POST /v1/{namespace}/objects/{digest}` and `GET /v1/{namespace}/objects/{digest}`
+`PUT /v1/{namespace}/objects/{digest}` and `GET /v1/{namespace}/objects/{digest}`
 like any other object, and verified the same way.
 
 `GET /v1/exec/capabilities` gains two optional fields:
