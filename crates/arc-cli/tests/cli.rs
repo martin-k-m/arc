@@ -503,6 +503,7 @@ fn a_reader_that_stops_early_does_not_panic() {
 // dependencies or execution policy changed" for all of them at once.
 
 /// The `reason` field of `arc run --explain --json`, for the run just made.
+#[cfg(unix)]
 fn miss_reason(sb: &Sandbox, args: &[&str]) -> String {
     let mut v = vec!["run", "--explain", "--json"];
     v.extend_from_slice(args);
@@ -547,8 +548,18 @@ fn a_changed_program_is_named_as_the_reason_the_cache_missed() {
 
     std::fs::write(&tool, "#!/bin/sh\necho v2\n").unwrap();
     let reason = miss_reason(&sb, &[&tool]);
+    // Two honest answers, depending on what the platform could observe. Where
+    // the tracer is complete the program is also a tracked *input*, and the
+    // input diff names its path first -- which is the better answer and was
+    // already correct. Where it is not, the program only appears in the key's
+    // toolchain digest, and that is the case this change is about. What must
+    // hold either way is that the miss names the thing that moved.
     assert!(
-        reason.contains("program"),
-        "a changed program should be named as such, got: {reason}"
+        reason.contains(&tool),
+        "the miss should name the program that changed, got: {reason}"
+    );
+    assert!(
+        !reason.contains("toolchain, observed dependencies"),
+        "the three-way lump is not an explanation: {reason}"
     );
 }
