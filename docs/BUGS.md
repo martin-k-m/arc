@@ -780,18 +780,35 @@ jitter. One of the six exhausts it.
   the passing run took the same thirty seconds, so the contention is present
   whether or not anyone loses.
 
-**What is not established.** Why one of six starves for twenty full seconds when
-every critical section is supposed to be short. Two candidates, neither tested:
-the poll is a flat fifteen milliseconds with no jitter, so six contenders can
-stay in lockstep and one can lose every round; or some phase of a traced run
-holds the handle far longer than intended, in which case `db.release()` is being
-called in the wrong place or not at all on some path. Distinguishing them means
-logging how long each holder keeps the database, which has not been done.
+**The budget is too short; the wait is not broken.** One variable changed,
+`LOCK_TIMEOUT`, and nothing else. Same container, same case, run alone, three
+iterations each:
 
-Raising `LOCK_TIMEOUT` alone would establish which of those it is — if a much
-longer budget passes, the holder is merely slow; if it still fails, something is
-starving. That experiment was set up and not completed, and no conclusion is
-drawn from it here.
+| `LOCK_TIMEOUT` | result | wall clock per run |
+| --- | --- | --- |
+| 20 s (as shipped) | 2 failed, 1 passed | 31.18 s, 31.12 s, 30.36 s |
+| 300 s | 3 passed, 0 failed | 36.46 s, 36.49 s, 36.51 s |
+
+So a contender waits *more than twenty seconds* and then succeeds. This is a
+budget exhausted, not a lock that can never be acquired, and the five or six
+extra seconds in the second arm are where that waiting shows up. The passing run
+in the first arm took the same thirty seconds as the failing ones, so the
+contention is present whether or not anybody loses.
+
+**What is still not established, and why no fix is here.** Why any holder keeps
+an exclusive lock for twenty seconds when every critical section is supposed to
+be short. Two candidates, neither tested: the retry polls every fifteen
+milliseconds with no jitter, so six contenders can stay in lockstep and one can
+lose every round; or some phase of a traced run holds the handle far longer than
+intended, meaning `db.release()` is called in the wrong place, or not at all, on
+some path. Distinguishing them means logging how long each holder keeps the
+database, which has not been done.
+
+Raising `LOCK_TIMEOUT` is *not* the fix, and the table above is not an argument
+for it. A twenty-second hold of an exclusive lock is the defect; a longer
+timeout only converts a failed command into a slow one. [#9](#9-the-tracer-loop-could-exit-with-a-child-still-stopped-and-hang-the-whole-command)
+is this file's own argument for not editing a concurrency defect before the
+mechanism is known, and it cost three wrong attempts to learn.
 
 **Whether this is #12.** Unknown, and not assumed. #12 is a cache hit that
 re-ran, which is a different symptom, and this failure is loud rather than
