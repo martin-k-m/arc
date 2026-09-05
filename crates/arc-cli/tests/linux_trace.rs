@@ -13,6 +13,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -834,22 +836,22 @@ fn concurrent_traced_runs_stay_independent() {
     sb.write("shared.txt", "one");
     let children: Vec<_> = (0..6)
         .map(|i| {
-            Command::new(ARC)
-                .args([
-                    "run",
-                    "--trace",
-                    "sh",
-                    "-c",
-                    &format!("cat shared.txt; echo job{}", i % 3),
-                ])
-                .current_dir(&sb.root)
-                .env("ARC_HOME", &sb.home)
-                .spawn()
-                .unwrap()
+            support::spawn_captured(
+                Command::new(ARC)
+                    .args([
+                        "run",
+                        "--trace",
+                        "sh",
+                        "-c",
+                        &format!("cat shared.txt; echo job{}", i % 3),
+                    ])
+                    .current_dir(&sb.root)
+                    .env("ARC_HOME", &sb.home),
+            )
         })
         .collect();
-    for mut c in children {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in children.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent traced run {i}"), c);
     }
     let graph = sb.arc(&["graph", "--json"]);
     assert!(graph.status.success(), "{}", stderr(&graph));

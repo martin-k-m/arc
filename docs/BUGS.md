@@ -2,11 +2,13 @@
 
 Defects I actually shipped, and what each one taught me. Every fixed entry
 names the commit that fixed it and the test that keeps it fixed. There are
-thirteen, which is a thin history, and I would rather it read thin and true than
+fourteen, which is a thin history, and I would rather it read thin and true than
 long and padded — nothing here is a hypothetical or a near miss. Four are odd
 ones out. #10 and #13 were defects in the tests and in the test harness rather
 than in Arc, and both are fixed. #11 and #12 are failures I have seen but not
-explained, so they carry no fix and no root cause, and they say so.
+explained, so they carry no fix and no root cause, and they say so. #14 is a
+failure I can reproduce on demand and have not explained, which is a better
+position than those two and still not a fix.
 
 The pattern across almost all of them is the same, and it is the reason I
 keep this file: **the failure was silent**. Arc kept working. It cached, it
@@ -809,6 +811,104 @@ red is not evidence. The harness had never been watched fail, and there was
 nothing in it that could fail: it had no way to report that it had run nothing,
 because running nothing is a success. Assert on the *claim* — the container was
 asked to run the command — not on the exit status.
+
+## 14. Six concurrent `arc run` invocations, and one of them cannot open the database at all
+
+**Status: open.** Reproduced on demand, mechanism only partly established, and
+no fix attempted here.
+
+**Symptom.** `concurrent_traced_runs_stay_independent`
+(`crates/arc-cli/tests/linux_trace.rs`) and
+`concurrent_traced_runs_do_not_corrupt_dependency_metadata`
+(`crates/arc-cli/tests/dependency.rs`) both fail in a container run of the
+workspace. Both spawn six `arc run` processes against one `ARC_HOME` and assert
+each exits zero. One does not:
+
+```
+concurrent traced run 1 exited 1
+--- stderr ---
+◆ Arc could not open its metadata database.
+  /tmp/.tmpGE8CVb/archome/arc.redb
+Database already open. Cannot acquire lock.
+```
+
+**This is Arc failing a command, not a test being fussy.** Running the same
+project's commands concurrently is the ordinary case — `make -j`, a watch loop,
+two terminals — and `arc run` is documented as safe under it. `db.rs` opens with
+the comment that "short critical sections plus bounded retry is what makes two
+concurrent `arc run` invocations safe rather than corrupt". The retry is
+`LOCK_TIMEOUT`, twenty seconds, polled every fifteen milliseconds with no
+jitter. One of the six exhausts it.
+
+**What is established.**
+
+- It reproduces readily in this container. Across two separate measurements of
+  the same case run alone: **four failures in three iterations** of the two
+  cases together, and **two failures in three** of
+  `concurrent_traced_runs_stay_independent` on its own. Nothing else was running
+  on the machine. `docs/BUGS.md` #12 records these same two tests failing once each in
+  a workspace run and never reproducing; they reproduce here readily.
+- The losing child is not a fixed one. Children 0, 1 and 2 have each been the
+  one that failed, so it is contention rather than anything positional.
+- The wait is not skipped. The three timed runs of that case took 31.18 s
+  (failed), 31.12 s (passed) and 30.36 s (failed), against a twenty-second
+  timeout. A failing run is consistent with a process waiting the whole budget
+  and then giving up, and not with an instant refusal. It is worth noting that
+  the passing run took the same thirty seconds, so the contention is present
+  whether or not anyone loses.
+
+**The budget is too short; the wait is not broken.** One variable changed,
+`LOCK_TIMEOUT`, and nothing else. Same container, same case, run alone, three
+iterations each:
+
+| `LOCK_TIMEOUT` | result | wall clock per run |
+| --- | --- | --- |
+| 20 s (as shipped) | 2 failed, 1 passed | 31.18 s, 31.12 s, 30.36 s |
+| 300 s | 3 passed, 0 failed | 36.46 s, 36.49 s, 36.51 s |
+
+So a contender waits *more than twenty seconds* and then succeeds. This is a
+budget exhausted, not a lock that can never be acquired, and the five or six
+extra seconds in the second arm are where that waiting shows up. The passing run
+in the first arm took the same thirty seconds as the failing ones, so the
+contention is present whether or not anybody loses.
+
+**What is still not established, and why no fix is here.** Why any holder keeps
+an exclusive lock for twenty seconds when every critical section is supposed to
+be short. Two candidates, neither tested: the retry polls every fifteen
+milliseconds with no jitter, so six contenders can stay in lockstep and one can
+lose every round; or some phase of a traced run holds the handle far longer than
+intended, meaning `db.release()` is called in the wrong place, or not at all, on
+some path. Distinguishing them means logging how long each holder keeps the
+database, which has not been done.
+
+Raising `LOCK_TIMEOUT` is *not* the fix, and the table above is not an argument
+for it. A twenty-second hold of an exclusive lock is the defect; a longer
+timeout only converts a failed command into a slow one. [#9](#9-the-tracer-loop-could-exit-with-a-child-still-stopped-and-hang-the-whole-command)
+is this file's own argument for not editing a concurrency defect before the
+mechanism is known, and it cost three wrong attempts to learn.
+
+**Whether this is #12.** Unknown, and not assumed. #12 is a cache hit that
+re-ran, which is a different symptom, and this failure is loud rather than
+silent. What they share is only the configuration.
+
+**How it was caught.** By fixing two things that were not this. The container
+harness ran nothing ([#13](#13-the-linux-container-harness-ran-nothing-and-exited-0-doing-it)),
+so the workspace had not actually been exercised on Linux from this machine;
+once it was, these two failed. And the assertion they failed on was
+`assert!(c.wait().unwrap().success())`, which reported nothing at all — the
+diagnostic above exists only because those assertions now say what the child
+did. Both of those were repairs to the instruments rather than to Arc, and
+neither was made in order to find this.
+
+**Reproduction.** `rust:1` container on Docker Desktop 29.4.1, arm64, twelve
+CPUs, macOS host. Copy the tree in, then loop either case alone:
+
+```sh
+cargo test -q -p arc-cli --test linux_trace \
+  concurrent_traced_runs_stay_independent -- --exact
+```
+
+It does not need the rest of the workspace, and it does not need load.
 
 ---
 
