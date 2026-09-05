@@ -26,10 +26,16 @@ IMAGE=${ARC_IMAGE:-rust:1}
 
 # A TTY is only requested when there is one to attach to: with output
 # redirected, `-t` can swallow it entirely on some Docker hosts.
+#
+# Expanded as ${TTY[@]+"${TTY[@]}"} rather than "${TTY[@]}" because macOS ships
+# bash 3.2, where an EMPTY array expanded under `set -u` is an unbound variable
+# rather than nothing at all. That is not a hypothetical: the plain spelling
+# passed on Linux and on this repository's own container, and failed all four
+# harness tests on the macOS runner with `TTY[@]: unbound variable`.
 TTY=()
 [ -t 1 ] && TTY=(-t)
 
-exec docker run --rm "${TTY[@]}" \
+exec docker run --rm ${TTY[@]+"${TTY[@]}"} \
   -v "$HERE":/src:ro \
   -v arc-linux-target:/target \
   -v arc-linux-cargo:/usr/local/cargo/registry \
