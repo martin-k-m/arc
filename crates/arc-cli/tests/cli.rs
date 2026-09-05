@@ -1,5 +1,7 @@
 //! End-to-end tests driving the real `arc` binary.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -360,17 +362,17 @@ fn concurrent_runs_share_the_cache_without_corrupting_it() {
     let sb = Sandbox::new();
     let children: Vec<_> = (0..6)
         .map(|i| {
-            Command::new(ARC)
-                .args(["run", "--"])
-                .args(echo(&format!("job{}", i % 2)).iter().map(|s| s.as_str()))
-                .current_dir(&sb.root)
-                .env("ARC_HOME", &sb.home)
-                .spawn()
-                .unwrap()
+            support::spawn_captured(
+                Command::new(ARC)
+                    .args(["run", "--"])
+                    .args(echo(&format!("job{}", i % 2)).iter().map(|s| s.as_str()))
+                    .current_dir(&sb.root)
+                    .env("ARC_HOME", &sb.home),
+            )
         })
         .collect();
-    for mut c in children {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in children.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent run {i}"), c);
     }
     let out = sb.arc(&["cache", "verify"]);
     assert!(

@@ -5,6 +5,8 @@
 //! on the same machine as the client, which is what makes toolchain digests
 //! match; every test that needs them *not* to match says so explicitly.
 
+mod support;
+
 use arc_cache::{Options as CacheOptions, Server};
 use arc_worker::{Options as WorkerOptions, Worker};
 use std::path::PathBuf;
@@ -588,16 +590,10 @@ fn two_jobs_get_separate_workspaces() {
     b.write("src/seed.txt", "beta");
 
     let script = "mkdir -p out && cat src/seed.txt > out/built.txt && cat out/built.txt";
-    let ja = a
-        .command(&["run", "--json", "sh", "-c", script])
-        .spawn()
-        .unwrap();
-    let jb = b
-        .command(&["run", "--json", "sh", "-c", script])
-        .spawn()
-        .unwrap();
-    for mut c in [ja, jb] {
-        assert!(c.wait().unwrap().success());
+    let ja = support::spawn_captured(&mut a.command(&["run", "--json", "sh", "-c", script]));
+    let jb = support::spawn_captured(&mut b.command(&["run", "--json", "sh", "-c", script]));
+    for (i, c) in [ja, jb].into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent client {i}"), c);
     }
     assert_eq!(
         std::fs::read_to_string(a.root.join("out/built.txt")).unwrap(),
@@ -635,14 +631,10 @@ fn many_clients_wanting_the_same_execution_cause_exactly_one() {
         .collect();
     let running: Vec<_> = clients
         .iter()
-        .map(|c| {
-            c.command(&["run", "--json", "sh", "-c", script])
-                .spawn()
-                .unwrap()
-        })
+        .map(|c| support::spawn_captured(&mut c.command(&["run", "--json", "sh", "-c", script])))
         .collect();
-    for mut c in running {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in running.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent client {i}"), c);
     }
 
     let (submitted, deduplicated, completed, _, short) = cluster.stats();
@@ -688,14 +680,10 @@ fn worker_capacity_is_respected() {
     let script = "mkdir -p out && sleep 1 && cat src/seed.txt > out/built.txt && echo made";
     let running: Vec<_> = clients
         .iter()
-        .map(|c| {
-            c.command(&["run", "--json", "sh", "-c", script])
-                .spawn()
-                .unwrap()
-        })
+        .map(|c| support::spawn_captured(&mut c.command(&["run", "--json", "sh", "-c", script])))
         .collect();
-    for mut c in running {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in running.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent client {i}"), c);
     }
     assert_eq!(cluster.stats().2, 6, "every distinct execution ran");
     for (i, c) in clients.iter().enumerate() {
@@ -719,15 +707,11 @@ fn a_full_queue_is_reported_and_the_command_runs_locally() {
     let script = "mkdir -p out && sleep 1 && cat src/seed.txt > out/built.txt && echo made";
     let running: Vec<_> = clients
         .iter()
-        .map(|c| {
-            c.command(&["run", "--json", "sh", "-c", script])
-                .spawn()
-                .unwrap()
-        })
+        .map(|c| support::spawn_captured(&mut c.command(&["run", "--json", "sh", "-c", script])))
         .collect();
     // Overload is a reason to run locally, never a reason to fail.
-    for mut c in running {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in running.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent client {i}"), c);
     }
     for (i, c) in clients.iter().enumerate() {
         assert_eq!(

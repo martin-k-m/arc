@@ -6,6 +6,8 @@
 //! tests skip there and the provider, escaping and summary logic is covered by
 //! unit tests instead.
 
+mod support;
+
 use arc_cache::{Options, Server};
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -511,17 +513,17 @@ fn two_ci_runs_sharing_one_cache_do_not_corrupt_it() {
     // Deliberately the same Arc home, which is what two jobs on one runner do.
     let home = a.home.clone();
     let run = |root: &PathBuf| {
-        Command::new(ARC)
-            .args(["ci", "--base", "HEAD", "--json"])
-            .current_dir(root)
-            .env("ARC_HOME", &home)
-            .env("ARC_NO_ANIM", "1")
-            .spawn()
-            .expect("spawning arc")
+        support::spawn_captured(
+            Command::new(ARC)
+                .args(["ci", "--base", "HEAD", "--json"])
+                .current_dir(root)
+                .env("ARC_HOME", &home)
+                .env("ARC_NO_ANIM", "1"),
+        )
     };
     let (x, y) = (run(&a.root), run(&b.root));
-    for mut child in [x, y] {
-        assert!(child.wait().unwrap().success());
+    for (i, child) in [x, y].into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent ci run {i}"), child);
     }
     let after = a.arc(&["ci", "--base", "HEAD", "--json"]);
     assert!(after.status.success(), "{}", stderr(&after));
