@@ -98,7 +98,7 @@ applies anything:
 - a path containing `..`, an absolute path, or a path escaping the project is
   rejected
 - a destination whose parent is a symlink is rejected
-- a destination that is itself a symlink is rejected
+- a destination that is itself a symlink is rejected, dangling or not
 - validation happens for **every** path first; a set that fails anywhere is
   applied nowhere
 
