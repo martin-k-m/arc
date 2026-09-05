@@ -30,6 +30,16 @@ path that moved. Common reasons:
 | no previous execution of this command was recorded | the first run of a new command |
 | tracked inputs changed | several inputs moved at once |
 | all inputs match execution `<id>` | this is a hit, and which record it came from |
+| the program changed: `<path>` | the executable's own contents differ — a compiler or interpreter upgrade |
+| what Arc observed this command execute changed | the learned dependency set widened; the usual cause of the miss right after a first trace |
+| the Arc environment changed | a different `[environment]` is in force, or one was gained or lost |
+| the configured output patterns changed | `[outputs] include` was edited |
+| the platform changed | a different OS or CPU architecture than the recorded run |
+| Arc's cache format changed | Arc's stored schema version moved; older results are not reused |
+
+Every component of the execution key is in that table. If Arc reports that it
+*cannot say which* component changed, the previous record predates Arc storing
+them: run the command once more and the next miss will name it.
 
 The `dependencies` line above it is the other half of the story. `complete`
 means Arc narrowed to exactly what the command reads; `partial` or `unsupported`

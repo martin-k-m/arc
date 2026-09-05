@@ -5,6 +5,19 @@ described under [Compatibility](#compatibility).
 
 ## Unreleased
 
+### Added
+
+- **A miss names which component of the execution key moved.** Previously a
+  miss that no input or environment-variable change explained was reported as
+  one three-way lump — "toolchain, observed dependencies or execution policy
+  changed" — which is three unrelated causes and no way to tell them apart. The
+  record now carries the remaining key components (OS, architecture, dependency
+  digest, output patterns, environment id), so `--explain` names exactly one:
+  the program's own contents changed, the learned dependency set widened, the
+  Arc environment changed, the output patterns changed, the platform changed,
+  or the cache schema moved. A record written before this existed carries none
+  of them, and Arc says it cannot attribute the miss rather than guessing.
+
 ### Changed
 
 - **Concurrency tests say what the child did when it fails.** Eight assertions
@@ -18,6 +31,25 @@ described under [Compatibility](#compatibility).
   investigations lacked.
 
 ### Fixed
+
+- **A restore destination that is itself a symlink is now refused.**
+  `docs/security.md` has claimed this for some time and `safe_join` did not do
+  it: it walked the destination's ancestors and never looked at the destination.
+  No escape actually occurred, because `Store::materialize` renames a temporary
+  file over the destination and a rename replaces a symlink rather than
+  following it — but that is an accident of a function whose own documentation
+  says it verifies "nothing about `dest`", and a property that holds by accident
+  elsewhere is one refactor from not holding. The check is now in the function
+  that documents it, and covers a dangling symlink too. This is a behaviour
+  change: a cached output whose destination in your tree is a symlink now fails
+  the restore, with the path named, instead of silently replacing the link with
+  a regular file.
+
+- **`docs/remote-protocol.md` said environment manifests are published with
+  `POST`.** The server routes only `PUT` for that path and the client sends
+  `PUT`; a `POST` gets a 404. The same document also said flatly that "there is
+  no remote execution" two sections after specifying `/v1/exec/capabilities` and
+  `/v1/exec/{namespace}/jobs`. Both corrected.
 
 - **ptrace read a `connect`'s socket address after the syscall, not before.**
   The pointer was captured at the entry stop and the memory behind it was read
