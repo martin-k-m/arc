@@ -493,3 +493,62 @@ fn a_reader_that_stops_early_does_not_panic() {
         "arc exited 101, the Rust panic status, when its reader went away"
     );
 }
+
+// ---- why did this re-run? ------------------------------------------------
+//
+// A cache that cannot say *which* of its key's components moved is a cache the
+// user has to guess at. Every component of the execution key gets a test here
+// that changes exactly that component and nothing else, and asserts the
+// reported reason names it. The lump these replace read "toolchain, observed
+// dependencies or execution policy changed" for all of them at once.
+
+/// The `reason` field of `arc run --explain --json`, for the run just made.
+fn miss_reason(sb: &Sandbox, args: &[&str]) -> String {
+    let mut v = vec!["run", "--explain", "--json"];
+    v.extend_from_slice(args);
+    let out = sb.arc(&v);
+    let err = stderr(&out);
+    let line = err
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("no json on stderr: {err}"));
+    let j: serde_json::Value = serde_json::from_str(line).expect("parsing arc --json");
+    j["explain"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no explain.reason in {j}"))
+        .to_string()
+}
+
+#[cfg(unix)]
+fn make_executable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The program Arc runs is not the project, so changing it changes the
+/// toolchain digest and nothing else in the key. Arc has always missed here,
+/// correctly; what it could not do was say why.
+#[cfg(unix)]
+#[test]
+fn a_changed_program_is_named_as_the_reason_the_cache_missed() {
+    let sb = Sandbox::new();
+    // Outside the project root on purpose: inside it, the script is also an
+    // input, and the input diff would explain the miss without the key ever
+    // being consulted.
+    let bin = sb._tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("mytool");
+    std::fs::write(&tool, "#!/bin/sh\necho v1\n").unwrap();
+    make_executable(&tool);
+    let tool = tool.to_str().unwrap().to_string();
+
+    assert!(sb.arc(&["run", &tool]).status.success());
+    assert!(sb.arc(&["run", &tool]).status.success());
+
+    std::fs::write(&tool, "#!/bin/sh\necho v2\n").unwrap();
+    let reason = miss_reason(&sb, &[&tool]);
+    assert!(
+        reason.contains("program"),
+        "a changed program should be named as such, got: {reason}"
+    );
+}

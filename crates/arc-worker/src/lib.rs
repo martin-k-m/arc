@@ -892,6 +892,9 @@ fn record_for(
         family_key: req.family_key.clone(),
         trace: None,
         environment: None,
+        // The worker builds this record only to serialise a result onto the
+        // wire; the client attributes its own misses from its own components.
+        key_components: None,
     };
     arc_core::remote::from_record(&local)
 }
