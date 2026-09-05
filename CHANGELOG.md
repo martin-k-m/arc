@@ -18,6 +18,18 @@ described under [Compatibility](#compatibility).
   or the cache schema moved. A record written before this existed carries none
   of them, and Arc says it cannot attribute the miss rather than guessing.
 
+### Changed
+
+- **Concurrency tests say what the child did when it fails.** Eight assertions
+  across five suites read `assert!(c.wait().unwrap().success())`, which throws
+  away the exit status and every byte the child wrote — and because the child
+  inherited the harness's stdio, its output did not even reach the failing
+  test's captured block. Two of those assertions failed in a container run of
+  the workspace with nothing to show for it. They now spawn with output
+  captured and report the status, stdout and stderr of the child that failed,
+  which is the diagnostic `docs/BUGS.md` #11 and #12 both say those
+  investigations lacked.
+
 ### Fixed
 
 - **A restore destination that is itself a symlink is now refused.**

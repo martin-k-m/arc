@@ -9,6 +9,8 @@
 //! scan applies and any change is a miss. Tests that care about the difference
 //! ask [`narrows`] rather than assuming a platform.
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -435,17 +437,17 @@ fn concurrent_traced_runs_do_not_corrupt_dependency_metadata() {
             } else {
                 vec!["sh".into(), "-c".into(), text]
             };
-            Command::new(ARC)
-                .args(["run", "--trace"])
-                .args(cmd.iter().map(|s| s.as_str()))
-                .current_dir(&sb.root)
-                .env("ARC_HOME", &sb.home)
-                .spawn()
-                .unwrap()
+            support::spawn_captured(
+                Command::new(ARC)
+                    .args(["run", "--trace"])
+                    .args(cmd.iter().map(|s| s.as_str()))
+                    .current_dir(&sb.root)
+                    .env("ARC_HOME", &sb.home),
+            )
         })
         .collect();
-    for mut c in children {
-        assert!(c.wait().unwrap().success());
+    for (i, c) in children.into_iter().enumerate() {
+        support::wait_ok(&format!("concurrent traced run {i}"), c);
     }
     let graph = sb.arc(&["graph", "--json"]);
     assert!(graph.status.success(), "{}", stderr(&graph));
