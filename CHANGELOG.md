@@ -51,6 +51,17 @@ described under [Compatibility](#compatibility).
   no remote execution" two sections after specifying `/v1/exec/capabilities` and
   `/v1/exec/{namespace}/jobs`. Both corrected.
 
+- **`scripts/linux-check.sh` ran nothing, and exited 0 doing it.** The script
+  the container was to run was inlined into the `docker run` command line
+  inside single quotes, and an apostrophe in one of its own comments closed
+  that quoting: the container was handed a lone comment, which `bash -c`
+  executes successfully and silently, and the caller's own arguments were
+  dropped as loose words. Every "checked in the container" claim made through
+  it is void. The container script is now a file named on the command line, so
+  no quoting of the outer command can truncate it, and
+  `crates/arc-cli/tests/harness.rs` asserts on the arguments the harness asks
+  docker for. See `docs/BUGS.md` #13.
+
 - **ptrace read a `connect`'s socket address after the syscall, not before.**
   The pointer was captured at the entry stop and the memory behind it was read
   at the exit stop, by which time the calling thread is stopped and its siblings
