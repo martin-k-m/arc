@@ -872,20 +872,51 @@ extra seconds in the second arm are where that waiting shows up. The passing run
 in the first arm took the same thirty seconds as the failing ones, so the
 contention is present whether or not anybody loses.
 
-**What is still not established, and why no fix is here.** Why any holder keeps
-an exclusive lock for twenty seconds when every critical section is supposed to
-be short. Two candidates, neither tested: the retry polls every fifteen
-milliseconds with no jitter, so six contenders can stay in lockstep and one can
-lose every round; or some phase of a traced run holds the handle far longer than
-intended, meaning `db.release()` is called in the wrong place, or not at all, on
-some path. Distinguishing them means logging how long each holder keeps the
-database, which has not been done.
+**Mechanism, established 2026-09-06.** The entry above asked for the one thing
+nobody had done: "logging how long each holder keeps the database". `db.rs` now
+does, behind `ARC_DB_TRACE=<file>`, which appends `<pid> <event> <ms>` for every
+acquire (the wait) and every release (the hold). Setting nothing changes nothing.
 
-Raising `LOCK_TIMEOUT` is *not* the fix, and the table above is not an argument
-for it. A twenty-second hold of an exclusive lock is the defect; a longer
-timeout only converts a failed command into a slow one. [#9](#9-the-tracer-loop-could-exit-with-a-child-still-stopped-and-hang-the-whole-command)
-is this file's own argument for not editing a concurrency defect before the
-mechanism is known, and it cost three wrong attempts to learn.
+Two runs of `concurrent_traced_runs_stay_independent` in the container, the
+second with the release sites labelled:
+
+```
+786 open 45                      acquired, 45 ms wait
+786 open 4848                    reacquired after a 4.8 s wait
+786 release:before-child 5256    held 5.26 s, released before the child
+787 open 5314                    waited 5.3 s
+787 release:before-child 5099    held 5.10 s
+789 open 15845                   waited 15.8 s
+790 open 10671                   waited 10.7 s
+```
+
+**Candidate (a), the lockstep poll, is refuted.** Waits come back 4.8 s, 5.3 s,
+10.7 s, 15.8 s: strictly increasing, one contender served per hold. That is a
+queue draining, not six processes colliding and one starving. No contender was
+passed over.
+
+**Candidate (b) is confirmed, and it is worse than "some phase".** Every hold is
+about five seconds and every one of them ends at `release:before-child`, so the
+exclusive lock is held across the *whole* pre-child phase. `db.rs` says a short
+critical section is what makes concurrent runs safe; the critical section is the
+entire plan-and-fingerprint phase. Six of those at five seconds each is thirty
+seconds of serialisation against a twenty-second budget, which is exactly the
+wall clock the table above measured, and why the fourth or fifth contender is
+the one that dies.
+
+For contrast, the same six-way concurrency **untraced**, on a Mac, holds the
+database 23-28 ms and waits at most 134 ms; six concurrent `arc run -- sleep 5`
+finish in 5 s wall, fully parallel. The release before the child works. The
+phase before it is what does not.
+
+**Still not fixed, deliberately.** The fix is to narrow that critical section,
+not to raise `LOCK_TIMEOUT`, and narrowing it means deciding which reads in the
+planning phase genuinely need the database open at the same time. That is a
+change to the engine's shape rather than a patch, and
+[#9](#9-the-tracer-loop-could-exit-with-a-child-still-stopped-and-hang-the-whole-command)
+is this file's argument for not making one of those in a hurry. What has changed
+is that it is no longer a guess: the instrument is checked in, the numbers are
+above, and anyone attempting the fix can measure whether it worked.
 
 **Whether this is #12.** Unknown, and not assumed. #12 is a cache hit that
 re-ran, which is a different symptom, and this failure is loud rather than
