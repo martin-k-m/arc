@@ -259,7 +259,9 @@ pub fn run(
     progress.stage("resolving project");
     let store = Store::open(arc_home)?;
     let db = Db::open(arc_home)?;
+    db.release_at("release:after-db-open");
     let plan = plan(project, cwd, program, args, arc_home, &db, &store)?;
+    db.release_at("release:after-plan");
 
     let cacheable = !opts.no_cache && plan.cfg.cache.enabled && !opts.no_capture;
     if !cacheable {
@@ -274,6 +276,17 @@ pub fn run(
     });
     let fp_start = Instant::now();
     let mut fps = db.load_fingerprints(&plan.project_id)?;
+    // The scan below hashes every input this command reaches, and it needs no
+    // database: `fps` is already in hand and `fingerprint_inputs` only reads and
+    // updates that map. Holding redb's exclusive lock across it is what
+    // docs/BUGS.md #14 measured, and it is the whole of that bug: six concurrent
+    // `arc run` invocations each held the database for about five seconds here,
+    // so the waits stacked past the twenty-second budget and the fourth or fifth
+    // contender had its command fail outright.
+    //
+    // db.rs says a short critical section is what makes concurrent runs safe.
+    // This is what makes it short. The next `db.` call reopens transparently.
+    db.release_at("release:before-fingerprint-scan");
     let inputs = fingerprint_inputs(
         project,
         arc_home,

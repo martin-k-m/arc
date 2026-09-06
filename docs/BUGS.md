@@ -814,8 +814,9 @@ asked to run the command — not on the exit status.
 
 ## 14. Six concurrent `arc run` invocations, and one of them cannot open the database at all
 
-**Status: open.** Reproduced on demand, mechanism only partly established, and
-no fix attempted here.
+**Status: fixed.** The planning phase held redb's exclusive lock, so concurrent
+runs serialised on it and the fourth or fifth contender exhausted the retry
+budget and failed the user's command.
 
 **Symptom.** `concurrent_traced_runs_stay_independent`
 (`crates/arc-cli/tests/linux_trace.rs`) and
@@ -909,14 +910,35 @@ database 23-28 ms and waits at most 134 ms; six concurrent `arc run -- sleep 5`
 finish in 5 s wall, fully parallel. The release before the child works. The
 phase before it is what does not.
 
-**Still not fixed, deliberately.** The fix is to narrow that critical section,
-not to raise `LOCK_TIMEOUT`, and narrowing it means deciding which reads in the
-planning phase genuinely need the database open at the same time. That is a
-change to the engine's shape rather than a patch, and
-[#9](#9-the-tracer-loop-could-exit-with-a-child-still-stopped-and-hang-the-whole-command)
-is this file's argument for not making one of those in a hurry. What has changed
-is that it is no longer a guess: the instrument is checked in, the numbers are
-above, and anyone attempting the fix can measure whether it worked.
+**Fixed 2026-09-06, and the fix is three lines.** The hold was never the child
+and never a barrier: it was the planning phase. `Db::open` opens the handle to
+create its tables, and it stayed open through `plan()`, which resolves the
+project and reads the config off disk and needs the database for almost none of
+it. So the exclusive lock spanned the slowest part of a run.
+
+`engine.rs` now releases at three points where nothing needs the database: after
+`Db::open`, after `plan()`, and before the fingerprint scan, which hashes every
+input the command reaches and only needs the `fps` map it already holds. Each
+next call reopens transparently, which is what `with_db` was always for.
+
+Measured the same way as the bug, in the same container, on the same test:
+
+| | before | after |
+| --- | --- | --- |
+| longest hold | 5,256 ms | 67 ms |
+| longest wait to acquire | 15,845 ms | 667 ms |
+| `concurrent_traced_runs_stay_independent` | fails | passes, 26.0 s to 11.9 s |
+| `concurrent_traced_runs_do_not_corrupt_dependency_metadata` | fails | passes |
+| workspace in the container | 2 failed | **0 failed**, 363 passed |
+
+The bisection is worth keeping because the first attempt was wrong. Releasing
+only before the fingerprint scan MOVED the five seconds rather than removing it:
+the same hold reappeared under the new label, which said the expensive span was
+earlier than the scan. Adding a release after `Db::open` and after `plan()`
+located it, and both of those now show holds in the tens of milliseconds.
+
+`ARC_DB_TRACE` stays. It is how this was found, it is how the fix was checked,
+and it is how the next regression here will be.
 
 **Whether this is #12.** Unknown, and not assumed. #12 is a cache hit that
 re-ran, which is a different symptom, and this failure is loud rather than
