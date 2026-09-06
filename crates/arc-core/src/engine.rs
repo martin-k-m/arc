@@ -464,7 +464,7 @@ pub fn run(
     // Nothing more is read from the database until the child exits, and holding
     // redb's exclusive lock across an arbitrarily long command would serialise
     // every other Arc process on this machine.
-    db.release();
+    db.release_at("release:before-child");
     let now = scan::now_millis();
 
     // Remote execution is only ever reached from here: after a local miss and a
@@ -1330,7 +1330,7 @@ fn bypass(
     db: &Db,
     plan: &Plan,
 ) -> Result<RunReport> {
-    db.release();
+    db.release_at("release:before-uncached-child");
     let now = scan::now_millis();
     let outcome = exec::run(&plan.resolved, args, cwd, !opts.no_capture, &mut (), None)?;
     let record = ExecutionRecord {

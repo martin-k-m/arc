@@ -81,8 +81,41 @@ pub const COUNTER_MS_SAVED: &str = "ms_saved";
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Append one measurement to the file named by `ARC_DB_TRACE`, if it is set.
+///
+/// This exists for `docs/BUGS.md` #14, which is open because the hold times
+/// were never measured: the entry offers two candidate mechanisms, a poll that
+/// keeps six contenders in lockstep or a phase that keeps the handle far longer
+/// than intended, and says distinguishing them needs exactly this log.
+///
+/// A line is `<pid> <event> <ms>`, appended, one write per event, so several
+/// processes can share one file without coordinating. Failures are ignored on
+/// purpose: a diagnostic that can fail a user's command is worse than no
+/// diagnostic, and this one runs on the path that opens the database.
+fn trace_db(event: &str, ms: u128) {
+    let Ok(path) = std::env::var("ARC_DB_TRACE") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{} {} {}", std::process::id(), event, ms);
+    }
+}
+
 pub struct Db {
     path: PathBuf,
+    /// When the currently open handle was acquired, for `ARC_DB_TRACE`.
+    ///
+    /// `docs/BUGS.md` #14 is open because nobody has measured how long a holder
+    /// keeps this database. The entry names two candidates and says
+    /// distinguishing them "means logging how long each holder keeps the
+    /// database, which has not been done". This is that log, and it is inert
+    /// unless the variable is set.
+    held_since: std::cell::RefCell<Option<Instant>>,
     /// The open database, reused across transactions within one phase of a run.
     ///
     /// Opening redb takes an exclusive file lock, so this handle must never be
@@ -99,6 +132,7 @@ impl Db {
         let db = Db {
             path: arc_home.join("arc.redb"),
             open: std::cell::RefCell::new(None),
+            held_since: std::cell::RefCell::new(None),
         };
         // Metadata from an incompatible layout — or a file too damaged to read
         // at all — is discarded, not migrated. Cache contents are disposable;
@@ -145,13 +179,29 @@ impl Db {
     /// Close the database if it is open. Call this before running a child
     /// process so other Arc processes are not locked out for its duration.
     pub fn release(&self) {
+        self.release_at("release");
+    }
+
+    /// `release`, with a label naming the call site, for `ARC_DB_TRACE`.
+    ///
+    /// The label is what turns "somebody held the database for five seconds"
+    /// into "this phase did". Without it the measurement says a hold is long
+    /// and cannot say which of the four release points ended it.
+    pub fn release_at(&self, label: &str) {
+        let was_open = self.open.borrow().is_some();
         *self.open.borrow_mut() = None;
+        if was_open {
+            if let Some(since) = self.held_since.borrow_mut().take() {
+                trace_db(label, since.elapsed().as_millis());
+            }
+        }
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
         let mut slot = self.open.borrow_mut();
         if slot.is_none() {
             *slot = Some(self.database()?);
+            *self.held_since.borrow_mut() = Some(Instant::now());
         }
         f(slot.as_ref().expect("just opened"))
     }
@@ -160,7 +210,10 @@ impl Db {
         let start = Instant::now();
         loop {
             match Database::create(&self.path) {
-                Ok(db) => return Ok(db),
+                Ok(db) => {
+                    trace_db("open", start.elapsed().as_millis());
+                    return Ok(db);
+                }
                 Err(redb::DatabaseError::DatabaseAlreadyOpen)
                     if start.elapsed() < LOCK_TIMEOUT =>
                 {
