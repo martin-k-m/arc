@@ -32,6 +32,15 @@ described under [Compatibility](#compatibility).
 
 ### Fixed
 
+- **An environment capture judges a symlink's escape by its components, not
+  its first two characters.** The check was `starts_with("..")`, which is wrong
+  in both directions: a link to `bin/../../x` starts with an ordinary name and
+  was recorded as a relocatable link, so the host file it really pointed at was
+  never captured; and a link to a file called `..cache` was treated as an
+  escape and inlined by content instead of kept as a link. A target now escapes
+  if any `/`-separated component is `..`. A link that climbs and comes back,
+  such as `a/../b`, is followed too, which is the conservative side.
+
 - **A restore destination that is itself a symlink is now refused.**
   `docs/security.md` has claimed this for some time and `safe_join` did not do
   it: it walked the destination's ancestors and never looked at the destination.
