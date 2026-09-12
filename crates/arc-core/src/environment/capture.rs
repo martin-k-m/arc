@@ -348,7 +348,9 @@ impl<'a> Builder<'a> {
         // An absolute or escaping link would reintroduce a host path into
         // something that is supposed to be relocatable. Follow it instead: if
         // it lands on a regular file, that file's *content* is portable.
-        let escapes = target_str.starts_with('/') || target_str.starts_with("..");
+        // Checked per component: `bin/../../x` escapes without starting with
+        // `..`, and `..cache` is an ordinary name that does not.
+        let escapes = target_str.starts_with('/') || target_str.split('/').any(|c| c == "..");
         if escapes {
             match std::fs::metadata(source) {
                 Ok(m) if m.is_file() => {
@@ -558,6 +560,36 @@ mod tests {
             .find(|f| f.path.v == "tc/bin/escape")
             .unwrap();
         assert!(escape.link.is_none());
+        c.manifest.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_escape_is_judged_by_components_not_by_prefix() {
+        let (tmp, s) = store();
+        let src = tmp.path().join("tc");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/..real"), b"real").unwrap();
+        std::os::unix::fs::symlink("..real", src.join("bin/dotdot")).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        // Starts with an ordinary component, then climbs out of the tree.
+        std::os::unix::fs::symlink("../../outside.txt", src.join("bin/inner")).unwrap();
+        std::os::unix::fs::symlink("bin/../../outside.txt", src.join("via_bin")).unwrap();
+
+        let spec = Spec {
+            trees: vec![Tree {
+                from: src,
+                to: "tc".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let c = capture(&spec, &s).unwrap();
+        let find = |p: &str| c.manifest.files.iter().find(|f| f.path.v == p).unwrap();
+        assert_eq!(find("tc/bin/dotdot").link.as_deref(), Some("..real"));
+        assert!(find("tc/bin/inner").link.is_none());
+        assert!(find("tc/via_bin").link.is_none());
         c.manifest.validate().unwrap();
     }
 
