@@ -27,10 +27,10 @@ path that moved. Common reasons:
 | --- | --- |
 | `<path>` changed / added / removed | a file the command is known to depend on moved |
 | `<path>` appeared / disappeared | the command checked whether that path existed, and the answer is now different |
-| `<dir>/ entries changed | the command listed that directory, and something was added to it or removed from it |
+| `<dir>/ entries changed` | the command listed that directory, and something was added to it or removed from it |
 | `<VAR>` changed | a variable in `[env] include` has a different value |
 | no previous execution of this command was recorded | the first run of a new command |
-| tracked inputs changed | several inputs moved at once |
+| tracked inputs changed | the inputs moved but no path could be named: the previous record has no readable manifest, or one written by an older Arc that did not store directories and existence checks |
 | all inputs match execution `<id>` | this is a hit, and which record it came from |
 | the program changed: `<path>` | the executable's own contents differ — a compiler or interpreter upgrade |
 | what Arc observed this command execute changed | the learned dependency set widened; the usual cause of the miss right after a first trace |
