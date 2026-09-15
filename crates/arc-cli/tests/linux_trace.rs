@@ -68,6 +68,11 @@ impl Sandbox {
         self.arc(&["run", "sh", "-c", script])
     }
 
+    /// The same, asking Arc to say why it decided what it decided.
+    fn explain(&self, script: &str) -> String {
+        stderr(&self.arc(&["run", "--explain", "sh", "-c", script]))
+    }
+
     /// Run once to observe, once to settle. The first execution is what teaches
     /// Arc the dependency set; the second is the first that can narrow, and it
     /// is the baseline every assertion below is made against.
@@ -301,6 +306,53 @@ fn enumerating_a_directory_depends_on_its_entries_not_just_its_files() {
         &sb.sh("ls plugins"),
         "a file that never existed when the trace ran must still invalidate it",
     );
+}
+
+// ------------------------------------------------------------ explaining ----
+
+#[test]
+fn a_miss_on_a_deleted_input_is_explained_as_a_removal() {
+    needs_tracer!();
+    let sb = Sandbox::new();
+    sb.write("input.txt", "one");
+    let read = read_file("input.txt");
+    sb.learn(&read);
+
+    std::fs::remove_file(sb.root.join("input.txt")).unwrap();
+    let log = sb.explain(&read);
+    assert!(log.contains("cache miss"), "{log}");
+    assert!(log.contains("input.txt removed"), "{log}");
+    assert!(!log.contains("input.txt changed"), "{log}");
+}
+
+#[test]
+fn a_miss_on_a_path_that_was_absent_names_the_path_that_appeared() {
+    needs_tracer!();
+    let sb = Sandbox::new();
+    sb.script(
+        "run.sh",
+        "#!/bin/sh\nif [ -f optional.cfg ]; then echo WITH; else echo WITHOUT; fi\n",
+    );
+    sb.learn("./run.sh");
+
+    sb.write("optional.cfg", "now here");
+    let log = sb.explain("./run.sh");
+    assert!(log.contains("cache miss"), "{log}");
+    assert!(log.contains("optional.cfg appeared"), "{log}");
+}
+
+#[test]
+fn a_miss_on_a_new_directory_entry_names_the_directory() {
+    needs_tracer!();
+    let sb = Sandbox::new();
+    std::fs::create_dir(sb.root.join("plugins")).unwrap();
+    sb.write("plugins/a.plugin", "a");
+    sb.learn("ls plugins");
+
+    sb.write("plugins/new.plugin", "b");
+    let log = sb.explain("ls plugins");
+    assert!(log.contains("cache miss"), "{log}");
+    assert!(log.contains("plugins/ entries changed"), "{log}");
 }
 
 // -------------------------------------------------------------- processes ----

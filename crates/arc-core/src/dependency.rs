@@ -564,9 +564,20 @@ pub struct Fingerprint {
     pub reused: usize,
     pub tracked: usize,
     /// `(path, digest)` for every tracked file, so `--explain` can name what
-    /// changed without re-walking the project.
+    /// changed without re-walking the project. A file that is gone carries
+    /// [`MISSING`] rather than a digest.
     pub files: Vec<(String, String)>,
+    /// `(path, entry-set digest)` for every enumerated directory.
+    pub directories: Vec<(String, String)>,
+    /// `(path, present)` for every path whose existence was the dependency.
+    pub existence: Vec<(String, bool)>,
 }
+
+/// The digest recorded for a tracked file that no longer exists. A value, not
+/// an absence: a dependency that has disappeared must change the key, and
+/// `--explain` must be able to say that it disappeared rather than that it
+/// changed.
+pub const MISSING: &str = "<missing>";
 
 /// Hash the current state of a learned dependency set.
 ///
@@ -618,20 +629,26 @@ pub fn fingerprint(
     // entry appearing, which is the case this exists to catch.
     h.field(b"directories");
     for rel in &set.directories {
+        let d = dir_digest(&root.join(rel));
         h.field(rel);
-        h.field(dir_digest(&root.join(rel)).bytes());
+        h.field(d.bytes());
+        out.directories.push((rel.clone(), d.hex()));
     }
     for abs in &set.external_directories {
+        let d = dir_digest(Path::new(abs));
         h.field(abs);
-        h.field(dir_digest(Path::new(abs)).bytes());
+        h.field(d.bytes());
+        out.directories.push((abs.clone(), d.hex()));
     }
 
     // Presence is the whole dependency here: there is nothing to hash, but a
     // path appearing where one was absent must still change the key.
     h.field(b"existence");
     for path in &set.existence {
+        let present = Path::new(path).symlink_metadata().is_ok();
         h.field(path);
-        h.field([Path::new(path).symlink_metadata().is_ok() as u8]);
+        h.field([present as u8]);
+        out.existence.push((path.clone(), present));
     }
 
     out.digest = h.finish();
@@ -639,10 +656,8 @@ pub fn fingerprint(
 }
 
 /// A file's digest, reusing the size/mtime cache the project scan already
-/// maintains. `MISSING` is a value, not an absence: a dependency that has
-/// disappeared must change the key.
+/// maintains.
 fn file_digest(path: &Path, key: &str, fps: &mut FingerprintMap, out: &mut Fingerprint) -> String {
-    const MISSING: &str = "<missing>";
     let Ok(md) = std::fs::symlink_metadata(path) else {
         return MISSING.to_string();
     };
@@ -1083,5 +1098,37 @@ mod tests {
         // A tracked input disappearing.
         std::fs::remove_file(root.join("a.txt")).unwrap();
         assert_ne!(fingerprint(&set, root, &mut fps).unwrap().digest, base);
+    }
+
+    #[test]
+    fn the_fingerprint_reports_every_class_it_hashes_so_a_miss_can_be_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("plugins")).unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        let maybe = display_form(&root.join("maybe.cfg"));
+
+        let mut set = DependencySet::empty("f", 0);
+        set.inputs = vec!["a.txt".into()];
+        set.directories = vec!["plugins".into()];
+        set.existence = vec![maybe.clone()];
+
+        let mut fps = FingerprintMap::new();
+        let before = fingerprint(&set, root, &mut fps).unwrap();
+        assert_eq!(before.directories.len(), 1);
+        assert_eq!(before.directories[0].0, "plugins");
+        assert_eq!(before.existence, vec![(maybe.clone(), false)]);
+        assert_ne!(before.files[0].1, MISSING);
+
+        std::fs::write(root.join("plugins/new.so"), "x").unwrap();
+        std::fs::write(root.join("maybe.cfg"), "").unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        let after = fingerprint(&set, root, &mut fps).unwrap();
+        assert_ne!(after.directories[0].1, before.directories[0].1);
+        assert_eq!(after.existence, vec![(maybe, true)]);
+        assert_eq!(
+            after.files,
+            vec![("a.txt".to_string(), MISSING.to_string())]
+        );
     }
 }

@@ -135,7 +135,7 @@ fn vaddr_to_offset(loads: &[(u64, u64, u64)], vaddr: u64) -> Option<u64> {
     loads
         .iter()
         .find(|(v, _, sz)| vaddr >= *v && vaddr < v.saturating_add(*sz))
-        .map(|(v, o, _)| o + (vaddr - v))
+        .and_then(|(v, o, _)| o.checked_add(vaddr - v))
 }
 
 fn split_paths(s: &str) -> Vec<String> {
@@ -182,6 +182,19 @@ fn u64_at(b: &[u8], off: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_load_segment_whose_offset_overflows_is_refused() {
+        // A segment at vaddr 0 with a file offset of u64::MAX puts the string
+        // table past the end of the address space; the sum must be rejected,
+        // not wrapped.
+        assert_eq!(vaddr_to_offset(&[(0, u64::MAX, 0x1000)], 0x10), None);
+        assert_eq!(
+            vaddr_to_offset(&[(0x1000, 0x40, 0x100)], 0x1010),
+            Some(0x50)
+        );
+        assert_eq!(vaddr_to_offset(&[(0x1000, 0x40, 0x100)], 0x2000), None);
+    }
 
     #[test]
     fn a_non_elf_file_is_not_an_error() {

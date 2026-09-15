@@ -202,6 +202,15 @@ pub struct RemoteExecStatus {
 #[derive(Serialize, Deserialize)]
 struct InputManifest {
     files: Vec<(String, String)>,
+    /// Enumerated directories and their entry-set digests. Only a narrowed
+    /// fingerprint has any; a project scan hashes files.
+    #[serde(default)]
+    directories: Vec<(String, String)>,
+    /// Paths whose presence or absence was the dependency, with the answer at
+    /// the time. A manifest written before this existed carries none, and the
+    /// diff then has nothing to say about them, which is the same as before.
+    #[serde(default)]
+    existence: Vec<(String, bool)>,
     /// Which input set this manifest describes. A narrowed manifest and a
     /// project-wide one cover different ground, so comparing them file by file
     /// reports every difference between the two *methods* as a change to the
@@ -215,9 +224,22 @@ struct InputManifest {
 struct Inputs {
     digest: Digest,
     files: Vec<(String, String)>,
+    directories: Vec<(String, String)>,
+    existence: Vec<(String, bool)>,
     bytes_hashed: u64,
     reused: usize,
     narrowed: bool,
+}
+
+impl Inputs {
+    fn manifest(&self) -> InputManifest {
+        InputManifest {
+            files: self.files.clone(),
+            directories: self.directories.clone(),
+            existence: self.existence.clone(),
+            narrowed: self.narrowed,
+        }
+    }
 }
 
 /// Everything fixed before the command can run.
@@ -608,24 +630,20 @@ pub fn run(
     // digest, which grows as executables are observed, and — the first time
     // narrowing switches on — the input set itself.
     let next_inputs = filed.as_ref().unwrap_or(&inputs);
-    let (effective_key, manifest_files, manifest_narrowed) = match &learned {
-        Some(merged) => (
-            key::execution_key(&KeyInputs {
-                program,
-                args,
-                rel_cwd: &plan.rel_cwd,
-                family_key: &plan.family_key,
-                input_digest: &next_inputs.digest,
-                env_digest: &env.digest,
-                toolchain_digest: &toolchain.digest,
-                dependency_digest: &merged.key_digest(),
-                output_globs: &plan.cfg.outputs.include,
-                environment_id: plan.environment_id(),
-            }),
-            next_inputs.files.clone(),
-            next_inputs.narrowed,
-        ),
-        None => (exec_key, inputs.files.clone(), inputs.narrowed),
+    let effective_key = match &learned {
+        Some(merged) => key::execution_key(&KeyInputs {
+            program,
+            args,
+            rel_cwd: &plan.rel_cwd,
+            family_key: &plan.family_key,
+            input_digest: &next_inputs.digest,
+            env_digest: &env.digest,
+            toolchain_digest: &toolchain.digest,
+            dependency_digest: &merged.key_digest(),
+            output_globs: &plan.cfg.outputs.include,
+            environment_id: plan.environment_id(),
+        }),
+        None => exec_key,
     };
 
     // Hermeticity is a claim about *this run*, so it can only be made after the
@@ -663,11 +681,7 @@ pub fn run(
         && (outcome.exit_code == 0 || opts.cache_failures || plan.cfg.cache.cache_failures);
 
     let (stdout, stderr, manifest) = if store_cacheable {
-        let manifest = InputManifest {
-            files: manifest_files,
-            narrowed: manifest_narrowed,
-        };
-        let mbytes = serde_json::to_vec(&manifest)?;
+        let mbytes = serde_json::to_vec(&next_inputs.manifest())?;
         (
             Some(blob(&store, &outcome.stdout)?),
             Some(blob(&store, &outcome.stderr)?),
@@ -1161,6 +1175,8 @@ fn fingerprint_inputs(
         return Ok(Inputs {
             digest,
             files,
+            directories: fp.directories,
+            existence: fp.existence,
             bytes_hashed: bytes,
             reused,
             narrowed: true,
@@ -1174,6 +1190,8 @@ fn fingerprint_inputs(
             .iter()
             .map(|f| (f.rel.clone(), f.digest.hex()))
             .collect(),
+        directories: Vec::new(),
+        existence: Vec::new(),
         bytes_hashed: set.bytes_hashed,
         reused: set.reused_fingerprints,
         narrowed: false,
@@ -1611,35 +1629,69 @@ fn key_component_reason(
 /// `path changed|added|removed` lines, by comparing against the stored input
 /// manifest of a previous execution.
 fn changed_inputs(store: &Store, prev: &ExecutionRecord, inputs: &Inputs) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
     let Some(m) = &prev.input_manifest else {
-        return Ok(changed);
+        return Ok(Vec::new());
     };
     let Ok(bytes) = store.read(&Digest::parse(&m.digest)?) else {
-        return Ok(changed);
+        return Ok(Vec::new());
     };
     let Ok(old) = serde_json::from_slice::<InputManifest>(&bytes) else {
-        return Ok(changed);
+        return Ok(Vec::new());
     };
+    Ok(diff_manifest(old, inputs))
+}
+
+/// One line per dependency that moved between a stored manifest and the
+/// current fingerprint, covering every class the fingerprint hashes.
+///
+/// A narrowed fingerprint keeps a deleted file in its list under the
+/// [`dependency::MISSING`] marker, because the deletion has to change the key.
+/// That marker is a deletion, not a change, and is reported as one. The same
+/// applies in reverse: a file that was missing at the previous run and is back
+/// was added. A directory is reported when its entry set moved, and a path
+/// whose presence was the dependency is reported when the answer flipped.
+fn diff_manifest(old: InputManifest, inputs: &Inputs) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut changed = Vec::new();
     if old.narrowed != inputs.narrowed {
-        return Ok(changed);
+        return changed;
     }
-    let old_map: std::collections::HashMap<_, _> = old.files.into_iter().collect();
-    let mut new_paths = std::collections::HashSet::new();
+    let missing = |d: &str| d == dependency::MISSING;
+    let old_map: HashMap<_, _> = old.files.into_iter().collect();
+    let mut new_paths = HashSet::new();
     for (rel, digest) in &inputs.files {
         new_paths.insert(rel.as_str());
         match old_map.get(rel) {
             Some(d) if d == digest => {}
+            Some(d) if missing(d) => changed.push(format!("{rel} added")),
+            Some(_) if missing(digest) => changed.push(format!("{rel} removed")),
             Some(_) => changed.push(format!("{rel} changed")),
+            None if missing(digest) => {}
             None => changed.push(format!("{rel} added")),
         }
     }
-    for path in old_map.keys() {
-        if !new_paths.contains(path.as_str()) {
+    for (path, digest) in &old_map {
+        if !new_paths.contains(path.as_str()) && !missing(digest) {
             changed.push(format!("{path} removed"));
         }
     }
-    Ok(changed)
+
+    let old_dirs: HashMap<_, _> = old.directories.into_iter().collect();
+    for (dir, digest) in &inputs.directories {
+        if old_dirs.get(dir).is_some_and(|d| d != digest) {
+            changed.push(format!("{dir}/ entries changed"));
+        }
+    }
+
+    let old_existence: HashMap<_, _> = old.existence.into_iter().collect();
+    for (path, present) in &inputs.existence {
+        match (old_existence.get(path), present) {
+            (Some(false), true) => changed.push(format!("{path} appeared")),
+            (Some(true), false) => changed.push(format!("{path} disappeared")),
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// Project files that changed since the cached execution but are outside this
@@ -1841,5 +1893,93 @@ mod key_attribution_tests {
         let r = reason(base(), base());
         assert!(r.contains("should"), "{r}");
         assert!(!r.contains("changed:"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod manifest_diff_tests {
+    use super::*;
+
+    fn inputs(
+        files: &[(&str, &str)],
+        directories: &[(&str, &str)],
+        existence: &[(&str, bool)],
+    ) -> Inputs {
+        let own = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        Inputs {
+            digest: crate::hash::hash_bytes(b""),
+            files: own(files),
+            directories: own(directories),
+            existence: existence.iter().map(|(p, b)| (p.to_string(), *b)).collect(),
+            bytes_hashed: 0,
+            reused: 0,
+            narrowed: true,
+        }
+    }
+
+    fn manifest(
+        files: &[(&str, &str)],
+        directories: &[(&str, &str)],
+        existence: &[(&str, bool)],
+    ) -> InputManifest {
+        inputs(files, directories, existence).manifest()
+    }
+
+    #[test]
+    fn a_deleted_input_is_removed_not_changed() {
+        let old = manifest(&[("src/a.txt", "aaaa")], &[], &[]);
+        let now = inputs(&[("src/a.txt", dependency::MISSING)], &[], &[]);
+        assert_eq!(diff_manifest(old, &now), vec!["src/a.txt removed"]);
+    }
+
+    #[test]
+    fn an_input_that_is_back_is_added_not_changed() {
+        let old = manifest(&[("src/a.txt", dependency::MISSING)], &[], &[]);
+        let now = inputs(&[("src/a.txt", "aaaa")], &[], &[]);
+        assert_eq!(diff_manifest(old, &now), vec!["src/a.txt added"]);
+    }
+
+    #[test]
+    fn a_file_missing_at_both_runs_is_not_news() {
+        let old = manifest(&[("src/a.txt", dependency::MISSING)], &[], &[]);
+        let now = inputs(&[("src/a.txt", dependency::MISSING)], &[], &[]);
+        assert!(diff_manifest(old, &now).is_empty());
+    }
+
+    #[test]
+    fn a_directory_whose_entries_moved_is_named() {
+        let old = manifest(&[], &[("plugins", "1111"), ("lib", "2222")], &[]);
+        let now = inputs(&[], &[("plugins", "3333"), ("lib", "2222")], &[]);
+        assert_eq!(diff_manifest(old, &now), vec!["plugins/ entries changed"]);
+    }
+
+    #[test]
+    fn a_presence_dependency_is_named_in_both_directions() {
+        let old = manifest(&[], &[], &[("/r/optional.cfg", false), ("/r/lock", true)]);
+        let now = inputs(&[], &[], &[("/r/optional.cfg", true), ("/r/lock", false)]);
+        assert_eq!(
+            diff_manifest(old, &now),
+            vec!["/r/optional.cfg appeared", "/r/lock disappeared"]
+        );
+    }
+
+    #[test]
+    fn a_manifest_written_before_these_classes_existed_diffs_files_only() {
+        let old: InputManifest =
+            serde_json::from_str(r#"{"files":[["a","1111"]],"narrowed":true}"#).unwrap();
+        let now = inputs(&[("a", "2222")], &[("plugins", "3333")], &[("/r/x", true)]);
+        assert_eq!(diff_manifest(old, &now), vec!["a changed"]);
+    }
+
+    #[test]
+    fn a_narrowed_and_a_project_wide_manifest_are_not_compared() {
+        let old = manifest(&[("a", "1111")], &[], &[]);
+        let mut now = inputs(&[("a", "2222")], &[], &[]);
+        now.narrowed = false;
+        assert!(diff_manifest(old, &now).is_empty());
     }
 }

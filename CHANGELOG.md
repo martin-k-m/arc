@@ -7,6 +7,18 @@ described under [Compatibility](#compatibility).
 
 ### Added
 
+- **`--explain` names a directory whose entries moved and an absent path that
+  appeared.** A narrowed run fingerprints three things a project scan does not:
+  the entry set of every directory the command listed, and the presence of
+  every path it looked for and did not find. Both were in the key and neither
+  was in the stored manifest, so a miss caused by `plugins/new.so` appearing
+  under an enumerated directory, or `optional.cfg` turning up where its absence
+  was the dependency, was reported as `tracked inputs changed` with nothing
+  named. The manifest now carries both classes and the diff reports
+  `plugins/ entries changed`, `optional.cfg appeared` and `optional.cfg
+  disappeared`. A manifest written before this carries neither and diffs files
+  only, as before.
+
 - **A miss names which component of the execution key moved.** Previously a
   miss that no input or environment-variable change explained was reported as
   one three-way lump — "toolchain, observed dependencies or execution policy
@@ -31,6 +43,18 @@ described under [Compatibility](#compatibility).
   investigations lacked.
 
 ### Fixed
+
+- **A deleted input under a narrowed fingerprint is explained as removed, not
+  changed.** The narrowed fingerprint keeps a deleted file in its list under a
+  `<missing>` marker so the deletion changes the key, and the diff compared
+  that marker against the old digest and called it a change. It is now a
+  removal, and a file that was missing at the previous run and is back is an
+  addition.
+
+- **`vaddr_to_offset` in the ELF reader added two attacker-controlled offsets
+  without checking.** The module's own doc comment forbids exactly that; the
+  sum is now `checked_add` and a segment whose file offset overflows is
+  refused like any other malformed header.
 
 - **An environment capture judges a symlink's escape by its components, not
   its first two characters.** The check was `starts_with("..")`, which is wrong
