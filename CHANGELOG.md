@@ -5,6 +5,8 @@ described under [Compatibility](#compatibility).
 
 ## Unreleased
 
+## 1.1.0 — 2026-09-15
+
 ### Added
 
 - **`--explain` names a directory whose entries moved and an absent path that
