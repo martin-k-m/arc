@@ -26,6 +26,8 @@ path that moved. Common reasons:
 | reason | what happened |
 | --- | --- |
 | `<path>` changed / added / removed | a file the command is known to depend on moved |
+| `<path>` appeared / disappeared | the command checked whether that path existed, and the answer is now different |
+| `<dir>/ entries changed | the command listed that directory, and something was added to it or removed from it |
 | `<VAR>` changed | a variable in `[env] include` has a different value |
 | no previous execution of this command was recorded | the first run of a new command |
 | tracked inputs changed | several inputs moved at once |
