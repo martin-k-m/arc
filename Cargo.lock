@@ -98,7 +98,6 @@ dependencies = [
  "arc-worker",
  "clap",
  "libc",
- "serde",
  "serde_json",
  "tempfile",
  "toml",
