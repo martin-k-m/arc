@@ -5,6 +5,23 @@ described under [Compatibility](#compatibility).
 
 ## Unreleased
 
+## 1.1.1 - 2026-10-29
+
+### Security
+
+- **rustls, rustls-webpki and webpki-roots updated to patched releases.**
+  The remote cache client uses these for TLS. The lockfile pinned rustls
+  0.23.43, rustls-webpki 0.103.14 and webpki-roots 1.0.9, which carry the
+  advisories RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348,
+  RUSTSEC-2026-0349, RUSTSEC-2026-0381 and RUSTSEC-2026-0382. They are now
+  0.23.46, 0.103.16 and 1.0.11. No other dependency moved.
+
+### Changed
+
+- **arc-cli no longer lists serde as a direct dependency.** Nothing in the
+  crate used it; it still arrives through serde_json.
+- **CI and release workflows use current major versions of their actions.**
+
 ## 1.1.0 — 2026-09-15
 
 ### Added
