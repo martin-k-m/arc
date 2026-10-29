@@ -147,6 +147,9 @@ impl Drop for Server {
     }
 }
 
+// `fetch_update` is deprecated in favour of `try_update` on current stable, which
+// the 1.74 floor does not have.
+#[allow(deprecated)]
 fn handle(state: &State, req: Request) {
     // Accept and never answer, but stay interruptible so shutdown is not held
     // hostage by an injected fault.
